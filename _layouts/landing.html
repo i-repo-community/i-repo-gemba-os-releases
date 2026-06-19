@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>i-Repo GEMBA OS — 現場データ基盤</title>
+<style>
+  :root{
+    --bg:#0a0c11; --bg2:#0e1118; --panel:#12161f; --panel2:#161b26;
+    --border:#222837; --border-soft:#1a1f2c;
+    --fg:#eef1f7; --muted:#8a93a8; --faint:#5d6680;
+    --accent:#ff9500; --accent-2:#ffb347; --accent-dim:rgba(255,149,0,.14);
+    --ok:#35c47a;
+    --radius:14px;
+    --maxw:1120px;
+    --font:-apple-system,BlinkMacSystemFont,"Segoe UI","Hiragino Kaku Gothic ProN","Yu Gothic UI",Meiryo,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{
+    background:var(--bg); color:var(--fg); font-family:var(--font);
+    line-height:1.75; -webkit-font-smoothing:antialiased;
+    background-image:
+      radial-gradient(900px 500px at 80% -10%, rgba(255,149,0,.10), transparent 60%),
+      radial-gradient(700px 500px at -10% 10%, rgba(80,120,255,.06), transparent 55%);
+    background-attachment:fixed;
+  }
+  a{color:inherit}
+  .wrap{max-width:var(--maxw); margin:0 auto; padding:0 22px}
+
+  /* ---- nav ---- */
+  header.nav{position:sticky; top:0; z-index:20; backdrop-filter:blur(10px);
+    background:rgba(10,12,17,.72); border-bottom:1px solid var(--border-soft)}
+  .nav-in{display:flex; align-items:center; gap:14px; height:62px}
+  .brand{display:flex; align-items:center; gap:11px; font-weight:800; letter-spacing:.2px}
+  .logo{width:34px; height:34px; border-radius:9px; display:grid; place-items:center;
+    background:linear-gradient(135deg,var(--accent),#ff6a00); color:#1a1206; font-weight:900; font-size:15px;
+    box-shadow:0 4px 14px rgba(255,149,0,.35)}
+  .brand small{display:block; font-weight:600; color:var(--muted); font-size:11px; letter-spacing:.4px}
+  .nav-sp{flex:1}
+  .nav a.link{color:var(--muted); text-decoration:none; font-size:14px; font-weight:600; padding:8px 10px; border-radius:8px}
+  .nav a.link:hover{color:var(--fg); background:var(--panel)}
+  @media(max-width:680px){ .nav a.link.hide-sm{display:none} }
+
+  /* ---- buttons ---- */
+  .btn{display:inline-flex; align-items:center; gap:9px; padding:13px 22px; border-radius:11px;
+    font-weight:800; text-decoration:none; font-size:15px; border:1px solid transparent; transition:.15s; cursor:pointer}
+  .btn-primary{background:linear-gradient(135deg,var(--accent),#ff7a00); color:#1a1206;
+    box-shadow:0 8px 24px rgba(255,149,0,.30)}
+  .btn-primary:hover{transform:translateY(-1px); box-shadow:0 12px 30px rgba(255,149,0,.42)}
+  .btn-ghost{background:var(--panel); color:var(--fg); border-color:var(--border)}
+  .btn-ghost:hover{border-color:var(--accent); color:var(--accent-2)}
+  .btn .sub{font-weight:600; font-size:11.5px; opacity:.8}
+
+  /* ---- hero ---- */
+  .hero{padding:74px 0 26px}
+  .eyebrow{display:inline-flex; align-items:center; gap:8px; font-size:12.5px; font-weight:700; color:var(--accent-2);
+    background:var(--accent-dim); border:1px solid rgba(255,149,0,.25); padding:6px 13px; border-radius:999px}
+  .hero h1{font-size:clamp(30px,5vw,52px); line-height:1.18; margin:20px 0 0; font-weight:900; letter-spacing:-.5px}
+  .hero h1 .hl{background:linear-gradient(120deg,var(--accent),var(--accent-2)); -webkit-background-clip:text; background-clip:text; color:transparent}
+  .hero p.lead{font-size:clamp(15px,2vw,19px); color:var(--muted); max-width:680px; margin:18px 0 0}
+  .hero-cta{display:flex; gap:14px; flex-wrap:wrap; align-items:center; margin-top:30px}
+  .os-hint{font-size:12.5px; color:var(--faint)}
+  .os-hint b{color:var(--muted)}
+
+  .hero-shot{margin:46px 0 0}
+
+  /* ---- screenshot frame ---- */
+  .shot{margin:0; position:relative; border-radius:var(--radius); overflow:hidden;
+    border:1px solid var(--border); background:
+      linear-gradient(var(--panel),var(--panel2));
+    aspect-ratio:16/10; display:grid; place-items:center}
+  .shot::before{content:attr(data-label); color:var(--faint); font-size:13px; font-weight:600;
+    padding:0 16px; text-align:center}
+  .shot img{position:absolute; inset:0; width:100%; height:100%; object-fit:cover; display:block}
+  .shot.big{aspect-ratio:16/9; box-shadow:0 30px 80px rgba(0,0,0,.45)}
+  .frame-bar{position:absolute; top:0; left:0; right:0; height:30px; background:rgba(7,8,12,.85);
+    border-bottom:1px solid var(--border-soft); display:flex; align-items:center; gap:6px; padding:0 12px; z-index:2}
+  .frame-bar i{width:9px; height:9px; border-radius:50%; background:#33394a; display:inline-block}
+  .shot.big img, .grid .shot img{ top:0 }
+
+  /* ---- sections ---- */
+  section{padding:56px 0}
+  .sec-head{max-width:680px; margin:0 0 30px}
+  .sec-head .kicker{color:var(--accent-2); font-weight:800; font-size:13px; letter-spacing:1px; text-transform:uppercase}
+  .sec-head h2{font-size:clamp(23px,3.4vw,34px); margin:8px 0 0; font-weight:900; letter-spacing:-.4px}
+  .sec-head p{color:var(--muted); margin:12px 0 0}
+
+  /* ---- 3-up value ---- */
+  .cards3{display:grid; grid-template-columns:repeat(3,1fr); gap:18px}
+  @media(max-width:820px){ .cards3{grid-template-columns:1fr} }
+  .vcard{background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:24px}
+  .vcard .ic{width:44px; height:44px; border-radius:11px; display:grid; place-items:center; font-size:22px;
+    background:var(--accent-dim); border:1px solid rgba(255,149,0,.2); margin-bottom:14px}
+  .vcard h3{margin:0 0 6px; font-size:17px}
+  .vcard p{margin:0; color:var(--muted); font-size:14px}
+
+  /* ---- download ---- */
+  .dl-grid{display:grid; grid-template-columns:repeat(3,1fr); gap:18px}
+  @media(max-width:820px){ .dl-grid{grid-template-columns:1fr} }
+  .dl-card{background:linear-gradient(var(--panel),var(--panel2)); border:1px solid var(--border);
+    border-radius:var(--radius); padding:24px; display:flex; flex-direction:column; gap:6px; position:relative}
+  .dl-card[data-active="1"]{border-color:var(--accent); box-shadow:0 0 0 1px var(--accent), 0 14px 34px rgba(255,149,0,.18)}
+  .dl-os{display:flex; align-items:center; gap:10px; font-weight:800; font-size:18px}
+  .dl-os .glyph{font-size:24px}
+  .dl-tag{font-size:11.5px; font-weight:800; padding:3px 10px; border-radius:999px; align-self:flex-start}
+  .dl-tag.reco{background:var(--accent-dim); color:var(--accent-2); border:1px solid rgba(255,149,0,.3)}
+  .dl-tag.lite{background:#11202e; color:#69b7ff; border:1px solid #1d3a52}
+  .dl-card p.note{color:var(--muted); font-size:13px; margin:4px 0 14px; min-height:38px}
+  .dl-btn{margin-top:auto}
+  .dl-btn.is-loading{opacity:.6; pointer-events:none}
+  .badge-here{position:absolute; top:-11px; right:16px; background:var(--accent); color:#1a1206;
+    font-size:11px; font-weight:800; padding:3px 11px; border-radius:999px; display:none}
+  .dl-card[data-active="1"] .badge-here{display:inline-block}
+  .dl-foot{margin-top:20px; color:var(--faint); font-size:13px; text-align:center}
+  .dl-foot .ver{color:var(--accent-2); font-weight:700}
+
+  /* ---- screen tour grid ---- */
+  .grid{display:grid; grid-template-columns:repeat(3,1fr); gap:20px}
+  @media(max-width:900px){ .grid{grid-template-columns:repeat(2,1fr)} }
+  @media(max-width:600px){ .grid{grid-template-columns:1fr} }
+  .tile h4{margin:13px 0 3px; font-size:15px; display:flex; align-items:center; gap:7px}
+  .tile .num{color:var(--accent-2); font-weight:800; font-size:12px}
+  .tile p{margin:0; color:var(--muted); font-size:13px}
+
+  /* ---- advanced / docs ---- */
+  .split{display:grid; grid-template-columns:1.1fr .9fr; gap:24px; align-items:start}
+  @media(max-width:820px){ .split{grid-template-columns:1fr} }
+  .code{background:#06070b; border:1px solid var(--border); border-radius:12px; padding:16px 18px; overflow:auto}
+  .code pre{margin:0; font-family:"SF Mono",Consolas,"Liberation Mono",monospace; font-size:13px; color:#cdd6e6}
+  .code .c{color:var(--faint)}
+  .doclist{display:flex; flex-direction:column; gap:12px}
+  .doclink{display:flex; align-items:center; gap:13px; background:var(--panel); border:1px solid var(--border);
+    border-radius:12px; padding:16px 18px; text-decoration:none}
+  .doclink:hover{border-color:var(--accent)}
+  .doclink .ic{font-size:22px}
+  .doclink b{display:block} .doclink span{color:var(--muted); font-size:13px}
+
+  footer{border-top:1px solid var(--border-soft); padding:34px 0; color:var(--faint); font-size:13px; margin-top:30px}
+  .hr{height:1px; background:var(--border-soft); border:0; margin:0}
+</style>
+</head><body>
+
+<header class="nav">
+  <div class="wrap nav-in">
+    <div class="brand"><span class="logo">GO</span>
+      <span>i-Repo GEMBA OS<small>現場データ基盤</small></span>
+    </div>
+    <span class="nav-sp"></span>
+    <a class="link" href="#download">ダウンロード</a>
+    <a class="link hide-sm" href="#features">できること</a>
+    <a class="link hide-sm" href="#screens">画面ツアー</a>
+    <a class="link" href="docs/ユーザーマニュアル.html">説明書</a>
+  </div>
+</header>
+
+<main class="wrap">
+  <!-- HERO -->
+  <section class="hero">
+    <span class="eyebrow">⚙️ Windows / macOS デスクトップアプリ</span>
+    <h1>現場の帳票データを、<br><span class="hl">そのまま「使えるデータ」に。</span></h1>
+    <p class="lead">i-Reporter で集めたデータを、お客様が選んだ保存先へ自動で届け、アプリの中で確認でき、
+      <b style="color:var(--fg)">AI に日本語で質問</b>できる。設定もプログラミングも要りません。</p>
+    <div class="hero-cta">
+      <a class="btn btn-primary" href="#download">↓ 無料でダウンロード</a>
+      <a class="btn btn-ghost" href="docs/ユーザーマニュアル.html">使い方を見る</a>
+      <span class="os-hint" id="osHint"></span>
+    </div>
+    <figure class="shot big hero-shot" data-label="📷 概要（ダッシュボード）画面のスクリーンショット">
+      <div class="frame-bar"><i></i><i></i><i></i></div>
+      <img src="assets/img/screen-overview.png" alt="i-Repo GEMBA OS メイン画面"
+           onerror="this.style.display='none'">
+    </figure>
+  </section>
+
+  <hr class="hr">
+
+  <!-- VALUE -->
+  <section id="features">
+    <div class="sec-head">
+      <div class="kicker">できること</div>
+      <h2>送る・確かめる・聞く。これだけ。</h2>
+      <p>現場のデータ活用に必要な3つを、1つのアプリで。</p>
+    </div>
+    <div class="cards3">
+      <div class="vcard"><div class="ic">📤</div><h3>選んだ保存先へ自動で送る</h3>
+        <p>SQLite / Parquet / MongoDB / Elasticsearch / BigQuery / S3 など、お客様の基盤へ。「どの帳票を・いつ・どこへ」を決めるだけ。</p></div>
+      <div class="vcard"><div class="ic">🔎</div><h3>入ったかをアプリで確認</h3>
+        <p>送信元と送信先を突き合わせ、中身（項目値・添付）まで読み取り専用で閲覧。「送ったはず」を取り違えません。</p></div>
+      <div class="vcard"><div class="ic">💬</div><h3>AI に日本語で質問</h3>
+        <p>「先月の指摘が多い項目は？」のように、現場データへ自然な言葉で。お使いの Claude をそのまま利用します。</p></div>
+    </div>
+  </section>
+
+  <!-- DOWNLOAD -->
+  <section id="download">
+    <div class="sec-head">
+      <div class="kicker">ダウンロード</div>
+      <h2>お使いの OS を選んでください</h2>
+      <p>下のボタンは、つねに <b style="color:var(--fg)">最新リリース</b>の対応ファイルへ自動でつながります。</p>
+    </div>
+    <div class="dl-grid">
+      <div class="dl-card" data-os-card="win">
+        <span class="badge-here">あなたの環境</span>
+        <div class="dl-os"><span class="glyph">🪟</span> Windows</div>
+        <span class="dl-tag reco">推奨・オフライン同梱</span>
+        <p class="note">ネットが弱い・無い現場でも確実に起動。サイズ大（約 200MB）。迷ったらこちら。</p>
+        <a class="btn btn-primary dl-btn is-loading" id="dl-win" href="https://github.com/i-repo-community/i-repo-gemba-os-releases/releases/latest">🪟 ダウンロード</a>
+      </div>
+      <div class="dl-card" data-os-card="win">
+        <div class="dl-os"><span class="glyph">🪟</span> Windows</div>
+        <span class="dl-tag lite">軽量・要ネット</span>
+        <p class="note">初回起動時に必要部品をオンライン取得。サイズ小（約 3MB）。回線が安定した環境向け。</p>
+        <a class="btn btn-ghost dl-btn is-loading" id="dl-win-online" href="https://github.com/i-repo-community/i-repo-gemba-os-releases/releases/latest">🪟 軽量版をダウンロード</a>
+      </div>
+      <div class="dl-card" data-os-card="mac">
+        <span class="badge-here">あなたの環境</span>
+        <div class="dl-os"><span class="glyph">🍎</span> macOS</div>
+        <span class="dl-tag reco">Apple Silicon / Intel 両対応</span>
+        <p class="note">universal の .dmg を開いてアプリをドラッグするだけ。</p>
+        <a class="btn btn-primary dl-btn is-loading" id="dl-mac" href="https://github.com/i-repo-community/i-repo-gemba-os-releases/releases/latest">🍎 ダウンロード</a>
+      </div>
+    </div>
+    <div class="dl-foot">
+      最新版 <span class="ver" id="verLabel">…</span> ・ 一度入れれば次回からアプリが自動更新します ・
+      <a href="https://github.com/i-repo-community/i-repo-gemba-os-releases/releases" style="color:var(--muted)">すべてのリリース／旧バージョン</a>
+    </div>
+  </section>
+
+  <hr class="hr">
+
+  <!-- SCREEN TOUR -->
+  <section id="screens">
+    <div class="sec-head">
+      <div class="kicker">画面ツアー</div>
+      <h2>11 画面で、流れにそって。</h2>
+      <p>サイドバーは「つなぐ → 作る → 動かす → 見る → 片付ける」の順。各画面の役割はこちら。</p>
+    </div>
+    <div class="grid">
+      <figure class="tile shot-tile">
+        <div class="shot" data-label="📷 接続先テンプレート"><img src="assets/img/screen-connections.png" alt="接続先テンプレート" onerror="this.style.display='none'"></div>
+        <h4><span class="num">01</span> 接続先テンプレート</h4><p>送り先に名前を付けて保存・再利用。</p>
+      </figure>
+      <figure class="tile">
+        <div class="shot" data-label="📷 フロー作成"><img src="assets/img/screen-flows.png" alt="フロー作成" onerror="this.style.display='none'"></div>
+        <h4><span class="num">02</span> フロー作成</h4><p>対象帳票・期間・送り先・スケジュール。</p>
+      </figure>
+      <figure class="tile">
+        <div class="shot" data-label="📷 実行状況"><img src="assets/img/screen-runs.png" alt="実行状況" onerror="this.style.display='none'"></div>
+        <h4><span class="num">03</span> 実行状況</h4><p>ログ・成功確認（レシート）・再実行。</p>
+      </figure>
+      <figure class="tile">
+        <div class="shot" data-label="📷 データ確認"><img src="assets/img/screen-reports.png" alt="データ確認" onerror="this.style.display='none'"></div>
+        <h4><span class="num">04</span> データ確認</h4><p>送信元×送信済みの突き合わせ。</p>
+      </figure>
+      <figure class="tile">
+        <div class="shot" data-label="📷 クリーンアップ設定"><img src="assets/img/screen-cleanup.png" alt="クリーンアップ設定" onerror="this.style.display='none'"></div>
+        <h4><span class="num">05</span> クリーンアップ設定</h4><p>保持期間・承認・ソフトデリート。</p>
+      </figure>
+      <figure class="tile">
+        <div class="shot" data-label="📷 現場蓄積データ"><img src="assets/img/screen-gemba.png" alt="現場蓄積データ" onerror="this.style.display='none'"></div>
+        <h4>現場蓄積データ</h4><p>送信済みを読み取り専用で閲覧・検索。</p>
+      </figure>
+      <figure class="tile">
+        <div class="shot" data-label="📷 着信 Webhook"><img src="assets/img/screen-webhook.png" alt="着信 Webhook" onerror="this.style.display='none'"></div>
+        <h4>着信 Webhook</h4><p>外部システムからフローを起動（localhost）。</p>
+      </figure>
+      <figure class="tile">
+        <div class="shot" data-label="📷 プラグイン"><img src="assets/img/screen-plugins.png" alt="プラグイン" onerror="this.style.display='none'"></div>
+        <h4>プラグイン</h4><p>送り先部品の状態・フォルダ・削除。</p>
+      </figure>
+      <figure class="tile">
+        <div class="shot" data-label="📷 エージェント接続"><img src="assets/img/screen-mcp.png" alt="エージェント接続" onerror="this.style.display='none'"></div>
+        <h4>エージェント接続</h4><p>AI ツールへ読み取り専用で接続（MCP）。</p>
+      </figure>
+      <figure class="tile" style="grid-column:span 2">
+        <div class="shot" data-label="📷 現場 AI チャット"><img src="assets/img/screen-agent.png" alt="現場 AI チャット" onerror="this.style.display='none'"></div>
+        <h4>⭐ 現場 AI チャット</h4><p>現場データについて、アプリの中で AI に日本語で質問。</p>
+      </figure>
+      <figure class="tile">
+        <div class="shot" data-label="📷 概要"><img src="assets/img/screen-overview.png" alt="概要" onerror="this.style.display='none'"></div>
+        <h4>概要</h4><p>全体の状況をひと目で。</p>
+      </figure>
+    </div>
+  </section>
+
+  <hr class="hr">
+
+  <!-- ADVANCED + DOCS -->
+  <section>
+    <div class="split">
+      <div>
+        <div class="sec-head" style="margin-bottom:16px">
+          <div class="kicker">上級者向け</div>
+          <h2>コマンドで入れる</h2>
+          <p>IT 管理者・開発者向け。最新インストーラを取得し、SHA256 を検証してから実行します。</p>
+        </div>
+        <div class="code"><pre><span class="c"># Windows (PowerShell)</span>
+irm https://i-repo-community.github.io/i-repo-gemba-os-releases/install.ps1 | iex
+
+<span class="c"># macOS / Linux</span>
+curl -fsSL https://i-repo-community.github.io/i-repo-gemba-os-releases/install.sh | bash</pre></div>
+      </div>
+      <div>
+        <div class="sec-head" style="margin-bottom:16px">
+          <div class="kicker">説明書</div>
+          <h2>もっと詳しく</h2>
+        </div>
+        <div class="doclist">
+          <a class="doclink" href="docs/ユーザーマニュアル.html"><span class="ic">📘</span>
+            <span><b>ユーザーマニュアル</b><span>セットアップから全画面の使い方まで</span></span></a>
+          <a class="doclink" href="docs/プラグイン使い方集/"><span class="ic">🧩</span>
+            <span><b>プラグイン使い方集</b><span>送り先ごと（SQLite / S3 / MongoDB …）の設定</span></span></a>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <strong>i-Repo GEMBA OS</strong> — 現場データを、顧客が選んだデータ基盤に届ける。<br>
+    © CIMTOPS Corporation. 配布物と公開ドキュメントのみを掲載しています。
+  </div>
+</footer>
+
+<script>
+(function(){
+  var REPO='i-repo-community/i-repo-gemba-os-releases';
+  var RELEASES='https://github.com/'+REPO+'/releases/latest';
+
+  // 訪問者の OS を判定してカードを強調
+  var ua=(navigator.userAgent||'')+' '+(navigator.platform||'');
+  var os = /Mac/i.test(ua)?'mac' : (/Win/i.test(ua)?'win':'other');
+  document.querySelectorAll('[data-os-card]').forEach(function(c){
+    if(c.getAttribute('data-os-card')===os) c.setAttribute('data-active','1');
+  });
+  var hint=document.getElementById('osHint');
+  if(hint) hint.innerHTML = os==='mac'?'お使いの端末は <b>macOS</b> のようです':
+                            os==='win'?'お使いの端末は <b>Windows</b> のようです':'';
+
+  // 最新リリースの各 OS 資産 URL を解決（CORS 許可済みの公開 API）
+  var rules=[
+    {id:'dl-win',        re:/x64-setup\.exe$/i},
+    {id:'dl-win-online', re:/x64-setup-online\.exe$/i},
+    {id:'dl-mac',        re:/universal\.dmg$/i}
+  ];
+  function fallback(){ document.querySelectorAll('.dl-btn').forEach(function(a){ a.href=RELEASES; a.classList.remove('is-loading'); }); }
+  fetch('https://api.github.com/repos/'+REPO+'/releases/latest',{headers:{'Accept':'application/vnd.github+json'}})
+    .then(function(r){ if(!r.ok) throw 0; return r.json(); })
+    .then(function(rel){
+      var v=document.getElementById('verLabel'); if(v) v.textContent=rel.tag_name||'';
+      rules.forEach(function(rule){
+        var a=document.getElementById(rule.id); if(!a) return;
+        var asset=(rel.assets||[]).find(function(x){ return rule.re.test(x.name); });
+        a.href = asset ? asset.browser_download_url : RELEASES;
+        a.classList.remove('is-loading');
+      });
+    })
+    .catch(fallback);
+})();
+</script>
+</body></html>
