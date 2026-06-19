@@ -1,0 +1,49 @@
+# i-repo-parquet の Iceberg モードをローカルで試すための構成
+#   MinIO（S3互換オブジェクトストア） + Apache Iceberg REST カタログ
+#
+#   起動:  docker compose up -d
+#   停止:  docker compose down -v   （-v でデータも破棄）
+#
+#   MinIO コンソール: http://localhost:9001 （admin / password）
+#   Iceberg REST:     http://localhost:8181
+services:
+  minio:
+    image: minio/minio
+    container_name: irepo-iceberg-minio
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+      MINIO_DOMAIN: minio
+    command: server /data --console-address ":9001"
+
+  # warehouse バケットを初回作成するワンショットジョブ
+  mc-init:
+    image: minio/mc
+    container_name: irepo-iceberg-mc-init
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until /usr/bin/mc alias set local http://minio:9000 admin password; do sleep 1; done;
+      /usr/bin/mc mb -p local/warehouse;
+      exit 0;
+      "
+
+  rest:
+    image: apache/iceberg-rest-fixture
+    container_name: irepo-iceberg-rest
+    depends_on:
+      - mc-init
+    ports:
+      - "8181:8181"
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"

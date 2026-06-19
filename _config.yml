@@ -1,0 +1,25 @@
+# GitHub Pages（Jekyll）設定。just-the-docs テーマで、既存の Markdown 説明書を
+# そのままサイドバー・検索つきドキュメントサイトとして公開する。
+title: i-Repo GEMBA OS
+description: 現場データを、顧客が選んだデータ基盤に届ける — ダウンロードと説明書
+remote_theme: just-the-docs/just-the-docs
+
+# 検索を有効化
+search_enabled: true
+
+# トップ以外のページ（docs/ 配下の説明書）も Pages の対象にする
+include:
+  - "docs"
+
+# Jekyll が無視するもの（配布スクリプトはサイトに混ぜない）
+exclude:
+  - install.ps1
+  - install.sh
+  - README.md
+  - Gemfile
+  - vendor
+
+# 右上リンク
+aux_links:
+  "ダウンロード（最新リリース）":
+    - "https://github.com/i-repo-community/i-repo-gemba-os-releases/releases/latest"
