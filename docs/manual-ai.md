@@ -1,7 +1,7 @@
 ---
 title: AI 連携の詳細
 parent: ユーザーマニュアル
-nav_order: 5
+nav_order: 6
 ---
 
 # AI 連携の詳細
