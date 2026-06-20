@@ -2,8 +2,9 @@
 
 > 帳票データを Elasticsearch に写し、日本語の全文検索・中間一致・集計を行う（macOS・Windows・Linux 対応）
 
-帳票データを **Elasticsearch に送る**プラグインです。i-Repo DataPipe の「Search Manager」にあたります。
-MongoDB が**正本**（更新・整合性・S3 突合）を担うのに対し、Elasticsearch は**検索の写し** ——
+帳票データを **Elasticsearch に送る**プラグインです。日本語の全文検索・あいまい検索（中間一致）や、
+項目値の集計（ファセット）に向きます。MongoDB が**正本**（更新・整合性・S3 突合）を担うのに対し、
+Elasticsearch は**検索の写し** ——
 全文検索・スコア付きの並べ替え・集計（ファセット）を担います。外部 CLI は不要で、Elasticsearch へ直接つなぎます。
 
 ## できること
