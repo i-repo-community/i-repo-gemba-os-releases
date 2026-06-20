@@ -44,7 +44,7 @@ async function loadBuiltins() {
 }
 
 const PLUGIN = "i-repo-archive";
-const VERSION = "0.4.2";
+const VERSION = "0.5.0";
 const PLUGIN_API = "1";
 const defaultArchiveRoot = () => join(homedir(), ".i-repo", "archives");
 
@@ -56,14 +56,15 @@ if (arg0 === "--plugin-schema") {
   // with subcommand bindings — GUIs render their forms from this declaration.
   console.log(JSON.stringify({
     pluginApi: [PLUGIN_API], schemaVersions: ["1.0"], recordTypes: [],
-    name: PLUGIN, version: "0.4.2",
-    description: "Stage report archives locally, then optionally push the bundle to cloud object storage (S3 / GCS / Azure Blob)",
+    name: PLUGIN, version: "0.5.0",
+    description: "帳票を bundle 化して保管：ローカル/ファイルサーバー、または S3 / GCS / Azure Blob へ配信（create=取得、push-*=配信）",
     phases: ["write", "verify"],
     platforms: ["macos", "linux", "windows"],
     // 価値軸（役割）の自己宣言。host が store 名から推測しないための機械可読宣言。
     roles: ["source", "keep"],
     // 表示カテゴリ（GUI が配信先を種別グループ表示するために読む・脱料理）。
-    // archive は「アーカイブ/バックアップ」。create=ローカル bundle / push-s3=同 bundle を S3 へ転送。
+    // archive は「アーカイブ/バックアップ」。create=ローカル bundle 生成 /
+    // push-local=指定フォルダ・ファイルサーバーへ / push-s3|gcs|azure=同 bundle をクラウドへ転送。
     category: "archive",
     // ── 抽出ソース宣言（ADC-1 / GEMBA OS が「期間・出力先」を注入し、残りは
     //    filter:true の param をユーザーが触る。host にプラグイン固有名をハードコード
@@ -91,6 +92,8 @@ if (arg0 === "--plugin-schema") {
         description: "アーカイブ bundle を Google Cloud Storage へ転送（クラウド・要 gcloud CLI）" },
       { name: "push-azure", input: ["dir"],
         description: "アーカイブ bundle を Azure Blob Storage へ転送（クラウド・要 az CLI）" },
+      { name: "push-local", input: ["dir"],
+        description: "アーカイブ bundle を指定フォルダ/ファイルサーバー（ネットワーク共有）へ保管（外部CLI不要）" },
     ],
     params: [
       // create — host 管理（filter なし）: --out（出力先）, --endpoint/--user/--password（認証）,
@@ -184,6 +187,14 @@ if (arg0 === "--plugin-schema") {
       { name: "--cleanup", type: "boolean", subcommand: "push-azure", destructive: true,
         label: "Clean up local archive",
         description: "Delete the local archive directory after the upload is verified" },
+      // push-local（ローカル/ファイルサーバー。外部CLI不要・Node fs でコピー）
+      { name: "--to", type: "string", required: true, subcommand: "push-local",
+        label: "保存先フォルダ/ファイルサーバー",
+        placeholder: "/Volumes/share/archives ・ \\\\server\\share\\archives ・ D:\\archives",
+        description: "ローカル/ネットワーク共有の保存先パス（マウント済み共有を含む）" },
+      { name: "--cleanup", type: "boolean", subcommand: "push-local", destructive: true,
+        label: "Clean up local archive",
+        description: "Delete the staged local archive directory after the copy is verified" },
       // common to all subcommands
       { name: "--dry-run", type: "boolean", label: "Dry run", description: "Validate without writing" },
     ],
@@ -206,6 +217,11 @@ if (arg0 === "--plugin-schema") {
         quirks: ["detail-optional"] },
       { datasetApi: ["1"], contract: "gemba-adc/1.0", store: "azure-bundle",
         subcommand: "push-azure", layout: "irepo-archive/1",
+        locator: { to: { param: "--to" } },
+        contents: "cumulative",
+        quirks: ["detail-optional"] },
+      { datasetApi: ["1"], contract: "gemba-adc/1.0", store: "local-bundle",
+        subcommand: "push-local", layout: "irepo-archive/1",
         locator: { to: { param: "--to" } },
         contents: "cumulative",
         quirks: ["detail-optional"] },
@@ -256,6 +272,11 @@ async function healthcheck() {
     name: "az-cli", ok: azOk, severity: "required-for:push-azure",
     hint: "Install Azure CLI (az) to use push-azure",
   });
+  // push-local は Node 組み込み fs でコピーするため外部 CLI 不要 — 常に充足。
+  checks.push({
+    name: "local-fs", ok: true, severity: "required-for:push-local",
+    hint: "No external CLI needed (uses Node fs)",
+  });
   const ok = irepoOk;
   console.log(JSON.stringify({ ok, checks }));
   return ok;
@@ -269,6 +290,7 @@ async function main() {
   if (command === "push-s3") return pushArchiveBundle(parsePushArgs(rest, S3_BACKEND), S3_BACKEND);
   if (command === "push-gcs") return pushArchiveBundle(parsePushArgs(rest, GCS_BACKEND), GCS_BACKEND);
   if (command === "push-azure") return pushArchiveBundle(parsePushArgs(rest, AZURE_BACKEND), AZURE_BACKEND);
+  if (command === "push-local") return pushArchiveBundle(parsePushArgs(rest, LOCAL_BACKEND), LOCAL_BACKEND);
   usage();
   process.exitCode = command === undefined || command === "--help" || command === "-h" ? 0 : 2;
 }
@@ -293,9 +315,12 @@ function usage() {
   ${PLUGIN} push-gcs   <archive-dir> --to gs://bucket/prefix [--cleanup] [--dry-run]
   ${PLUGIN} push-azure <archive-dir> --to https://<account>.blob.core.windows.net/<container>/<prefix>
       [--sas <token> | --connection-string <cs>] [--cleanup] [--dry-run]
+  ${PLUGIN} push-local <archive-dir> --to <folder|network-share path> [--cleanup] [--dry-run]
       --cleanup                Delete the local archive after the upload is verified
-      (gcs requires gcloud; azure requires az CLI. secrets are read from --sas/
-       --connection-string or AZURE_STORAGE_* env and passed to az via env, never argv)`);
+      (gcs requires gcloud; azure requires az CLI. push-local needs no external CLI
+       (Node fs copy) and accepts a plain folder or mounted network-share path.
+       secrets are read from --sas/--connection-string or AZURE_STORAGE_* env and
+       passed to az via env, never argv)`);
 }
 
 // ── Tiny argv parser (no dependencies) ─────────────────────────────────────
@@ -387,6 +412,28 @@ function parseCreateArgs(argv) {
   };
 }
 
+// file:// URL を OS パスへ正規化する（catalog.rs の normalize_local_dest と同基準）。host/path を
+// 分けて扱う:
+// - 空ホスト / localhost: file:///abs→/abs、file:///C:/x・file://localhost/C:/x→C:/x
+//   （Windows ドライブは先頭 / を落とす。/C:/x は Windows で別物/解釈不能）
+// - ホスト指定: file://server/share→//server/share（Windows は UNC \\server\share と解釈）
+// scheme 無しのプレーンパスはそのまま。単純 replace だと host/ドライブを壊すため明示分解する。
+function normalizeLocalDest(to) {
+  const t = String(to).trim();
+  if (!t.startsWith("file://")) return t;
+  const rest = t.slice("file://".length);
+  const i = rest.indexOf("/");
+  if (i === -1) return "//" + rest;            // ホストのみ → UNC host
+  const host = rest.slice(0, i);
+  const path = rest.slice(i);                   // 先頭 '/'
+  const isDrive = (s) => /^[A-Za-z]:/.test(s);
+  if (host === "" || host.toLowerCase() === "localhost") {
+    const inner = path.slice(1);
+    return isDrive(inner) ? inner : path;       // C:/... か /abs
+  }
+  return "//" + host + path;                     // UNC //server/share/...
+}
+
 function parsePushArgs(argv, backend) {
   const label = `push-${backend.store}`;
   const spec = { "--to": "value", "--dry-run": "flag", "--cleanup": "flag" };
@@ -394,8 +441,16 @@ function parsePushArgs(argv, backend) {
   if (backend.store === "azure") { spec["--sas"] = "value"; spec["--connection-string"] = "value"; }
   const o = parseArgv(argv, spec, label);
   if (o._.length !== 1) throw new Error(`${label} requires exactly one <archive-dir> argument.`);
-  if (!o.to) throw new Error(`${label} requires --to ${backend.scheme}…`);
-  if (!o.to.startsWith(backend.scheme)) throw new Error(`destination must start with "${backend.scheme}".`);
+  // local は scheme 付き URL ではなくファイルパス（フォルダ/ネットワーク共有）。scheme 検査を外し、
+  // 非空パスのみ要求する（任意で file:// 接頭辞を剥がす）。cloud は従来どおり scheme を強制。
+  if (backend.store === "local") {
+    const to = normalizeLocalDest(o.to ?? "");
+    if (!to) throw new Error(`${label} requires --to <folder|network-share path>.`);
+    o.to = to;
+  } else {
+    if (!o.to) throw new Error(`${label} requires --to ${backend.scheme}…`);
+    if (!o.to.startsWith(backend.scheme)) throw new Error(`destination must start with "${backend.scheme}".`);
+  }
   // Azure は blob エンドポイント URL の構造（account/container/prefix）まで parse 時に検証する
   // （dry-run でも不正 URL を早期に弾く。upload 時の parseAzureTo と同基準）。
   if (backend.store === "azure") parseAzureTo(o.to);
@@ -645,7 +700,32 @@ const AZURE_BACKEND = {
   },
 };
 
-const PUSH_BACKENDS = { s3: S3_BACKEND, gcs: GCS_BACKEND, azure: AZURE_BACKEND };
+// push-local（ローカル/ファイルサーバー）: 外部CLI不要・Node fs で再帰コピーする。
+// パス結合は path.join（cloud の "/" 強制ではなく OS のセパレータ）。Windows UNC（\\server\share）・
+// macOS（/Volumes/…）・Linux マウントの3形を素通しする（CLAUDE.md: OS 依存を局所化／cmd.exe を介さない）。
+const LOCAL_BACKEND = {
+  store: "local", scheme: "", prefixKey: "localPrefix", receiptName: "push-local.json",
+  // dry-run の dest プレビュー用（共通スケルトンが joinUri の代わりに使う）。
+  joinDest(to, batchDir) { return join(to, batchDir); },
+  async upload(archivePath, to, batchDir, _env) {
+    const destination = join(to, batchDir);
+    await fsp.mkdir(destination, { recursive: true });
+    // fs.cp(src, dest, {recursive}) は src ツリーを dest にミラーする（dest が src の複製になる）。
+    await fsp.cp(archivePath, destination, { recursive: true });
+    return destination;
+  },
+  async uploadReceipt(receiptPath, destination, _env) {
+    const target = join(destination, "receipts", this.receiptName);
+    await fsp.mkdir(dirname(target), { recursive: true });
+    await fsp.cp(receiptPath, target);
+  },
+  async verify(destination, _env) {
+    const st = await fsp.stat(join(destination, "receipts", this.receiptName)).catch(() => null);
+    return st !== null && st.size > 0;
+  },
+};
+
+const PUSH_BACKENDS = { s3: S3_BACKEND, gcs: GCS_BACKEND, azure: AZURE_BACKEND, local: LOCAL_BACKEND };
 
 async function pushArchiveBundle(options, backend) {
   const archivePath = resolveArchivePath(options.archiveDir);
@@ -658,7 +738,9 @@ async function pushArchiveBundle(options, backend) {
   const env = buildPushEnv(options);
 
   if (options.dryRun) {
-    emitReceipt("write", jobId, count, 0, false, { archivePath, [backend.prefixKey]: joinUri(options.to, batchDir), dryRun: true });
+    // local は OS パス結合（joinDest）、cloud は scheme ベースの joinUri。
+    const previewDest = backend.joinDest ? backend.joinDest(options.to, batchDir) : joinUri(options.to, batchDir);
+    emitReceipt("write", jobId, count, 0, false, { archivePath, [backend.prefixKey]: previewDest, dryRun: true });
     return;
   }
 

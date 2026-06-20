@@ -5,8 +5,8 @@
       "name": "archive",
       "file": "i-repo-archive",
       "displayName": "i-repo-archive",
-      "version": "0.4.2",
-      "description": "Stage report archives locally, then optionally push the bundle to cloud object storage (S3 / GCS / Azure Blob)",
+      "version": "0.5.0",
+      "description": "帳票を bundle 化して保管：ローカル/ファイルサーバー、または S3 / GCS / Azure Blob へ配信（create=取得、push-*=配信）",
       "platforms": [
         "macos",
         "linux",
@@ -25,7 +25,7 @@
         {
           "path": "i-repo-archive",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-archive",
-          "sha256": "f6bfad1f952ea77172fe6bb09c33d28ac6775aea0424ce2b8c7a3d29878f3dc2"
+          "sha256": "adbf8fe98081eb9e70de5332f56518651178500970f307fa1e54ec8f74b9c063"
         }
       ]
     },
@@ -54,7 +54,7 @@
         {
           "path": "i-repo-bigquery",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-bigquery",
-          "sha256": "33109757d08e7c5c1dbe6579117533b55407322eafa8775afe341008b7b25cbb"
+          "sha256": "4bf7811bfbcf3115f78f2f8cd937c0860c52d049ffaad93c7a39e46e00ca20e8"
         }
       ]
     },
@@ -83,7 +83,7 @@
         {
           "path": "i-repo-elastic",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-elastic",
-          "sha256": "fc33404add74604276f42fd49fdde447203a5265445683ccb21b2aa37609203c"
+          "sha256": "4a63fa145a749f223b5ec461e641eb9de78b523567ec46105ca0d47d47501055"
         }
       ]
     },
@@ -111,7 +111,7 @@
         {
           "path": "i-repo-mongo",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-mongo",
-          "sha256": "8ebe8633617735a423a149409363958037904c44b8800e3494a3fe99bd36bea0"
+          "sha256": "158b790136ff2aebb3a1165dd09f5b9e31d753339e3c68cc9b6c734bada9b5a6"
         }
       ]
     },
@@ -140,7 +140,7 @@
         {
           "path": "i-repo-parquet",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-parquet",
-          "sha256": "c74a2bc1be9e0610b65abc52aa8b92d094fc8482bfe428ce468ea2b54a1f267d"
+          "sha256": "d6196cd065a95874881e7ec4dfdedfbc137b4352d3ddf66772a0e942bcb76f23"
         }
       ]
     },
@@ -168,7 +168,7 @@
         {
           "path": "i-repo-sqlite",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-sqlite",
-          "sha256": "be4b23800345e1e61c95af940a96685fe92eb3ce4ec974dcbb9d6339c072af87"
+          "sha256": "7bfdc6a0702dc42a5da3e880483fc447581b2911d9224fef815573f567f3be33"
         }
       ]
     }
@@ -177,12 +177,12 @@
     {
       "path": "lib/gemba-read.js",
       "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/lib/gemba-read.js",
-      "sha256": "b3746c622a45f4f14d94a880d946df9e96559b3e28b156dc66ad13e1abb43cb9"
+      "sha256": "c5e7643d636ae837a3b9fe0ae90dce3a446d2d9a565ea1effcddfb4d8ecad0a2"
     },
     {
       "path": "lib/spawn.js",
       "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/lib/spawn.js",
-      "sha256": "5617316e0be1500801b38bc9441ab8968c6da0d6ac9f756dee5c87eab7b400b7"
+      "sha256": "dab1e5a0e2ea791a3877cca95169eafe91d8d4038828aa82c3e444e72d78b446"
     }
   ]
 }

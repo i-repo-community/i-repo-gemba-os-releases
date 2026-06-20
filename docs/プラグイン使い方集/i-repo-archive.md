@@ -1,9 +1,10 @@
 # i-repo-archive 使い方
 
-> 帳票をまとめて保管し、必要ならクラウドへアップロードする（macOS・Windows・Linux 対応）
+> 帳票をまとめて保管し、必要ならファイルサーバーやクラウドへ配信する（macOS・Windows・Linux 対応）
 
 帳票（PDF / Excel と項目の入力値）を**まとめてローカルに保管**し、必要なら
-**クラウドへアップロード**するプラグインです。アプリの配信フローでは、まずこの archive が
+**指定フォルダ・ファイルサーバー（ネットワーク共有）やクラウド（S3 / GCS / Azure）へ配信**する
+プラグインです。アプリの配信フローでは、まずこの archive が
 対象期間の帳票を取り出し、その結果を後続の送り先（SQLite / MongoDB / S3 など）へ渡します。
 
 ## できること
@@ -14,6 +15,7 @@
 | `push-s3` | 保管フォルダを Amazon S3 へアップロードする（要 aws CLI） |
 | `push-gcs` | 保管フォルダを Google Cloud Storage へアップロードする（要 gcloud CLI） |
 | `push-azure` | 保管フォルダを Azure Blob Storage へアップロードする（要 az CLI） |
+| `push-local` | 保管フォルダを**指定フォルダ・ファイルサーバー（ネットワーク共有）**へコピーする（外部 CLI 不要） |
 
 ## アプリ（GUI）での使い方
 
@@ -64,6 +66,11 @@ i-repo archive push-gcs ~/irepo-archives/2026-06 \
 # Azure Blob Storage へアップロード（認証は環境変数 or --sas / --connection-string）
 i-repo archive push-azure ~/irepo-archives/2026-06 \
   --to https://<account>.blob.core.windows.net/<container>/irepo
+
+# 指定フォルダ・ファイルサーバー（ネットワーク共有）へコピー（外部 CLI 不要）
+# --to はマウント済みの共有/フォルダのパス。保管フォルダ名が末尾に自動付与される。
+i-repo archive push-local ~/irepo-archives/2026-06 \
+  --to /Volumes/share/irepo        # 例: Windows は \\server\share\irepo、Linux は /mnt/share/irepo
 ```
 
 ## 主なパラメータ
@@ -85,15 +92,15 @@ i-repo archive push-azure ~/irepo-archives/2026-06 \
 | `--allow-worktree` | bool | git ワークツリー内への書き込みを許可 |
 | `--endpoint`/`--user`/`--password` | string | 取り込み元の i-Reporter 接続先を上書き |
 
-### push-s3 / push-gcs / push-azure（クラウドへアップロード）
+### push-s3 / push-gcs / push-azure / push-local（保管フォルダの配信）
 
 | パラメータ | 型 | 説明 |
 |---|---|---|
-| `--to` | string **(必須)** | アップロード先の**親プレフィックス**（保管フォルダ名が末尾に自動付与）。s3=`s3://bucket/prefix`、gcs=`gs://bucket/prefix`、azure=`https://<account>.blob.core.windows.net/<container>/prefix` |
-| `--cleanup` | bool | アップロード確認後にローカルの保管フォルダを削除 |
+| `--to` | string **(必須)** | 配信先の**親プレフィックス／親フォルダ**（保管フォルダ名が末尾に自動付与）。s3=`s3://bucket/prefix`、gcs=`gs://bucket/prefix`、azure=`https://<account>.blob.core.windows.net/<container>/prefix`、local=フォルダ/ネットワーク共有のパス（例 `/Volumes/share/irepo`、`\\server\share\irepo`、`D:\irepo`） |
+| `--cleanup` | bool | 配信確認後にローカルの保管フォルダを削除 |
 | `--sas` / `--connection-string` | string | （push-azure のみ）認証。値は **az の引数には載せず**環境変数で渡します。CLI を手で打つ場合は、シェル履歴やプロセス一覧に残らないよう**環境変数での指定を推奨**。未指定時はサインイン認証 |
 
-> S3 は `aws` CLI、GCS は `gcloud` CLI、Azure は `az` CLI が必要です。アプリの「プラグイン」タブで各 CLI の有無・認証を確認できます。
+> S3 は `aws` CLI、GCS は `gcloud` CLI、Azure は `az` CLI が必要です。**push-local は外部 CLI 不要**（OS のファイルコピーで動きます。ネットワーク共有はあらかじめマウント／割り当てしておきます）。アプリの「プラグイン」タブで各 CLI の有無・認証を確認できます。
 
 ### 共通
 
