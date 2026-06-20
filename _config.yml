@@ -4,6 +4,9 @@ title: i-Repo GEMBA OS
 description: 現場データを、顧客が選んだデータ基盤に届ける — ダウンロードと説明書
 remote_theme: just-the-docs/just-the-docs
 
+# サイトロゴ（マニュアル各ページのサイドバー上部に表示）
+logo: "/assets/img/app-icon.png"
+
 # 検索を有効化
 search_enabled: true
 

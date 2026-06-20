@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="icon" type="image/png" href="{{ '/assets/img/app-icon.png' | relative_url }}">
 <title>i-Repo GEMBA OS — 現場データ基盤</title>
 <style>
   :root{
@@ -29,8 +29,9 @@
   header.nav{position:sticky; top:0; z-index:30; background:var(--paper); border-bottom:3px solid var(--ink)}
   .nav-in{display:flex; align-items:center; gap:18px; height:66px}
   .brand{display:flex; align-items:center; gap:12px; font-weight:900; font-size:17px; letter-spacing:-.02em}
-  .logo{width:38px; height:38px; display:grid; place-items:center; background:var(--accent); color:var(--accent-ink);
-    font-weight:900; font-size:15px; border:2px solid var(--ink); box-shadow:var(--shadow-sm)}
+  .logo{width:38px; height:38px; display:flex; flex-direction:column; align-items:center; justify-content:center; line-height:.95; background:var(--accent); color:#fff;
+    font-weight:900; font-size:11px; letter-spacing:.5px; border:2px solid var(--ink); box-shadow:var(--shadow-sm)}
+  .logo span{display:block}
   .nav-sp{flex:1}
   .nav .nlink{font-family:var(--mono); font-size:13px; font-weight:600; letter-spacing:.04em; padding:6px 4px; border-bottom:2px solid transparent}
   .nav .nlink:hover{border-bottom-color:var(--accent)}
@@ -136,7 +137,7 @@
 
 <header class="nav">
   <div class="wrap nav-in">
-    <a class="brand" href="#top"><span class="logo">GO</span> i-Repo&nbsp;GEMBA&nbsp;OS</a>
+    <a class="brand" href="#top"><span class="logo"><span>IR</span><span>GO</span></span> i-Repo&nbsp;GEMBA&nbsp;OS</a>
     <span class="nav-sp"></span>
     <a class="nlink" href="#download">DOWNLOAD</a>
     <a class="nlink hide-sm" href="#features">FEATURES</a>
