@@ -1,0 +1,170 @@
+// i-Repo GEMBA OS — 使い方ページ（just-the-docs）を landing のネオブルータリズムに合わせる上書き。
+// just-the-docs（remote_theme）は本体 SCSS の末尾で `@import "custom/custom";` するので、
+// ここのプレーン CSS が cascade/specificity で最後に効く。
+// 方針: SCSS 変数（$body-background-color 等）には触れない。版差で未定義変数があると
+//       SCSS コンパイルごとサイトが壊れるため、確実に効くプレーン CSS 上書きだけで寄せる。
+
+:root {
+  --ink: #141210;
+  --paper: #f3efe6;
+  --paper2: #ece7da;
+  --accent: #ff5a1f;
+  --accent-ink: #140a04;
+  --shadow: 6px 6px 0 var(--ink);
+  --shadow-sm: 4px 4px 0 var(--ink);
+  --sans: "Helvetica Neue", Helvetica, Arial, "Hiragino Kaku Gothic ProN", "Yu Gothic UI", Meiryo, system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+}
+
+// ---- 全体パレット（紙色＋黒インク。本文背景はグリッド無しで可読性優先） ----
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+}
+.side-bar,
+.main {
+  background: var(--paper);
+}
+
+// ---- サイドバー / ヘッダー（太い罫線でブロック化） ----
+.side-bar {
+  border-right: 3px solid var(--ink);
+}
+.site-header {
+  border-bottom: 3px solid var(--ink);
+}
+.site-title {
+  font-weight: 900;
+  letter-spacing: -0.02em;
+  color: var(--ink) !important;
+}
+.site-title:hover {
+  background-image: none;
+  background-color: var(--paper2);
+}
+
+// ---- ナビ（アクティブはオレンジ、ホバーは紙2） ----
+.nav-list .nav-list-item .nav-list-link {
+  color: var(--ink);
+}
+.nav-list .nav-list-item .nav-list-link:hover {
+  background-image: none;
+  background-color: var(--paper2);
+}
+.nav-list .nav-list-item .nav-list-link.active {
+  font-weight: 800;
+  background-image: none;
+  background-color: var(--paper2);
+}
+// アクティブ項目の左バーをアクセント色に
+.nav-list .nav-list-item > .nav-list-link.active::before {
+  background-color: var(--accent);
+}
+
+// ---- 見出し（太字・字詰め。h1/h2 は黒罫線で landing のセクション感） ----
+.main-content {
+  h1, h2, h3, h4, h5 {
+    color: var(--ink);
+    font-weight: 900;
+    letter-spacing: -0.02em;
+  }
+  h1 {
+    border-bottom: 4px solid var(--ink);
+    padding-bottom: 0.25em;
+  }
+  h2 {
+    border-bottom: 3px solid var(--ink);
+    padding-bottom: 0.2em;
+    margin-top: 1.6em;
+  }
+
+  // ---- 本文リンク（黒文字＋アクセント下線。ホバーでオレンジ反転＝landing の mark と統一） ----
+  a:not(.btn) {
+    color: var(--ink);
+    text-decoration: none;
+    border-bottom: 2px solid var(--accent);
+  }
+  a:not(.btn):hover {
+    background-color: var(--accent);
+    color: var(--accent-ink);
+    border-bottom-color: var(--ink);
+  }
+
+  // ---- コードブロック（黒地・紙文字・ハードシャドウ。landing の .code と同じ） ----
+  .highlight,
+  figure.highlight,
+  pre.highlight,
+  div.highlighter-rouge {
+    background: var(--ink) !important;
+    border: 2px solid var(--ink);
+    box-shadow: var(--shadow-sm);
+    border-radius: 0;
+  }
+  pre.highlight,
+  pre.highlight code,
+  .highlight code {
+    background: transparent !important;
+    color: var(--paper);
+  }
+  // インラインコード（紙2地・細罫）
+  code.language-plaintext.highlighter-rouge,
+  p code,
+  li code,
+  td code {
+    background-color: var(--paper2);
+    color: var(--ink);
+    border: 1px solid var(--ink);
+    border-radius: 0;
+  }
+
+  // ---- 表（ハードボーダー＋影。ヘッダ行は黒地紙文字） ----
+  .table-wrapper {
+    box-shadow: var(--shadow-sm);
+    border-radius: 0;
+  }
+  table {
+    border: 2px solid var(--ink);
+    border-radius: 0;
+  }
+  th, td {
+    border: 1px solid var(--ink);
+  }
+  thead th {
+    background-color: var(--ink);
+    color: var(--paper);
+  }
+
+  // ---- 引用 / 注記 ----
+  blockquote {
+    border-left: 6px solid var(--accent);
+    background-color: var(--paper2);
+    padding: 0.6em 1em;
+  }
+}
+
+// ---- ボタン・ラベル・検索（角ゼロ＋黒罫＋ハードシャドウ） ----
+.btn {
+  border: 2px solid var(--ink);
+  border-radius: 0;
+  box-shadow: var(--shadow-sm);
+  font-weight: 800;
+}
+.btn-primary {
+  background-color: var(--accent);
+  color: var(--accent-ink);
+}
+.search-input {
+  border: 2px solid var(--ink);
+  border-radius: 0;
+}
+.search-result {
+  border-radius: 0;
+}
+// セクション見出し（サイドバーのカテゴリ）等は等幅で landing の kick に寄せる
+.nav-category {
+  font-family: var(--mono);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--accent);
+}
