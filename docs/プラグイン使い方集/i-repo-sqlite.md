@@ -1,16 +1,75 @@
 # i-repo-sqlite 使い方
 
-> Accumulate NDJSON records into a local SQLite database（UPSERT by idempotencyKey）
-> （version 0.1.0 / phases: write, verify / input: stdin-ndjson / mac・Linux・Windows）
+> 帳票データを手元の SQLite データベースにためて、Excel や BI ツールから読めるようにする（macOS・Windows・Linux 対応）
 
-manifest の NDJSON を **ローカルSQLite に蓄積**する配信プラグイン。
-サーバー不要・1ファイルで完結するため、**BIツール（Excel/Power BI/Metabase等）から直接読む**用途や、
-ネットワークに出さずに手元で集計したいケースに向きます。Node.js 22.5+ の組み込み `node:sqlite` を使い、
-追加の npm 依存はありません。
+帳票（項目の入力値）を**手元の SQLite ファイル1つにためていく**送り先プラグインです。
+サーバーを立てる必要がなく、ファイルが1つあれば完結するので、**Excel / Power BI / Metabase などの
+BI ツールから直接読みたい**ときや、**ネットワークに出さずに手元で集計したい**ときに向きます。
 
-## テーブル構造
+同じ帳票を何度送っても**重複せず、最新の内容で上書き**されます。
 
-`idempotency_key` を主キーに UPSERT します（同じ帳票の再実行で重複しない）。
+## できること
+
+- 帳票の入力値を、手元の SQLite ファイル（1ファイル）にためていく
+- Excel / Power BI / Metabase などの BI ツールから直接読む
+- SQL でしぼり込み・集計する（クラスター値も検索できる）
+
+## アプリ（GUI）での使い方
+
+1. 接続先テンプレート → 新規 → プラグイン **sqlite** を選択
+2. フォームに入力
+   - **SQLite DBファイル**（必須）: `~/irepo-warehouse.db`（無ければ作成）
+   - **テーブル名**（既定 `reports`）
+3. 保存 → フローの配信先として選択
+
+> 💡 不具合内容・場所などの**項目の入力値**まで検索したいときは、抽出設定で「項目の入力値も含める」を ON にしてください（archive 側の設定）。OFF だと一覧の値だけが入ります。
+
+## CLI での使い方
+
+```bash
+# 取り出した帳票を SQLite にためる
+cat .../manifests/reports.ndjson \
+  | i-repo sqlite --db ~/irepo-warehouse.db --table reports
+
+# 書き込まず確認だけ
+cat .../reports.ndjson | i-repo sqlite --db ~/irepo-warehouse.db --dry-run
+```
+
+## 主なパラメータ
+
+| パラメータ | 型 | 必須 | 説明 |
+|---|---|:--:|---|
+| `--db` | string | ✓ | 出力先 SQLite ファイル（無ければ作成） |
+| `--table` | string | | テーブル名（既定: `reports`、無ければ作成） |
+| `--dry-run` | bool | | 書き込まず確認のみ |
+
+## トラブルシューティング
+
+- **項目の入力値（クラスター値）が入っていない** → 抽出設定の「項目の入力値も含める」が OFF。アプリならフローのトグルを確認する。
+- **`node:sqlite` が無いエラー** → Node.js 22.5 以上が必要。`node --version` で確認する。
+- **送信済みの確認がとれない（失敗扱い）** → ためた件数が合っていない状態です。取り出しの途中で中断していないか確認する。
+
+## SQLite と MongoDB の使い分け
+
+| | SQLite | MongoDB |
+|---|---|---|
+| サーバー | 不要（1ファイル） | 必要 |
+| BI ツール連携 | 直接読みやすい | 専用コネクタが必要 |
+| 入れ子の検索 | SQL でひと手間かけて展開 | そのまま入れ子を検索 |
+| 規模 | 手元・単一マシン向け | 共有・大規模向け |
+| 向き | **手元集計・BI ですぐ使える** | **共有・大規模・全文検索** |
+
+---
+
+## 技術メモ（仕組み）
+
+> ここから先は仕組みを知りたい人向けです。ふだんの利用では読まなくて問題ありません。
+
+Node.js 22.5+ の組み込み `node:sqlite` を使い、追加の npm 依存はありません。
+
+### テーブル構造
+
+`idempotency_key` を主キーに UPSERT します（同じ帳票を再度送っても重複せず、最新の内容で上書きされます）。
 
 | カラム | 内容 |
 |---|---|
@@ -21,40 +80,13 @@ manifest の NDJSON を **ローカルSQLite に蓄積**する配信プラグイ
 | `name` | 帳票名 |
 | `deleted` | 削除フラグ |
 | `regist_time` / `update_time` | 登録・更新日時 |
-| `raw_json` | レコード全体のJSON（detail/artifacts含む） |
+| `raw_json` | レコード全体のJSON（detail/artifacts 含む） |
 | `loaded_at` | 取込時刻 |
 
-> クラスター値（`detail`）は `raw_json` の中に格納されます。SQLiteの
-> [JSON関数](https://www.sqlite.org/json1.html)（`json_extract` 等）で取り出して検索・集計できます。
+クラスター値（`detail`）は `raw_json` の中に格納されます。SQLite の
+[JSON関数](https://www.sqlite.org/json1.html)（`json_extract` 等）で取り出して検索・集計できます。
 
-## Connector（GUI）での使い方
-
-1. 接続先テンプレート → 新規 → プラグイン **sqlite** を選択
-2. フォームに入力
-   - **SQLite DBファイル**（必須）: `~/irepo-warehouse.db`（無ければ作成）
-   - **テーブル名**（既定 `reports`）
-3. 保存 → フローの配信先として選択（`--with-detail`をONにすると`raw_json`にクラスター値が入る）
-
-## CLI での使い方
-
-```bash
-# manifest を SQLite に蓄積
-cat .../manifests/reports.ndjson \
-  | i-repo sqlite --db ~/irepo-warehouse.db --table reports
-
-# 書き込まず検証だけ
-cat .../reports.ndjson | i-repo sqlite --db ~/irepo-warehouse.db --dry-run
-```
-
-## パラメータ
-
-| パラメータ | 型 | 必須 | 説明 |
-|---|---|:--:|---|
-| `--db` | string | ✓ | 出力先SQLiteファイル（無ければ作成） |
-| `--table` | string | | テーブル名（既定: `reports`、無ければ作成） |
-| `--dry-run` | bool | | 書き込まず検証のみ |
-
-## SQL での検索例（クラスター値を JSON 関数で）
+### SQL での検索例（クラスター値を JSON 関数で）
 
 `raw_json` に `detail.clusters` が入っているので、JSON関数で展開して検索します。
 
@@ -74,18 +106,7 @@ WHERE json_extract(je.value, '$.name') = '指摘区分'
 GROUP BY 1 ORDER BY 件数 DESC;
 ```
 
-## Mongo / SQLite の使い分け
+### 成功の判定について
 
-| | SQLite | MongoDB |
-|---|---|---|
-| サーバー | 不要（1ファイル） | 必要 |
-| BIツール連携 | ODBC/直読みが容易 | コネクタ要 |
-| ネスト検索 | `json_each` で展開（やや冗長） | ネイティブにネスト検索 |
-| 規模 | 〜数十万件・単一マシン | スケールアウト前提 |
-| 向き | **手元集計・BI Ready** | **共有・大規模・全文検索** |
-
-## トラブルシューティング
-
-- **`node:sqlite` が無いエラー** → Node.js 22.5 以上が必要。`node --version` を確認。
-- **クラスター値が `raw_json` に無い** → archive側の`--with-detail`が必要。
-- **`verified:false`** → 書き戻し件数の不一致。stdinの途中切断やトレーラー欠落を確認。
+書き込み後、ためた件数が宣言どおりに揃ったときだけ「送信済みの確認」（receipt の `verified:true`）が立ちます。
+途中で入力が切れている（トレーラ欠落など）と、この確認は立ちません。
