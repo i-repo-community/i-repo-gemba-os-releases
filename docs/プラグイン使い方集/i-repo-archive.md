@@ -95,6 +95,7 @@ i-repo archive push-s3 ~/irepo-archives/2026-06 \
 ## 主なパラメータ
 
 ### create
+
 | パラメータ | 型 | 説明 |
 |---|---|---|
 | `--out` | string | 出力先ディレクトリ（既定: `~/.i-repo/archives/<timestamp>`） |
@@ -111,12 +112,14 @@ i-repo archive push-s3 ~/irepo-archives/2026-06 \
 | `--endpoint`/`--user`/`--password` | string | 内側のi-repo呼び出しの接続先を上書き |
 
 ### push-s3
+
 | パラメータ | 型 | 説明 |
 |---|---|---|
 | `--to` | string **(必須)** | アップロード先（`s3://bucket/prefix`） |
 | `--cleanup` | bool | 検証成功後にローカルアーカイブを削除 |
 
 ### 共通
+
 | パラメータ | 型 | 説明 |
 |---|---|---|
 | `--dry-run` | bool | 書き込まず検証のみ |

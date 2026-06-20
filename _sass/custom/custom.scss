@@ -36,8 +36,11 @@ body {
 }
 .site-title {
   font-weight: 900;
-  letter-spacing: -0.02em;
+  letter-spacing: -0.03em;
   color: var(--ink) !important;
+  // 「i-Repo GEMBA OS」を折り返さず1行で（太字化で幅が増え折れていたため）。
+  white-space: nowrap;
+  font-size: 1.05rem;
 }
 .site-title:hover {
   background-image: none;
