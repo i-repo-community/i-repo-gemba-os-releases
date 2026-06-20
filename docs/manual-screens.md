@@ -1,0 +1,26 @@
+---
+title: 画面の使い方
+parent: ユーザーマニュアル
+nav_order: 2
+has_children: true
+---
+
+# 画面の使い方
+
+サイドバーの並びは、データの流れ（**つなぐ → 作る → 動かす → 見る → 片付ける**）に沿っています。
+各画面の詳しい使い方は、左メニューのこのページ配下、または下のリンクから開けます。
+
+| 画面 | 役割 |
+|---|---|
+| [概要](screen-overview.html) | 全体の状況をひと目で見るダッシュボード |
+| [接続先テンプレート](screen-connections.html) | 送り先を名前を付けて保存・再利用 |
+| [フロー作成](screen-flows.html) | 「どの帳票を・いつ・どこへ」を1セットにまとめる |
+| [実行状況](screen-runs.html) | 実行ログ・成功確認・再実行 |
+| [データ確認](screen-reports.html) | 送信元と送信済みを突き合わせ |
+| [クリーンアップ設定](screen-cleanup.html) | 元データの整理（保持期間・承認・ソフトデリート） |
+| [現場蓄積データ](screen-gemba.html) | 送信済みを読み取り専用で閲覧・検索 |
+| [スケジュール](screen-scheduler.html) | 定期実行・カレンダー・OS タスク登録 |
+| [着信 Webhook](screen-webhook.html) | 外部システムからフローを起動 |
+| [プラグイン](screen-plugins.html) | 送り先部品の状態・フォルダ・削除 |
+| [エージェント接続](screen-mcp.html) | Claude / Codex に読み取り専用でつなぐ |
+| [現場 AI チャット](screen-agent.html) | アプリ内で AI に日本語で質問 |
