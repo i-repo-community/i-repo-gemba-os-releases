@@ -1,0 +1,40 @@
+---
+title: アプリの更新（バージョンアップ）
+parent: ユーザーマニュアル
+nav_order: 2
+---
+
+# アプリの更新（バージョンアップ）
+
+新しいバージョンが出たら、**最新版をダウンロードして入れ直す**ことで更新できます
+（現在は手動更新です。自動更新は準備中です）。
+
+## 更新の手順
+
+1. [更新情報（What's New）](更新情報.html) や
+   [リリース一覧](https://github.com/i-repo-community/i-repo-gemba-os-releases/releases) で
+   新しいバージョンを確認します。
+2. 最新の配布物をダウンロードします（[最新リリース](https://github.com/i-repo-community/i-repo-gemba-os-releases/releases/latest)）。
+3. 入れ替えます。
+   - **Windows**: 新しいインストーラ（`…-setup.exe` / 軽量版 `…-setup-online.exe`）を実行します。
+   - **macOS**: 新しい `.dmg` を開き、アプリを「アプリケーション」へ上書きコピーします。
+
+## 更新しても消えないもの
+
+設定や送信実績は**アプリ本体とは別の場所**（`~/.i-repo/` とアプリのデータ領域）に保存されるため、
+入れ替えても**そのまま引き継がれます**。
+
+- i-Reporter の接続設定（エンドポイント・ID）／フロー／接続先テンプレート
+- 送信実績・[現場蓄積データ](screen-gemba.html)・カタログ（AI 連携の索引）
+- 送り先プラグイン（`~/.i-repo/plugins/`）
+
+## プラグインの更新
+
+新しいアプリ版で**同梱プラグインが新しくなっている**場合は、[初回セットアップ](manual-setup.html)と
+同じインストールコマンドを再実行すると、プラグインも最新になります。
+
+- Windows: `powershell -ExecutionPolicy Bypass -File .\plugins\install.ps1`
+- macOS / Linux: `./plugins/install.sh`
+
+> フロー一覧に「**版変更**」と出るのは、抽出プラグインが更新されたお知らせです。対処は
+> [フロー作成 ＞「版変更」と表示されたとき](screen-flows.html#version-changed) を参照してください。

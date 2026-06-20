@@ -1,7 +1,7 @@
 ---
 title: 画面の使い方
 parent: ユーザーマニュアル
-nav_order: 2
+nav_order: 3
 has_children: true
 ---
 
