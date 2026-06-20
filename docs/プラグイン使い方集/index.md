@@ -1,60 +1,102 @@
 # i-Repo プラグイン使い方集
 
-i-Repo GEMBA OS が利用する i-repo CLI プラグインの使い方をまとめます。
-各プラグインは **自己記述（`--plugin-schema`）** を持ち、Connector の GUI はそのスキーマから
-入力フォームを自動生成します。このため「プラグインを追加・修正すれば GUI は改修不要で追従」します。
+i-Repo GEMBA OS が使う i-repo CLI プラグインの使い方をまとめます。
+各プラグインは**自分の入力項目を申告する仕組み**を持っているため、アプリの GUI は
+その情報から入力フォームを自動生成します。プラグインを追加・修正すれば、GUI を作り直さなくても
+そのまま追従します。
 
 ## プラグイン一覧
 
-| プラグイン | 役割 | 入力(intake) | 対応OS | ドキュメント |
-|---|---|---|---|---|
-| **archive** | 帳票のスナップショット作成（PDF/Excel/メタ＋クラスター詳細）。S3への一括push | `create`:none / `push-s3`:dir | mac/Linux/Win | [i-repo-archive](i-repo-archive.md) |
-| **mongo** | NDJSONをMongoDBへupsert（帳票IDキーでネスト構造を保持） | stdin-ndjson | mac/Linux/Win | [i-repo-mongo](i-repo-mongo.md) |
-| **s3** | NDJSON/ファイルをS3へ配信 | stdin-ndjson / files | mac/Linux | [i-repo-s3](i-repo-s3.md) |
-| **sqlite** | NDJSONをローカルSQLiteへ蓄積（BI Ready） | stdin-ndjson | mac/Linux/Win | [i-repo-sqlite](i-repo-sqlite.md) |
-| **elastic** | NDJSONをElasticsearchへindex（全文検索・ファセットの写し） | stdin-ndjson | mac/Linux/Win | [i-repo-elastic](i-repo-elastic.md) |
-| **parquet** | NDJSONをParquet / Apache Icebergへ（Lakehouse Ready） | stdin-ndjson | mac/Linux/Win | [i-repo-parquet](i-repo-parquet.md) |
-| **hello** | 動作確認用サンプル（引数・環境変数の確認） | — | 全OS | [i-repo-hello](i-repo-hello.md) |
+下の表から、使いたいプラグインのページに進めます。
 
-## 役割分担（i-Repo DataPipe 構想）
+| プラグイン | 役割 | 対応OS | ドキュメント |
+|---|---|---|---|
+| **archive** | 帳票（PDF / Excel と項目の入力値）をまとめて保管し、必要なら S3 へアップロード | mac / Linux / Win | [i-repo-archive](i-repo-archive.md) |
+| **mongo** | MongoDB に蓄積（帳票IDをキーに、ネスト構造のまま保持） | mac / Linux / Win | [i-repo-mongo](i-repo-mongo.md) |
+| **sqlite** | ローカルの SQLite に蓄積（そのまま BI ツールで使える） | mac / Linux / Win | [i-repo-sqlite](i-repo-sqlite.md) |
+| **elastic** | Elasticsearch に取り込む（全文検索・絞り込み向け） | mac / Linux / Win | [i-repo-elastic](i-repo-elastic.md) |
+| **parquet** | Parquet / Apache Iceberg に書き出す（データ分析基盤向け） | mac / Linux / Win | [i-repo-parquet](i-repo-parquet.md) |
+| **s3** | ファイルや一覧データを Amazon S3 へ配信 | mac / Linux | [i-repo-s3](i-repo-s3.md) |
+| **hello** | 動作確認用のサンプル | 全OS | [i-repo-hello](i-repo-hello.md) |
+
+## どれを選べばいい？
+
+まず **archive** で帳票を取り出し、その結果を送り先プラグインに渡す、という流れが基本です。
+送り先は「取り出したデータをどう使いたいか」で選びます。
+
+| やりたいこと | おすすめ |
+|---|---|
+| 帳票の中身（不具合内容・場所など）を検索・集計したい | **sqlite**（手軽に始められる）/ **mongo** |
+| BI ツールやダッシュボードでグラフ化したい | **sqlite** / **parquet** |
+| 言葉での全文検索や絞り込みをしたい | **elastic** |
+| 大量データを分析基盤（データレイク）に貯めたい | **parquet** |
+| PDF / Excel の実体ファイルをクラウドに保管したい | **s3** |
+| まずは帳票をローカルにまとめて保管したい | **archive** |
+
+> 迷ったら、検索や集計の入口として **sqlite** から始めるのが手軽です。
+> あとから別の送り先を追加することもできます。
+
+## データの流れ
 
 ```
                  ┌─────────────────────────────────────────┐
                  │  i-Repo GEMBA OS（このアプリ）      │
                  │  抽出範囲・配信先・スケジュールを管理       │
                  └───────────────┬─────────────────────────┘
-                                 │ i-repo CLI を spawn
+                                 │ i-repo CLI を呼び出す
         ┌────────────────────────┼────────────────────────┐
         ▼                        ▼                         ▼
    ┌─────────┐            ┌──────────────────┐      ┌──────────────┐
-   │ archive │  manifest  │    配信プラグイン    │      │   配信プラグイン │
-   │ create  │──NDJSON──▶ │  mongo / sqlite   │      │      s3       │
+   │ archive │   一覧     │    送り先プラグイン   │      │   送り先プラグイン│
+   │ create  │──データ──▶ │  mongo / sqlite   │      │      s3       │
    └─────────┘            │ elastic / parquet │      │（実体PDF/Excel）│
-                          │ （構造化データ）     │      └──────────────┘
-                          └──────────────────┘       objectKey で突合
-                       正本 / BI / 検索 / Lakehouse
+                          │ （項目の入力値など）  │      └──────────────┘
+                          └──────────────────┘       一覧と実体を突合
+                       保管 / BI / 検索 / 分析基盤
 ```
 
-- **構造化データ**（クラスター値・メタ）は Mongo（正本）/ SQLite（BI）/ Elastic（検索）/ Parquet・Iceberg（Lakehouse）に
-- **実体ファイル**（PDF/Excel）は S3 に
-- 両者は `artifacts[].objectKey` でリンク（`--with-detail` 時に付与）
-- 冪等キー `report:<itemId>:rev<revNo>` が全sink共通 → どのストア間でも突合できる
+- **項目の入力値やメタ情報**（不具合内容・場所など）は mongo / sqlite / elastic / parquet へ
+- **実体ファイル**（PDF / Excel）は s3 へ
+- 一覧データと実体ファイルは共通の番号でひも付くため、どの送り先どうしでも突合できます
 
 ## 配信の安全設計（全プラグイン共通）
 
-すべての配信プラグインは **write → verify → receipt** の3段で動きます。
+すべての送り先プラグインは、**書き込み → 確認 → 控えの発行**の3段で動きます。
 
-1. **write**: 書き込み（upsert / upload）
-2. **verify**: 読み戻して件数・内容を照合
-3. **receipt**: `verified:true/false` を含む受領書を出力
+1. **書き込み**: 送り先にデータを書き込む
+2. **確認**: 書いた内容を読み戻して、件数・中身が合っているか照合する
+3. **控えの発行**: 「送信済みの確認」が取れたかどうかを記録する
 
-Connector は **`verified:true` のときだけ「外部書き出し済み」フラグ**を付けます。
-`--dry-run` は検証のみで書き込まず、書き出し済みにもしません（クリーンアップ事故の防止）。
+アプリは、この**「送信済みの確認」が取れたときだけ**「外部へ書き出し済み」の印を付けます。
+お試し実行（書き込まずに確認だけ行うモード）では書き出し済みにはならないので、
+うっかり消してしまう事故を防げます。
 
 ## 共通の前提
 
-- i-Reporter の認証（エンドポイント/ID/PW）は **i-repo CLI設定**（`~/.i-repo/i-repo.json`）を共有します。
-  Connector の「設定」画面から編集できます。
+- i-Reporter への接続先（エンドポイント / ID / パスワード）は、i-repo CLI の設定を共有します。
+  アプリの「設定」画面から編集できます。
 - プラグインは `~/.i-repo/plugins/` に置かれた実行ファイルです。
-- Connector の「プラグイン」タブで、各プラグインの healthcheck（依存・認証の充足）と
-  契約適合（verify）を確認できます。
+- アプリの「プラグイン」タブで、各プラグインの**依存・認証の充足チェック**と、
+  規約どおりに動くかの確認ができます。
+
+---
+
+## 技術メモ（仕組み）
+
+> ここから先は仕組みを知りたい人向けです。ふだんの利用では読まなくて問題ありません。
+
+- **プラグインの自己記述（`--plugin-schema`）**: 各プラグインは自分の入力項目・依存関係などを
+  機械可読な形で申告します。アプリの GUI は、この申告（manifest）を読んで入力フォームを自動生成します。
+- **入力(intake)の種類**: プラグインがデータを受け取る方法です。`archive create` は入力なし（自分で取り出す）、
+  `archive push-s3` は保管フォルダ（dir）、送り先プラグイン（mongo / sqlite / elastic / parquet）は
+  標準入力の NDJSON（一覧データを1行1帳票で流し込む）、s3 は NDJSON またはファイル群を受け取ります。
+- **冪等キー**: 各帳票には `report:<itemId>:rev<revNo>` 形式のキーが付き、全送り先で共通です。
+  これにより、同じ帳票を何度送っても重複せず、送り先どうしの突合もできます。実体ファイルとの
+  ひも付けには `artifacts[].objectKey` を使います（項目の入力値を含めて取り込んだとき付与）。
+- **受領書（receipt）と `verified:true`**: 「確認」段で照合に成功すると、受領書に `verified:true` が
+  記録されます。アプリが「書き出し済み」と判定するのはこの値が `true` のときだけで、
+  コマンドが正常終了しただけでは成功とみなしません。
+- **healthcheck**: 「依存・認証の充足チェック」のことです。必要なコマンド（例: `aws` CLI）の有無や
+  認証状態を確認します。
+- **secret の扱い**: パスワードや API キーなどの秘匿値（secretParams）は、コマンドに直接書かず
+  環境変数などで渡します。
