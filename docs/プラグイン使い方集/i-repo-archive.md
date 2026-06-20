@@ -51,17 +51,19 @@ i-repo archive create \
   --regist-to   "2026/06/30 23:59:59"
 
 # 保管フォルダを S3 へアップロード（アップロード確認後にローカルを削除）
+# ※ --to は「親プレフィックス」を指定する。保管フォルダ名（例 2026-06）が自動で末尾に付き、
+#    アップロード先は s3://my-bucket/irepo/2026-06/... になる。
 i-repo archive push-s3 ~/irepo-archives/2026-06 \
-  --to s3://my-bucket/irepo/2026-06 \
+  --to s3://my-bucket/irepo \
   --cleanup
 
 # Google Cloud Storage へアップロード
 i-repo archive push-gcs ~/irepo-archives/2026-06 \
-  --to gs://my-bucket/irepo/2026-06
+  --to gs://my-bucket/irepo
 
 # Azure Blob Storage へアップロード（認証は環境変数 or --sas / --connection-string）
 i-repo archive push-azure ~/irepo-archives/2026-06 \
-  --to https://<account>.blob.core.windows.net/<container>/irepo/2026-06
+  --to https://<account>.blob.core.windows.net/<container>/irepo
 ```
 
 ## 主なパラメータ
@@ -87,9 +89,9 @@ i-repo archive push-azure ~/irepo-archives/2026-06 \
 
 | パラメータ | 型 | 説明 |
 |---|---|---|
-| `--to` | string **(必須)** | アップロード先。s3=`s3://bucket/prefix`、gcs=`gs://bucket/prefix`、azure=`https://<account>.blob.core.windows.net/<container>/prefix` |
+| `--to` | string **(必須)** | アップロード先の**親プレフィックス**（保管フォルダ名が末尾に自動付与）。s3=`s3://bucket/prefix`、gcs=`gs://bucket/prefix`、azure=`https://<account>.blob.core.windows.net/<container>/prefix` |
 | `--cleanup` | bool | アップロード確認後にローカルの保管フォルダを削除 |
-| `--sas` / `--connection-string` | string | （push-azure のみ）認証。値は安全のため環境変数で渡されます（コマンドには平文で出ません）。未指定時はサインイン認証 |
+| `--sas` / `--connection-string` | string | （push-azure のみ）認証。値は **az の引数には載せず**環境変数で渡します。CLI を手で打つ場合は、シェル履歴やプロセス一覧に残らないよう**環境変数での指定を推奨**。未指定時はサインイン認証 |
 
 > S3 は `aws` CLI、GCS は `gcloud` CLI、Azure は `az` CLI が必要です。アプリの「プラグイン」タブで各 CLI の有無・認証を確認できます。
 
