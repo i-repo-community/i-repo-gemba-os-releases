@@ -1,0 +1,583 @@
+#!/usr/bin/env node
+/**
+ * i-repo-elastic — sink plugin: index i-repo NDJSON records into Elasticsearch.
+ *
+ * 構想「i-Repo DataPipe」の Search Manager 相当。
+ * MongoDB が正本（更新・整合性・S3突合）を担うのに対し、Elasticsearch は
+ * 「検索の写し」— 転置インデックスによる日本語全文検索・中間一致・ファセット集計を担う。
+ * detail.clusters のネスト構造はそのまま index され、match / nested クエリで検索できる。
+ *
+ * 設計: Node 内蔵 fetch で REST API を直接叩く薄いアダプタ。npm 依存ゼロ・外部CLI不要。
+ *   install: copy to ~/.i-repo/plugins/i-repo-elastic && chmod +x
+ *
+ * Usage:
+ *   cat manifests/reports.ndjson | i-repo elastic --url http://localhost:9200 --index irepo-reports
+ *
+ * Contract (PLUGINS.md / SCHEMA.md):
+ *   - 予約フラグ --plugin-schema / --plugin-healthcheck
+ *   - IREPO_PLUGIN_API 不一致は exit 11
+ *   - stream-end トレーラ照合 (§2.6)
+ *   - receipt: write → verify。verify は _mget で読み戻して件数照合し、
+ *     verified:true はそのときだけ立てる
+ *   - 冪等: idempotencyKey（無ければ itemId:revNo）を _id にして index（再実行で重複しない）
+ */
+"use strict";
+
+const PLUGIN = "i-repo-elastic";
+const VERSION = "0.1.0";
+
+const argv = process.argv.slice(2);
+
+// ── 予約フラグ ───────────────────────────────────────────────────────
+if (argv[0] === "--plugin-schema") {
+  process.stdout.write(JSON.stringify({
+    pluginApi: ["1"],
+    schemaVersions: ["1.0"],
+    recordTypes: ["*"],
+    name: PLUGIN,
+    version: VERSION,
+    description: "Index NDJSON records into Elasticsearch (日本語全文検索・中間一致・ファセット集計の写し)",
+    phases: ["write", "verify"],
+    platforms: ["macos", "linux", "windows"],
+    roles: ["sink", "read", "search"],
+    category: "search",   // 表示カテゴリ（GUI 種別グループ表示用・脱料理）
+    // 能力タグ（開いた語彙・string[]）。CLI verify(describe-shape) は capabilities を string[] と検査する。
+    // keyword-search=全文検索 --q を受理（capability宣言＋fail-open・vNext §②の一般化）。
+    // 各タグの詳細（dialect/audience 等）は capabilityDetails で宣言する（ホストはそちらを読む）。
+    capabilities: ["keyword-search", "native-query"],
+    capabilityDetails: {
+      // T2: ネイティブクエリ（仕様 §9）。query --native '<ES query DSL JSON>' を _search へ素通し。
+      // read-only はプラグインが強制（エンドポイントを _search に固定＋script(painless)拒否）。audience 既定=human。
+      "native-query": { dialect: "es-query-dsl", input: "json", readOnly: "enforced", audience: ["human"] },
+    },
+    input: ["stdin-ndjson"],
+    params: [
+      { name: "--url", type: "string", required: true,
+        label: "Elasticsearch URL", placeholder: "http://localhost:9200",
+        description: "Elasticsearch base URL" },
+      { name: "--index", type: "string", default: "irepo-reports",
+        label: "インデックス名",
+        description: "Target index (created on first write)" },
+      { name: "--api-key", type: "string", secret: true, envVar: "IREPO_ELASTIC_API_KEY",
+        label: "APIキー（任意）",
+        description: "Authorization: ApiKey <key> (省略時は認証なし)" },
+      { name: "--user", type: "string",
+        label: "Basic認証ユーザー（任意）",
+        description: "Basic auth user (use with --password)" },
+      { name: "--password", type: "string", secret: true, envVar: "IREPO_ELASTIC_PASSWORD",
+        label: "Basic認証パスワード（任意）",
+        description: "Basic auth password" },
+      { name: "--dry-run", type: "boolean", label: "Dry run",
+        description: "Validate input without writing" },
+      // ── query(読み返し)で受理する選択フィルタの宣言（脱料理: host が汎用描画/転送する印）。
+      //    新しい検索意味は足さない＝既に parseQueryArgs が受理する共通フラグを宣言するだけ。
+      { name: "--since", type: "string", subcommand: "query", filter: true, label: "開始時刻（含む）",
+        placeholder: "2026-06-01 00:00:00", description: "時刻範囲の下限（半開区間 [since, until)）" },
+      { name: "--until", type: "string", subcommand: "query", filter: true, label: "終了時刻（含まない）",
+        placeholder: "2026-06-15 00:00:00", description: "時刻範囲の上限（排他）" },
+      { name: "--time-field", type: "select", subcommand: "query", filter: true, label: "時刻フィールド",
+        choices: ["loaded", "updated", "registered"], default: "loaded",
+        description: "範囲フィルタの対象時刻（取込/更新/登録）" },
+      { name: "--deleted", type: "boolean", subcommand: "query", filter: true, label: "削除済みのみ",
+        description: "deleted=true/false のレコードに絞る" },
+      { name: "--ids", type: "string", subcommand: "query", filter: true, label: "冪等キー（CSV）",
+        description: "冪等キーの完全一致（カンマ区切り）" },
+      { name: "--item-id", type: "string", subcommand: "query", filter: true, repeatable: true, label: "itemId",
+        description: "itemId の完全一致（反復可・全リビジョン取得）" },
+      { name: "--fields", type: "string", subcommand: "query", filter: true, label: "射影フィールド（CSV）",
+        description: "正準名で返却フィールドを限定（カンマ区切り）" },
+      // capability: keyword-search（elastic の本領）。全文検索＝帳票のどこかに語を含むものを引く。
+      { name: "--q", type: "string", subcommand: "query", filter: true, label: "全文検索",
+        placeholder: "漏れ 不良", description: "全文検索（語をどこかに含む帳票。スペース区切りは AND）" },
+    ],
+    // ── ADC-1（gemba-read/1.0）読み返し契約の宣言 ──────────────────────
+    subcommands: [
+      { name: "query", mode: "read", input: ["none"], output: ["ndjson"],
+        description: "着地済みレコードを正準封筒形で読み出す（ページ付き・書込ゼロ）" },
+    ],
+    // ── ADC-1（gemba-adc/1.0）着地スキーマ宣言。ネスト保持・camelCase・動的マッピング無効 ──
+    dataset: [{
+      datasetApi: ["1"], contract: "gemba-adc/1.0", store: "elasticsearch",
+      // locator は query が必要とする接続フラグを**全て**宣言する（認証フラグ含む。
+      // 漏らすと access.query 経路で認証が脱落し 401 へ退行する — レビューで検出済み）。
+      locator: {
+        url: { param: "--url" }, index: { param: "--index", default: "irepo-reports" },
+        apiKey: { param: "--api-key", secret: true }, user: { param: "--user" },
+        password: { param: "--password", secret: true },
+      },
+      naming: "camelCase",
+      keys: { primary: "_id", upsert: true, dedupe: null },
+      contents: "cumulative",
+      fields: [
+        { name: "_id", canonical: "idempotencyKey", source: "idempotencyKey", type: "string", role: "key" },
+        { name: "_loadedAt", canonical: "loadedAt", type: "datetime", format: "iso8601", timezone: "utc", role: "lineage" },
+        { name: "*", canonical: "raw", source: ".", type: "object", schemaRef: "envelope/1.0", pii: "likely" },
+      ],
+      quirks: ["nested-source", "dynamic-mapping-off", "detail-optional"],
+    }],
+  }) + "\n");
+  process.exit(0);
+}
+
+if (argv[0] === "--plugin-healthcheck") {
+  const checks = [];
+  const fetchOk = typeof fetch === "function";
+  checks.push({ name: "node-fetch", ok: fetchOk, severity: "required",
+    hint: fetchOk ? `Node ${process.version} built-in fetch available`
+      : "Node.js 18 以上が必要です（内蔵 fetch を使用）" });
+  const ok = checks.every((c) => c.ok);
+  process.stdout.write(JSON.stringify({ ok, checks }) + "\n");
+  process.exit(ok ? 0 : 1);
+}
+
+// ── 契約バージョン ───────────────────────────────────────────────────
+if (process.env.IREPO_PLUGIN_API && process.env.IREPO_PLUGIN_API !== "1") {
+  console.error(`${PLUGIN}: unsupported IREPO_PLUGIN_API=${process.env.IREPO_PLUGIN_API} (supported: 1)`);
+  process.exit(11);
+}
+
+// ── query サブコマンド（ADC-1 / gemba-read/1.0・読み取り専用） ─────────
+// 着地済みレコードを「正準封筒形」で読み出す。書込・新規作成・スキーマ変更はしない。
+// 成功は末尾 query-end トレーラの存在で判定（契約 §3.4）。0件でも query-end を出す。
+// 共通部（envelope/時刻3形式/カーソル/フラグ解析）は lib/gemba-read.js（正本: plugins/lib/）。
+// ここにはストア固有部（_search 読み取り・record 復元・dest・認証）だけを置く。
+if (argv[0] === "query") {
+  let G;
+  try { G = require("./lib/gemba-read.js"); }
+  catch {
+    console.error(JSON.stringify({ schemaVersion: "1.0", recordType: "error", contract: "gemba-read/1.0",
+      plugin: PLUGIN, code: "E_INTERNAL",
+      message: "gemba-read ライブラリが見つかりません（lib/gemba-read.js）。plugins/install.sh を再実行してください",
+      retryable: false }));
+    process.exit(1);
+  }
+  // runQuery は非同期（fetch）。同期復帰で write 経路へ落ちないよう、ここで実行を打ち切る。
+  // CommonJS モジュールスコープの top-level return は合法（exit は runQuery 内の IIFE で起きる）。
+  runQuery(argv.slice(1), G);
+  return;
+}
+
+function runQuery(qargs, G) {
+  const { queryEnd, emitRow, queryError } = G.createReadKit(PLUGIN);
+  const opts = G.parseQueryArgs(qargs, {
+    "--url": "url", "--index": "index", "--api-key": "apiKey", "--user": "user", "--password": "password",
+  }, queryError, { "--q": { key: "q" }, "--native": { key: "native" }, "--native-timeout-ms": { key: "nativeTimeoutMs" } }); // capability: keyword-search / native-query
+  // secret は host から環境変数で渡る場合がある（本番化 PR3・argv 露出回避）。フラグが argv に「無いときだけ」
+  // env を採用する（parseQueryArgs は未指定フラグを "" 初期化するため、生 qargs で有無を判定する）。
+  // --api-key "" の明示指定は尊重し env で上書きしない。ambient 漏れ込みは host が除去するため presence ベース。
+  const apiKeyOnArgv = qargs.includes("--api-key");
+  const passwordOnArgv = qargs.includes("--password");
+  if (!apiKeyOnArgv && process.env.IREPO_ELASTIC_API_KEY) opts.apiKey = process.env.IREPO_ELASTIC_API_KEY;
+  if (!passwordOnArgv && process.env.IREPO_ELASTIC_PASSWORD) opts.password = process.env.IREPO_ELASTIC_PASSWORD;
+  if (!opts.url) queryError("E_ARGS", "--url is required", "読み取り対象の Elasticsearch URL", 2);
+  if (!opts.index) opts.index = "irepo-reports";
+
+  const qurl = opts.url.replace(/\/+$/, "");
+  // dest は連携側・カタログ・エージェントへ渡るため userinfo (`//user:pass@host`) を `//****@host`
+  // にマスクする（ADC-1 §6.2 / 既知の漏洩経路）。実リクエストには素の qurl を使う。
+  const maskUserinfo = (u) => u.replace(/(\/\/)[^/@]*@/, "$1****@");
+  const dest = `elasticsearch:${opts.index}@${maskUserinfo(qurl)}`;
+  // error.message にも userinfo が混ざりうる（Node fetch は資格情報入り URL を全文エコーして拒否する）。
+  // §3.3「message に secret を含めない」を守るため、文字列中の `//user:pass@` を全箇所マスクする。
+  const scrub = (s) => String(s).replace(/(\/\/)[^/@\s]*@/g, "$1****@");
+
+  // 認証ヘッダ（write の authHeaders と同方針）。message/dest に api-key/password を出さない。
+  function qAuthHeaders() {
+    const h = { "Content-Type": "application/json" };
+    if (opts.apiKey) h["Authorization"] = `ApiKey ${opts.apiKey}`;
+    else if (opts.user) h["Authorization"] = "Basic " + Buffer.from(`${opts.user}:${opts.password}`).toString("base64");
+    return h;
+  }
+  async function qEs(method, path, body) {
+    const res = await fetch(qurl + path, {
+      method, headers: qAuthHeaders(),
+      body: body == null ? undefined : JSON.stringify(body),
+    });
+    const text = await res.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch { /* 非JSONレスポンス */ }
+    return { status: res.status, ok: res.ok, json, text };
+  }
+
+  // 時刻フィルタの range 句。lib の timeBounds が「格納形式」へ正規化済みの gte/lt を返す
+  // （字句比較を正しく成立させる。半開区間 [since, until)）。
+  //   loaded     → _loadedAt（ISO8601 UTC 文字列）
+  //   updated    → values.updateTime（ローカル "YYYY/MM/DD hh:mm:ss"）
+  //   registered → values.registTime（同上）
+  // いずれも date_detection:false で text+keyword。range は固定幅で辞書順=時系列順となる keyword で行う。
+  const timeKwField = opts.timeField === "updated" ? "values.updateTime.keyword"
+    : opts.timeField === "registered" ? "values.registTime.keyword" : "_loadedAt.keyword";
+
+  function buildFilters() {
+    const filter = [];
+    const bounds = G.timeBounds(opts, opts.timeField === "loaded" ? "iso" : "slash", queryError, dest);
+    if (bounds) filter.push({ range: { [timeKwField]: bounds } });
+    if (opts.deleted != null) filter.push({ term: { deleted: opts.deleted } });
+    if (opts.ids && opts.ids.length) filter.push({ terms: { _id: opts.ids } });
+    if (opts.itemIds.length) filter.push({ terms: { "itemId.keyword": opts.itemIds } });
+    return filter;
+  }
+
+  (async () => {
+    // ── ネイティブクエリ（capability: native-query / 仕様 §9・T2）──
+    // ES はエンドポイントを _search に固定するので構造的に read-only（_update_by_query 等は呼ばない）。
+    // バリデータの主眼は script(painless) 実行の拒否。リソースガード: size(行数)・server&client timeout・出力1MB。
+    if (opts.native != null) {
+      const v = validateReadOnlyEsBody(opts.native);
+      if (!v.ok) queryError("E_ARGS", `native query rejected: ${v.reason}`, "read-only の _search ボディ(JSON)のみ・script 不可（仕様 §9）", 2, dest);
+      let timeoutMs = parseInt(opts.nativeTimeoutMs ?? "", 10);
+      if (!Number.isFinite(timeoutMs) || timeoutMs < 1) timeoutMs = 10000;
+      if (timeoutMs > 60000) timeoutMs = 60000;
+      const cap = opts.limit, byteCap = 1_000_000;
+      const userSize = Number(v.body.size);
+      // size:0（集計のみ）は尊重し、正の size だけ cap で抑える。未指定(NaN)は cap（§9.6・Codex P2）。
+      const size = Math.min(Number.isFinite(userSize) && userSize >= 0 ? userSize : cap, cap);
+      // --count-only と併用時は「count first」を尊重: 行は出さず（size:0）total だけ返す。
+      // aggs も外して安価なカウントにする（行/集計を転送・開示しない・Codex P2）。
+      let reqBody;
+      if (opts.countOnly) {
+        const { aggs, aggregations, ...rest } = v.body;
+        reqBody = { ...rest, size: 0, track_total_hits: true, timeout: `${timeoutMs}ms` };
+      } else {
+        reqBody = { ...v.body, size, timeout: `${timeoutMs}ms` };                              // server側 timeout（§9.6）
+      }
+
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), timeoutMs);                                   // client側 backstop（§9.6）
+      let res, text;
+      try {
+        res = await fetch(`${qurl}/${encodeURIComponent(opts.index)}/_search`, {
+          method: "POST", headers: qAuthHeaders(), body: JSON.stringify(reqBody), signal: ac.signal,
+        });
+        text = await res.text();
+      } catch (e) {
+        clearTimeout(timer);
+        if (e && e.name === "AbortError") queryError("E_TIMEOUT", `native query exceeded ${timeoutMs}ms`, "より絞り込んだクエリにしてください（§9.6）", 1, dest);
+        queryError("E_CONNECT", `cannot reach Elasticsearch: ${scrub(e.message)}`, "--url を確認。ES が起動しているか確認", 1, dest);
+      }
+      clearTimeout(timer);
+      let json = null; try { json = JSON.parse(text); } catch { /* 非JSON */ }
+      if (res.status === 404 || json?.error?.type === "index_not_found_exception") {
+        queryError("E_NOT_FOUND", `index not found: ${opts.index}`, "配信が一度も成功していない可能性があります", 1, dest);
+      }
+      if (res.status === 401 || res.status === 403) {
+        queryError("E_CONNECT", `authorization failed: HTTP ${res.status}`, "--api-key / --user / --password を確認", 1, dest);
+      }
+      if (!res.ok || !json || !json.hits || !Array.isArray(json.hits.hits)) {
+        queryError("E_INTERNAL", `native _search failed: HTTP ${res.status}`, scrub((json?.error?.reason) || "").slice(0, 160) || null, 1, dest);
+      }
+      // --count-only: 行を出さず total だけ返す（count first・行非開示）。
+      if (opts.countOnly) {
+        const total = typeof json.hits?.total?.value === "number" ? json.hits.total.value : 0;
+        queryEnd({ count: 0, complete: true, total, nextCursor: null, dest, dedupeApplied: false, native: true });
+        process.exit(0);
+      }
+      const hits = json.hits.hits;
+      let bytes = 0, n = 0, truncated = json.timed_out === true; // server側タイムアウトも truncated 扱い
+      for (const hit of hits) {
+        const rec = hit._source || {};
+        const lb = Buffer.byteLength(JSON.stringify(rec));
+        if (bytes + lb > byteCap) { truncated = true; break; }  // 結果サイズキャップ（§9.6）
+        emitRow(hit._id, rec._loadedAt ?? null, rec, true);     // 任意形は raw で出す
+        bytes += lb; n++;
+      }
+      // 「まだ続きがある」かの判定。size:0（集計のみ）は行を要求していないので行ベースでは判定しない。
+      // 総数が正確（relation:"eq" / 旧ESの素の数値）なら total>n で精密判定し、ちょうど size 件＝総数の
+      // ケースを誤って truncated にしない。総数が下限のみ(gte)/不明のときだけ「フルページ＝まだあるかも」の
+      // ヒューリスティック（hits.length>=size）へフォールバック（§9.6・Codex P2）。
+      const totalObj = json.hits?.total;
+      const totalVal = typeof totalObj?.value === "number" ? totalObj.value
+        : (typeof totalObj === "number" ? totalObj : null);
+      const exactTotal = totalVal !== null && (totalObj?.relation === "eq" || typeof totalObj === "number");
+      if (!truncated && size > 0) {
+        if (exactTotal) { if (totalVal > n) truncated = true; }
+        else if (hits.length >= size) truncated = true;
+      }
+      const end = { count: n, complete: !truncated, truncated, nextCursor: null, dest, dedupeApplied: false, native: true };
+      // 集計（ファセット）も byteCap のバイト会計に含める。超えるなら trailer 膨張を避けて落とし truncated に（§9.6・Codex P2）。
+      if (json.aggregations) {
+        if (bytes + Buffer.byteLength(JSON.stringify(json.aggregations)) <= byteCap) {
+          end.aggregations = json.aggregations; // elastic の本領＝集計を返す
+        } else { end.truncated = true; end.complete = false; }
+      }
+      queryEnd(end);
+      process.exit(0);
+    }
+
+    let filter;
+    try { filter = buildFilters(); }
+    catch (e) { queryError("E_INTERNAL", scrub(e.message), null, 1, dest); }
+    // 全文検索 --q（capability: keyword-search）。simple_query_string は構文エラーで落ちず
+    // ユーザー入力に寛容。スコアは使わず（並びは idempotencyKey 昇順＝決定的）絞り込みに用いる。
+    // 既定の全フィールド展開(*)は boolean(deleted)/数値フィールドに当たると 400 になり得るため
+    // lenient:true で型不一致を無視する（_search/_count 両方が落ちない・Codex 指摘）。
+    const must = opts.q ? [{ simple_query_string: { query: opts.q, default_operator: "and", lenient: true } }] : [];
+    const query = (filter.length || must.length)
+      ? { bool: { ...(filter.length ? { filter } : {}), ...(must.length ? { must } : {}) } }
+      : { match_all: {} };
+
+    const timeFilter = G.buildTimeFilter(opts);
+
+    // ── count-only: _count で総件数だけ返す（row は出さない） ──────────────
+    if (opts.countOnly) {
+      let r;
+      try { r = await qEs("POST", `/${encodeURIComponent(opts.index)}/_count`, { query }); }
+      catch (e) { queryError("E_CONNECT", `cannot reach Elasticsearch: ${scrub(e.message)}`, "--url を確認。ES が起動しているか確認", 1, dest); }
+      if (r.status === 404 || r.json?.error?.type === "index_not_found_exception") {
+        queryError("E_NOT_FOUND", `index not found: ${opts.index}`, "配信が一度も成功していない可能性があります", 1, dest);
+      }
+      if (r.status === 401 || r.status === 403) {
+        queryError("E_CONNECT", `authorization failed: HTTP ${r.status}`, "--api-key / --user / --password を確認", 1, dest);
+      }
+      if (!r.ok || !r.json || typeof r.json.count !== "number") {
+        queryError("E_INTERNAL", `_count failed: HTTP ${r.status}`, null, 1, dest);
+      }
+      const end = { count: 0, complete: true, total: r.json.count, nextCursor: null, dest, dedupeApplied: false };
+      if (timeFilter) end.timeFilter = timeFilter;
+      queryEnd(end);
+      process.exit(0);
+    }
+
+    // ── ページング: 主キー昇順（決定的）、cursor=search_after（最後の sort 値を base64 で不透明化）──
+    // 主キー _id は idempotencyKey と同値で書き込まれている。ES 8 は既定で _id への fielddata 必要な
+    // sort を禁止する（indices.id_field_data.enabled / クラスター設定変更が要る）ため、読み取り専用の
+    // 制約を守ったまま同じ昇順を得るべく、_source 内の idempotencyKey.keyword（=_id）で並べる。
+    const SORT_FIELD = "idempotencyKey.keyword";
+    const body = { size: opts.limit, query, sort: [{ [SORT_FIELD]: "asc" }] };
+    if (opts.cursor != null) {
+      const last = G.decodeCursor(opts.cursor);
+      if (last == null) queryError("E_CURSOR", "カーソルが不正です", "前回の query-end.nextCursor をそのまま渡してください", 2, dest);
+      body.search_after = [last];
+    }
+
+    let r;
+    try { r = await qEs("POST", `/${encodeURIComponent(opts.index)}/_search`, body); }
+    catch (e) { queryError("E_CONNECT", `cannot reach Elasticsearch: ${scrub(e.message)}`, "--url を確認。ES が起動しているか確認", 1, dest); }
+    if (r.status === 404 || r.json?.error?.type === "index_not_found_exception") {
+      queryError("E_NOT_FOUND", `index not found: ${opts.index}`, "配信が一度も成功していない可能性があります", 1, dest);
+    }
+    if (r.status === 401 || r.status === 403) {
+      queryError("E_CONNECT", `authorization failed: HTTP ${r.status}`, "--api-key / --user / --password を確認", 1, dest);
+    }
+    if (!r.ok || !r.json || !r.json.hits || !Array.isArray(r.json.hits.hits)) {
+      queryError("E_INTERNAL", `_search failed: HTTP ${r.status}`, null, 1, dest);
+    }
+
+    const hits = r.json.hits.hits;
+    let lastSort = null;
+    for (const hit of hits) {
+      lastSort = Array.isArray(hit.sort) && hit.sort.length ? hit.sort[hit.sort.length - 1] : hit._id;
+      const src = hit._source || {};
+      // record 復元: _source から _loadedAt を除いたもの（write の doc 形 { ...envelope, _loadedAt } の逆）。
+      const { _loadedAt, ...record } = src;
+      let out = record;
+      if (!opts.raw && opts.fields && record && record._raw === undefined) out = G.pickFields(record, opts.fields);
+      emitRow(hit._id, _loadedAt ?? null, opts.raw ? src : out, opts.raw);
+    }
+    const complete = hits.length < opts.limit;
+    const end = {
+      count: hits.length, complete,
+      nextCursor: complete ? null : G.encodeCursor(String(lastSort)),
+      dest, dedupeApplied: false,
+    };
+    if (timeFilter) end.timeFilter = timeFilter;
+    queryEnd(end);
+    process.exit(0);
+  })().catch((e) => { queryError("E_INTERNAL", scrub(e.message), null, 1, dest); });
+}
+
+// ── ネイティブクエリ read-only バリデータ（ES・T2 / 仕様 §9）─────────────
+// エンドポイントは _search 固定（プラグインが制御）なので _update_by_query 等は構造的に到達不能。
+// 主リスクは body 内の script(painless) 実行。再帰的に script 系キーを拒否する。
+function validateReadOnlyEsBody(raw) {
+  let body;
+  try { body = JSON.parse(String(raw)); }
+  catch (e) { return { ok: false, reason: `JSON parse 失敗: ${e.message}` }; }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { ok: false, reason: "オブジェクトの _search ボディ(JSON)が必要" };
+  }
+  // script 実行系に加え wrapper（base64 で別クエリを内包＝再帰スキャンを潜って script を渡せる）も拒否（Codex #35 P1）。
+  const FORBIDDEN = new Set(["script", "script_fields", "runtime_mappings", "scripted_metric", "wrapper"]);
+  let bad = null;
+  const scan = (o) => {
+    if (bad || !o || typeof o !== "object") return;
+    if (Array.isArray(o)) { for (const x of o) scan(x); return; }
+    for (const k of Object.keys(o)) { if (FORBIDDEN.has(k)) { bad = k; return; } scan(o[k]); }
+  };
+  scan(body);
+  if (bad) return { ok: false, reason: `script 実行(${bad})は read-only では不可` };
+  return { ok: true, body };
+}
+
+// ── 引数 ─────────────────────────────────────────────────────────────
+let url = "", index = "irepo-reports", apiKey = "", user = "", password = "", dryRun = false;
+let apiKeySeen = false, passwordSeen = false;
+for (let i = 0; i < argv.length; i++) {
+  switch (argv[i]) {
+    case "--url":      url = argv[++i] ?? ""; break;
+    case "--index":    index = argv[++i] ?? "irepo-reports"; break;
+    case "--api-key":  apiKey = argv[++i] ?? ""; apiKeySeen = true; break;
+    case "--user":     user = argv[++i] ?? ""; break;
+    case "--password": password = argv[++i] ?? ""; passwordSeen = true; break;
+    case "--dry-run":  dryRun = true; break;
+    default: console.error(`unknown option: ${argv[i]}`); process.exit(2);
+  }
+}
+// secret は host から環境変数で渡る場合がある（本番化 PR3・argv 露出回避）。フラグが「未指定のときだけ」
+// env を採用する（契約: flag 優先。--api-key "" 等の明示指定を env で上書きしない）。ambient/グローバル
+// env の漏れ込みは host が secret_env_plan で除去するため、ここは presence ベースで素直に env を読む。
+if (!apiKeySeen && process.env.IREPO_ELASTIC_API_KEY) apiKey = process.env.IREPO_ELASTIC_API_KEY;
+if (!passwordSeen && process.env.IREPO_ELASTIC_PASSWORD) password = process.env.IREPO_ELASTIC_PASSWORD;
+// dry-run は接続情報なしでも入力検証だけ行える（plugin verify が使う経路）
+if (!dryRun && !url) {
+  console.error("--url is required");
+  process.exit(2);
+}
+url = url.replace(/\/+$/, "");
+
+const jobId = `elastic-${new Date().toISOString().replace(/[-:T]/g, "").slice(0, 15)}-${process.pid}`;
+// dest は receipt 経由で連携側・カタログ・エージェントへ渡るため、URL の userinfo
+// (`//user:pass@host`) を `//****@host` にマスクする（ADC-1 契約 §6.2 / 既知の漏洩経路）。
+// 実リクエストには素の url を使い続けるので機能には影響しない。
+const maskUserinfo = (u) => u.replace(/(\/\/)[^/@]*@/, "$1****@");
+const dest = url ? `elasticsearch:${index}@${maskUserinfo(url)}` : `elasticsearch:${index}`;
+
+const receipt = (phase, count, failedCount, verified, extra = {}) => {
+  process.stdout.write(JSON.stringify({
+    schemaVersion: "1.0", recordType: "receipt", plugin: PLUGIN,
+    producedBy: { plugin: PLUGIN, version: VERSION },
+    phase, jobId, count, failedCount, verified, dest,
+    ...(dryRun ? { dryRun: true } : {}),
+    ...extra,
+  }) + "\n");
+};
+
+function authHeaders() {
+  const h = { "Content-Type": "application/json" };
+  if (apiKey) h["Authorization"] = `ApiKey ${apiKey}`;
+  else if (user) h["Authorization"] = "Basic " + Buffer.from(`${user}:${password}`).toString("base64");
+  return h;
+}
+
+async function es(method, path, body, ndjson = false) {
+  const h = authHeaders();
+  if (ndjson) h["Content-Type"] = "application/x-ndjson";
+  const res = await fetch(url + path, {
+    method, headers: h,
+    body: body == null ? undefined : (ndjson ? body : JSON.stringify(body)),
+  });
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch { /* 非JSONレスポンス */ }
+  return { status: res.status, ok: res.ok, json, text };
+}
+
+async function readStdin() {
+  const chunks = [];
+  for await (const c of process.stdin) chunks.push(c);
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+const CHUNK = 500; // 1回の _bulk / _mget に載せる最大ドキュメント数
+function chunked(arr, n) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
+}
+
+(async () => {
+  const text = await readStdin();
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+
+  const docs = [];
+  let trailer = null, envelopes = 0;
+  for (const line of lines) {
+    let obj;
+    try { obj = JSON.parse(line); } catch { docs.push({ _raw: line }); continue; }
+    if (obj && obj.schemaVersion) envelopes++;
+    if (obj && obj.recordType === "stream-end") { trailer = obj; continue; }
+    docs.push(obj);
+  }
+
+  // stream-end 照合（§2.6）
+  if (trailer) {
+    if (typeof trailer.count !== "number" || trailer.count !== docs.length) {
+      console.error(`❌ incomplete stream: trailer count=${trailer.count ?? "unreadable"} but received ${docs.length}`);
+      receipt("write", docs.length, docs.length, false);
+      process.exit(1);
+    }
+  } else if (envelopes > 0) {
+    console.error("❌ truncated stream: envelope records present but no stream-end trailer");
+    receipt("write", docs.length, docs.length, false);
+    process.exit(1);
+  }
+
+  // 冪等キーと取込時刻
+  const now = new Date().toISOString();
+  const prepared = docs.map((d, i) => {
+    const key = d.idempotencyKey
+      ?? (d.itemId != null ? `report:${d.itemId}:rev${d.revNo ?? "?"}` : `${jobId}:${i}`);
+    return { id: key, doc: { ...d, _loadedAt: now } };
+  });
+
+  if (dryRun) {
+    receipt("write", prepared.length, 0, false);
+    console.error(`(dry-run) would index ${prepared.length} document(s) → ${index}`);
+    process.exit(0);
+  }
+
+  // ── インデックスを事前作成（date/numeric の自動推論をOFF） ──────────
+  // クラスター値は "2026/06/01" のような日付風テキストも混在するため、
+  // dynamic mapping の日付推論に任せると型衝突で index error になる。
+  const create = await es("PUT", `/${encodeURIComponent(index)}`, {
+    mappings: { date_detection: false, numeric_detection: false },
+  });
+  if (!create.ok && create.json?.error?.type !== "resource_already_exists_exception") {
+    console.error(`index create failed: HTTP ${create.status} ${create.text.slice(0, 300)}`);
+    receipt("write", prepared.length, prepared.length, false);
+    process.exit(1);
+  }
+
+  // ── write 相: _bulk index（_id 指定 = 同IDは全置換 = 冪等）。500件ずつ ──
+  let writeFailed = 0;
+  for (const batch of chunked(prepared, CHUNK)) {
+    const body = batch
+      .map(({ id, doc }) =>
+        JSON.stringify({ index: { _index: index, _id: id } }) + "\n" + JSON.stringify(doc))
+      .join("\n") + "\n";
+    const r = await es("POST", "/_bulk", body, true);
+    if (!r.ok || !r.json) {
+      console.error(`bulk request failed: HTTP ${r.status} ${r.text.slice(0, 300)}`);
+      receipt("write", prepared.length, prepared.length, false);
+      process.exit(1);
+    }
+    if (r.json.errors) {
+      for (const item of r.json.items) {
+        const op = item.index || item.create || {};
+        if (op.error) {
+          writeFailed++;
+          console.error(`index error _id=${op._id}: ${op.error.type}: ${op.error.reason}`);
+        }
+      }
+    }
+  }
+  receipt("write", prepared.length, writeFailed, false);
+  if (writeFailed > 0) process.exit(1);
+
+  // ── verify 相: refresh 後、_mget で全 _id を読み戻して件数照合 ─────────
+  await es("POST", `/${encodeURIComponent(index)}/_refresh`);
+  const ids = prepared.map((p) => p.id);
+  let found = 0, verifyErr = false;
+  for (const batch of chunked(ids, CHUNK)) {
+    const r = await es("POST", `/${encodeURIComponent(index)}/_mget?_source=false`, { ids: batch });
+    if (!r.ok || !r.json || !Array.isArray(r.json.docs)) { verifyErr = true; break; }
+    found += r.json.docs.filter((d) => d.found).length;
+  }
+  const verified = !verifyErr && found === ids.length;
+  receipt("verify", prepared.length, verified ? 0 : prepared.length - found, verified, { verifiedDocs: found });
+  process.exit(verified ? 0 : 1);
+})().catch((e) => {
+  console.error(`${PLUGIN}: ${e.message}`);
+  receipt("write", 0, 0, false);
+  process.exit(1);
+});

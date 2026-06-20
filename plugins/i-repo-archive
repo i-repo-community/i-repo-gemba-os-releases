@@ -1,0 +1,1205 @@
+#!/usr/bin/env node
+/**
+ * i-repo-archive — example plugin: stage report archives locally, then
+ * optionally push the finished bundle to Amazon S3.
+ *
+ * ZERO DEPENDENCIES by design: a single file using Node 20 built-ins only.
+ * i-repo itself requires Node >= 20 (package.json engines), so Node is
+ * guaranteed to exist wherever i-repo runs — no npm install, no lockfile,
+ * no supply-chain surface. This is the recommended shape for plugins.
+ *
+ * Cross-platform: works on macOS / Linux / Windows.
+ *   macOS/Linux: copy this file to ~/.i-repo/plugins/i-repo-archive && chmod +x
+ *   Windows:     copy BOTH this file and i-repo-archive.cmd (the shim next to
+ *                it) into %USERPROFILE%\.i-repo\plugins\
+ *
+ * Contract (docs/PLUGINS.md, docs/SCHEMA.md):
+ *   - reserved flags --plugin-healthcheck / --plugin-schema
+ *   - IREPO_PLUGIN_API version check (exit 11 on mismatch)
+ *   - stream-end trailer validation on the manifest (SCHEMA.md §2.6)
+ *   - receipts on stdout in the frozen §6 shape (write → verify phases)
+ *
+ * Usage:
+ *   i-repo archive create [filters...] [--out DIR] [--with-artifacts pdf,excel]
+ *   i-repo archive push-s3 <archive-dir> --to s3://bucket/prefix [--cleanup] [--dry-run]
+ *
+ * Artifact naming: the server-provided filename (Content-Disposition =
+ * ファイル自動出力設定の名称) is used when available; otherwise
+ * 帳票ID_帳票名称.<ext>. Collisions get a _帳票ID suffix.
+ * --cleanup deletes the local archive only after the upload is verified.
+ */
+"use strict";
+
+// Loaded via dynamic import() so this single extensionless file runs under
+// BOTH module systems: inside a "type":"module" package tree it is ESM, while
+// in ~/.i-repo/plugins (no package.json above) Node loads it as CommonJS.
+// Static require()/import would each break in one of the two environments.
+let spawn, fs, fsp, homedir, tmpdir, basename, dirname, join, resolve, sep;
+async function loadBuiltins() {
+  ({ spawn } = await import("node:child_process"));
+  fs = await import("node:fs");
+  fsp = await import("node:fs/promises");
+  ({ homedir, tmpdir } = await import("node:os"));
+  ({ basename, dirname, join, resolve, sep } = await import("node:path"));
+}
+
+const PLUGIN = "i-repo-archive";
+const VERSION = "0.4.2";
+const PLUGIN_API = "1";
+const defaultArchiveRoot = () => join(homedir(), ".i-repo", "archives");
+
+// ── Reserved flags (docs/PLUGINS.md): answer before own args ──────────────
+const arg0 = process.argv[2];
+if (arg0 === "--plugin-schema") {
+  // This plugin does not consume stdin records; it calls i-repo back instead.
+  // Full self-description (PLUGINS.md §3): platforms / subcommands / params
+  // with subcommand bindings — GUIs render their forms from this declaration.
+  console.log(JSON.stringify({
+    pluginApi: [PLUGIN_API], schemaVersions: ["1.0"], recordTypes: [],
+    name: PLUGIN, version: "0.4.2",
+    description: "Stage report archives locally, then optionally push the bundle to cloud object storage (S3 / GCS / Azure Blob)",
+    phases: ["write", "verify"],
+    platforms: ["macos", "linux", "windows"],
+    // 価値軸（役割）の自己宣言。host が store 名から推測しないための機械可読宣言。
+    roles: ["source", "keep"],
+    // 表示カテゴリ（GUI が配信先を種別グループ表示するために読む・脱料理）。
+    // archive は「アーカイブ/バックアップ」。create=ローカル bundle / push-s3=同 bundle を S3 へ転送。
+    category: "archive",
+    // ── 抽出ソース宣言（ADC-1 / GEMBA OS が「期間・出力先」を注入し、残りは
+    //    filter:true の param をユーザーが触る。host にプラグイン固有名をハードコード
+    //    させないための機械可読契約）。timeWindow を持つ create だけが抽出ソース。
+    extraction: {
+      subcommand: "create",
+      outParam: "--out",              // host が管理アーカイブ dir を入れる
+      forceFlags: ["--allow-worktree"], // host が常に付与（app-data は repo 外だが安全弁）
+      timeWindow: {
+        registeredFrom: "--regist-from", registeredTo: "--regist-to",
+        updatedFrom: "--update-from", updatedTo: "--update-to",
+        format: "yyyy/MM/dd HH:mm:ss",
+      },
+    },
+    // intake はサブコマンドで異なる (要望書v2 §3.2): create はデータ入力なし
+    // (i-repo を呼び戻す側)、push-s3 は create が作ったディレクトリを位置引数で
+    // 受ける。sink に dir を渡す/bundler に stdin を流す取り違えを連携側が
+    // 実行前に検出できる。
+    subcommands: [
+      { name: "create", input: ["none"],
+        description: "帳票と添付をローカルにアーカイブ保管（bundle 生成）" },
+      { name: "push-s3", input: ["dir"],
+        description: "アーカイブ bundle を S3 へ転送（クラウド・create で作った bundle のリモート版／要 aws CLI）" },
+      { name: "push-gcs", input: ["dir"],
+        description: "アーカイブ bundle を Google Cloud Storage へ転送（クラウド・要 gcloud CLI）" },
+      { name: "push-azure", input: ["dir"],
+        description: "アーカイブ bundle を Azure Blob Storage へ転送（クラウド・要 az CLI）" },
+    ],
+    params: [
+      // create — host 管理（filter なし）: --out（出力先）, --endpoint/--user/--password（認証）,
+      //   --allow-worktree/--force（運用フラグ）, --regist/update-from/to（period から host が注入）,
+      //   --definition（--definition-id に一本化）, --dry-run。
+      // ユーザー向け抽出フィルタは filter:true を付ける。
+      { name: "--out", type: "string", subcommand: "create", label: "Output directory",
+        placeholder: "~/.i-repo/archives/<timestamp>", description: "Archive output directory" },
+      { name: "--with-artifacts", type: "select", subcommand: "create", default: "pdf", filter: true,
+        label: "出力形式（成果物）",
+        choices: ["pdf", "pdf,excel", "text", "none"],
+        description: "アーカイブに含める成果物（pdf=PDF＋メタデータ / pdf,excel=PDF＋Excel＋メタデータ / text=バイナリ無し・フィールド入力値(クラスター値)まで含むテキストのみ / none=一覧メタのみ）" },
+      { name: "--with-detail", type: "boolean", subcommand: "create", filter: true,
+        label: "クラスター詳細を含める",
+        description: "各帳票の reports get を呼び、manifest にクラスター値(detail)を埋め込む" },
+      { name: "--detail-sleep-ms", type: "string", subcommand: "create", filter: true,
+        label: "詳細取得間隔(ms)", placeholder: "200", default: "200",
+        description: "各帳票の詳細取得ごとのスリープ時間(ms)。0 で無効。API 過負荷防止用",
+        dependsOn: "--with-detail" },
+      { name: "--detail-sleep-every", type: "string", subcommand: "create", filter: true,
+        label: "詳細スリープ周期(件)", placeholder: "1", default: "1",
+        description: "N 件ごとにスリープを入れる（例: 10 なら10件ごと）",
+        dependsOn: "--with-detail" },
+      { name: "--allow-worktree", type: "boolean", subcommand: "create",
+        description: "Allow writing inside the current git worktree" },
+      { name: "--force", type: "boolean", subcommand: "create", destructive: true,
+        description: "Reuse an existing archive directory（既存ディレクトリの管理配下を削除して再利用）" },
+      { name: "--endpoint", type: "string", subcommand: "create",
+        description: "Override the i-repo endpoint for the inner i-repo call" },
+      { name: "--user", type: "string", subcommand: "create",
+        description: "Override the i-repo user for the inner i-repo call" },
+      { name: "--password", type: "string", subcommand: "create", secret: true, envVar: "IREPO_PASSWORD",
+        label: "i-Reporter password", description: "Override the i-repo password for the inner i-repo call" },
+      { name: "--definition-id", type: "string", subcommand: "create", filter: true,
+        label: "帳票定義ID", placeholder: "空欄なら全定義", description: "Filter: 帳票定義ID（数値）" },
+      { name: "--label-id", type: "string", subcommand: "create", filter: true,
+        label: "ラベルID", placeholder: "-9 で全レベル",
+        description: "Filter: ラベルID（rep list の -l）。-9 は全レベル（すべて）" },
+      { name: "--word", type: "string", subcommand: "create", filter: true,
+        label: "検索ワード", description: "Filter: 帳票名・備考などの検索ワード" },
+      // rep list の choices は文字列（test/published）。repb download の数値コードとは別物。
+      { name: "--public-status", type: "select", subcommand: "create", filter: true,
+        label: "公開ステータス",
+        choices: ["test", "published"],
+        description: "Filter: 公開ステータス（test=テスト / published=公開）" },
+      { name: "--edit-status", type: "select", subcommand: "create", filter: true,
+        label: "編集ステータス",
+        choices: ["before-input", "editing", "waiting-approval", "rejected", "completed", "applying"],
+        description: "Filter: 編集ステータス（before-input=入力前 / editing=編集中 / waiting-approval=承認待ち / rejected=差戻し / completed=完了 / applying=申請中）" },
+      { name: "--type", type: "string", subcommand: "create", filter: true,
+        label: "帳票種別", placeholder: "label,sheet,set,book",
+        description: "Filter: 帳票種別（カンマ区切り: label/sheet/set/book）" },
+      { name: "--definition", type: "string", subcommand: "create", description: "Filter: definition（--definition-id に一本化・CLI専用）" },
+      { name: "--word-target", type: "string", subcommand: "create", filter: true,
+        label: "検索対象", description: "Filter: 検索ワードの対象" },
+      { name: "--history", type: "boolean", subcommand: "create", filter: true,
+        label: "履歴を含める", description: "Filter: 過去リビジョンも含める" },
+      { name: "--regist-from", type: "string", subcommand: "create", placeholder: "2026-01-01",
+        description: "Filter: registered on/after" },
+      { name: "--regist-to", type: "string", subcommand: "create", placeholder: "2026-01-31",
+        description: "Filter: registered on/before" },
+      { name: "--update-from", type: "string", subcommand: "create", description: "Filter: updated on/after" },
+      { name: "--update-to", type: "string", subcommand: "create", description: "Filter: updated on/before" },
+      { name: "--system-key", type: "string", subcommand: "create", filter: true,
+        label: "システムキー", placeholder: "n=v",
+        description: "Filter: システムキー n=v（反復可）" },
+      // push-s3
+      { name: "--to", type: "string", required: true, subcommand: "push-s3",
+        label: "S3 destination", placeholder: "s3://bucket/prefix",
+        description: "S3 destination for the archive bundle" },
+      { name: "--cleanup", type: "boolean", subcommand: "push-s3", destructive: true,
+        label: "Clean up local archive",
+        description: "Delete the local archive directory after the upload is verified" },
+      // push-gcs
+      { name: "--to", type: "string", required: true, subcommand: "push-gcs",
+        label: "GCS destination", placeholder: "gs://bucket/prefix",
+        description: "Google Cloud Storage destination for the archive bundle" },
+      { name: "--cleanup", type: "boolean", subcommand: "push-gcs", destructive: true,
+        label: "Clean up local archive",
+        description: "Delete the local archive directory after the upload is verified" },
+      // push-azure
+      { name: "--to", type: "string", required: true, subcommand: "push-azure",
+        label: "Azure Blob destination", placeholder: "https://<account>.blob.core.windows.net/<container>/<prefix>",
+        description: "Azure Blob destination for the archive bundle (blob endpoint URL)" },
+      { name: "--sas", type: "string", subcommand: "push-azure", secret: true, envVar: "AZURE_STORAGE_SAS_TOKEN",
+        label: "SAS トークン（任意）",
+        description: "Shared Access Signature。値は argv ではなく環境変数で az に渡す（未指定時は接続文字列か az login）" },
+      { name: "--connection-string", type: "string", subcommand: "push-azure", secret: true, envVar: "AZURE_STORAGE_CONNECTION_STRING",
+        label: "接続文字列（任意）",
+        description: "ストレージアカウント接続文字列。値は argv ではなく環境変数で az に渡す" },
+      { name: "--cleanup", type: "boolean", subcommand: "push-azure", destructive: true,
+        label: "Clean up local archive",
+        description: "Delete the local archive directory after the upload is verified" },
+      // common to all subcommands
+      { name: "--dry-run", type: "boolean", label: "Dry run", description: "Validate without writing" },
+    ],
+    // ── ADC-1（gemba-adc/1.0）着地スキーマ宣言。バンドル形（manifests/+documents/+receipts/）──
+    dataset: [
+      { datasetApi: ["1"], contract: "gemba-adc/1.0", store: "dir-bundle",
+        subcommand: "create", layout: "irepo-archive/1",
+        locator: { to: { param: "--out" } },
+        contents: "cumulative",
+        quirks: ["detail-optional"] },
+      { datasetApi: ["1"], contract: "gemba-adc/1.0", store: "s3-bundle",
+        subcommand: "push-s3", layout: "irepo-archive/1",
+        locator: { to: { param: "--to" } },
+        contents: "cumulative",
+        quirks: ["detail-optional"] },
+      { datasetApi: ["1"], contract: "gemba-adc/1.0", store: "gcs-bundle",
+        subcommand: "push-gcs", layout: "irepo-archive/1",
+        locator: { to: { param: "--to" } },
+        contents: "cumulative",
+        quirks: ["detail-optional"] },
+      { datasetApi: ["1"], contract: "gemba-adc/1.0", store: "azure-bundle",
+        subcommand: "push-azure", layout: "irepo-archive/1",
+        locator: { to: { param: "--to" } },
+        contents: "cumulative",
+        quirks: ["detail-optional"] },
+    ],
+  }));
+  process.exit(0);
+}
+
+// ── Contract version check: unsupported → stderr + exit 11 ──
+const announcedApi = process.env.IREPO_PLUGIN_API;
+if (arg0 !== "--plugin-healthcheck" && announcedApi && announcedApi !== PLUGIN_API) {
+  console.error(`${PLUGIN}: unsupported IREPO_PLUGIN_API=${announcedApi} (supported: ${PLUGIN_API})`);
+  process.exit(11);
+}
+
+loadBuiltins()
+  .then(() =>
+    arg0 === "--plugin-healthcheck"
+      ? healthcheck().then((ok) => process.exit(ok ? 0 : 1))
+      : main(),
+  )
+  .catch((error) => {
+    console.error(`${PLUGIN}: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  });
+
+async function healthcheck() {
+  const checks = [];
+  const irepoOk = await commandExists(iRepoBin(), ["--version"]);
+  checks.push({
+    name: "i-repo-cli", ok: irepoOk, severity: "required",
+    hint: "Install i-repo (npm i -g i-repo) or fix PATH",
+  });
+  // クラウド転送 CLI は各 push サブコマンド専用 — severity でスコープを示すので、
+  // 不在でも全体の ok は落とさない（i-repo CLI だけが必須）。
+  const awsOk = await commandExists("aws", ["--version"]);
+  checks.push({
+    name: "aws-cli", ok: awsOk, severity: "required-for:push-s3",
+    hint: "Install AWS CLI v2 to use push-s3",
+  });
+  const gcloudOk = await commandExists("gcloud", ["--version"]);
+  checks.push({
+    name: "gcloud-cli", ok: gcloudOk, severity: "required-for:push-gcs",
+    hint: "Install Google Cloud SDK (gcloud) to use push-gcs",
+  });
+  const azOk = await commandExists("az", ["--version"]);
+  checks.push({
+    name: "az-cli", ok: azOk, severity: "required-for:push-azure",
+    hint: "Install Azure CLI (az) to use push-azure",
+  });
+  const ok = irepoOk;
+  console.log(JSON.stringify({ ok, checks }));
+  return ok;
+}
+
+// ── Entry ──────────────────────────────────────────────────────────────────
+
+async function main() {
+  const [command, ...rest] = process.argv.slice(2);
+  if (command === "create") return createArchive(parseCreateArgs(rest));
+  if (command === "push-s3") return pushArchiveBundle(parsePushArgs(rest, S3_BACKEND), S3_BACKEND);
+  if (command === "push-gcs") return pushArchiveBundle(parsePushArgs(rest, GCS_BACKEND), GCS_BACKEND);
+  if (command === "push-azure") return pushArchiveBundle(parsePushArgs(rest, AZURE_BACKEND), AZURE_BACKEND);
+  usage();
+  process.exitCode = command === undefined || command === "--help" || command === "-h" ? 0 : 2;
+}
+
+function usage() {
+  console.error(`Usage:
+  ${PLUGIN} create [options]
+      --out <path>             Archive directory (default: ~/.i-repo/archives/<timestamp>)
+      --allow-worktree         Allow writing inside the current git worktree
+      --force                  Reuse an existing archive directory
+      --with-artifacts <t,..>  pdf,pdfLayer,excel,text,none (default: pdf; text=no binaries, cluster values only)
+      --with-detail            Embed cluster values (reports get per record)
+      --detail-sleep-ms <ms>   Sleep between detail fetches (default: 0)
+      --detail-sleep-every <n> Apply sleep every N records (default: 1)
+      --dry-run                Resolve inputs and report without writing
+      --endpoint/--user/--password <v>   Override i-repo credentials
+      Filters: -l/--label-id -w/--word --public-status -e/--edit-status
+               -t/--type -d/--definition --definition-id --word-target
+               --history --regist-from --regist-to --update-from --update-to
+               -k/--system-key <n=v> (repeatable)
+  ${PLUGIN} push-s3    <archive-dir> --to s3://bucket/prefix [--cleanup] [--dry-run]
+  ${PLUGIN} push-gcs   <archive-dir> --to gs://bucket/prefix [--cleanup] [--dry-run]
+  ${PLUGIN} push-azure <archive-dir> --to https://<account>.blob.core.windows.net/<container>/<prefix>
+      [--sas <token> | --connection-string <cs>] [--cleanup] [--dry-run]
+      --cleanup                Delete the local archive after the upload is verified
+      (gcs requires gcloud; azure requires az CLI. secrets are read from --sas/
+       --connection-string or AZURE_STORAGE_* env and passed to az via env, never argv)`);
+}
+
+// ── Tiny argv parser (no dependencies) ─────────────────────────────────────
+// spec: { "--name": "value" | "flag" | "list", "-x": "--name" (alias) }
+
+function parseArgv(argv, spec, label) {
+  const out = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    let token = argv[i];
+    if (!token.startsWith("-")) {
+      out._.push(token);
+      continue;
+    }
+    let inlineValue;
+    const eq = token.indexOf("=");
+    if (eq > -1) {
+      inlineValue = token.slice(eq + 1);
+      token = token.slice(0, eq);
+    }
+    let kind = spec[token];
+    if (typeof kind === "string" && kind.startsWith("--")) {
+      token = kind; // alias → canonical
+      kind = spec[token];
+    }
+    if (!kind) throw new Error(`Unknown option for ${label}: ${token}\nRun "${PLUGIN} --help".`);
+    const key = token.replace(/^--/, "");
+    if (kind === "flag") {
+      if (inlineValue !== undefined) throw new Error(`Option ${token} does not take a value.`);
+      out[key] = true;
+      continue;
+    }
+    const value = inlineValue !== undefined ? inlineValue : argv[++i];
+    if (value === undefined) throw new Error(`Option ${token} requires a value.`);
+    if (kind === "list") (out[key] = out[key] ?? []).push(value);
+    else out[key] = value;
+  }
+  return out;
+}
+
+const CREATE_SPEC = {
+  "--out": "value", "--allow-worktree": "flag", "--force": "flag",
+  "--with-artifacts": "value", "--with-detail": "flag", "--dry-run": "flag",
+  "--detail-sleep-ms": "value", "--detail-sleep-every": "value",
+  "--endpoint": "value", "--user": "value", "--password": "value",
+  "--label-id": "value", "-l": "--label-id",
+  "--word": "value", "-w": "--word",
+  "--public-status": "value",
+  "--edit-status": "value", "-e": "--edit-status",
+  "--type": "value", "-t": "--type",
+  "--definition": "value", "-d": "--definition",
+  "--definition-id": "value",
+  "--word-target": "value", "--history": "flag",
+  "--regist-from": "value", "--regist-to": "value",
+  "--update-from": "value", "--update-to": "value",
+  "--system-key": "list", "-k": "--system-key",
+};
+
+function parseCreateArgs(argv) {
+  const o = parseArgv(argv, CREATE_SPEC, "create");
+  if (o._.length > 0) throw new Error(`Unexpected argument: ${o._[0]}`);
+  const artifacts = (o["with-artifacts"] ?? "pdf").split(",").map((s) => s.trim()).filter(Boolean);
+  for (const a of artifacts) {
+    if (!["pdf", "pdfLayer", "excel", "text", "none"].includes(a)) {
+      throw new Error(`Unsupported artifact type "${a}". Use pdf, pdfLayer, excel, text, or none.`);
+    }
+  }
+  return {
+    out: o.out,
+    allowWorktree: Boolean(o["allow-worktree"]),
+    force: Boolean(o.force),
+    withArtifacts: artifacts,
+    // text モードはバイナリ無し＋フィールド値（クラスター値）を必ず埋めるので detail を強制 ON。
+    withDetail: Boolean(o["with-detail"]) || artifacts.includes("text"),
+    detailSleepMs: Math.max(0, parseInt(o["detail-sleep-ms"] ?? "200", 10) || 0),
+    detailSleepEvery: Math.max(1, parseInt(o["detail-sleep-every"] ?? "1", 10) || 1),
+    dryRun: Boolean(o["dry-run"]),
+    endpoint: o.endpoint,
+    user: o.user,
+    password: o.password,
+    filters: {
+      labelId: o["label-id"], word: o.word, publicStatus: o["public-status"],
+      editStatus: o["edit-status"], itemType: o.type,
+      definition: o["definition-id"] ?? o.definition,
+      wordTarget: o["word-target"], history: Boolean(o.history),
+      registFrom: o["regist-from"], registTo: o["regist-to"],
+      updateFrom: o["update-from"], updateTo: o["update-to"],
+      systemKeys: o["system-key"] ?? [],
+    },
+  };
+}
+
+function parsePushArgs(argv, backend) {
+  const label = `push-${backend.store}`;
+  const spec = { "--to": "value", "--dry-run": "flag", "--cleanup": "flag" };
+  // Azure は認証 secret を受ける（値は argv に出さず env で az に渡す。buildPushEnv 参照）。
+  if (backend.store === "azure") { spec["--sas"] = "value"; spec["--connection-string"] = "value"; }
+  const o = parseArgv(argv, spec, label);
+  if (o._.length !== 1) throw new Error(`${label} requires exactly one <archive-dir> argument.`);
+  if (!o.to) throw new Error(`${label} requires --to ${backend.scheme}…`);
+  if (!o.to.startsWith(backend.scheme)) throw new Error(`destination must start with "${backend.scheme}".`);
+  // Azure は blob エンドポイント URL の構造（account/container/prefix）まで parse 時に検証する
+  // （dry-run でも不正 URL を早期に弾く。upload 時の parseAzureTo と同基準）。
+  if (backend.store === "azure") parseAzureTo(o.to);
+  const out = { archiveDir: o._[0], to: o.to, dryRun: Boolean(o["dry-run"]), cleanup: Boolean(o.cleanup) };
+  if (backend.store === "azure") {
+    out.azure = true;
+    // フラグ未指定なら env から拾う（host の secret env 注入＝envVar 宣言と整合）。
+    out.sas = o.sas || process.env.AZURE_STORAGE_SAS_TOKEN || "";
+    out.connectionString = o["connection-string"] || process.env.AZURE_STORAGE_CONNECTION_STRING || "";
+  }
+  return out;
+}
+
+// ── create ──────────────────────────────────────────────────────────────────
+
+async function createArchive(options) {
+  // "none"（一覧メタのみ）と "text"（フィールド値まで・バイナリ無し）はどちらもバイナリDLをスキップ。
+  // 矛盾指定（例 pdf,text）でもバイナリ無しを優先する。
+  const noBinaries = options.withArtifacts.some((a) => a === "none" || a === "text");
+  const artifacts = noBinaries
+    ? []
+    : Array.from(new Set(options.withArtifacts.filter((a) => a !== "none" && a !== "text")));
+  const archivePath = resolveArchivePath(options.out);
+  ensureArchiveLocationIsSafe(archivePath, options.allowWorktree);
+
+  if (!options.dryRun) await prepareArchiveDirectory(archivePath, options.force);
+
+  const jobId = `archive-${timestampTag()}-${process.pid}`;
+  const credentials = await resolveCredentials(options);
+  const manifestText = await listReports(credentials, options.filters);
+  const records = parseManifest(manifestText); // validates the stream-end trailer
+  const savedFiles = [];
+
+  if (!options.dryRun) {
+    // ── 成果物ダウンロード（先に実行し、各レコードへ objectKey を記録） ──
+    // With --history the same report id appears across multiple revisions, so
+    // count ids and add a -rev<n> discriminator only where it's needed.
+    const idCounts = new Map();
+    for (const record of records) {
+      const id = getReportId(record);
+      if (id !== null) idCounts.set(id, (idCounts.get(id) ?? 0) + 1);
+    }
+    const usedNames = new Set();
+    for (const record of records) {
+      const reportId = getReportId(record);
+      if (reportId === null) {
+        console.error("skipping artifact download for a record without itemId/topId");
+        continue;
+      }
+      const revNo = record.revNo != null ? String(record.revNo) : "";
+      const needsRev = (idCounts.get(reportId) ?? 0) > 1 && revNo !== "";
+      for (const artifact of artifacts) {
+        const dl = await downloadArtifactNamed(credentials, reportId, artifact);
+        try {
+          const fileName = chooseArtifactFileName(dl.name, {
+            record, reportId, revNo, needsRev, artifact,
+            multipleArtifacts: artifacts.length > 1, usedNames,
+          });
+          usedNames.add(fileName);
+          const outputPath = join(archivePath, "documents", fileName);
+          await moveFile(dl.tempPath, outputPath);
+          savedFiles.push(outputPath);
+          // NoSQLドキュメントから添付を辿れるよう、相対 objectKey を記録（S3なら <prefix>/documents/<name>）
+          (record.artifacts = record.artifacts ?? []).push({
+            type: artifact, file: fileName, objectKey: `documents/${fileName}`,
+          });
+        } finally {
+          await fsp.rm(dl.tempDir, { recursive: true, force: true });
+        }
+      }
+    }
+
+    // ── --with-detail: 各帳票の reports get を呼び、クラスター値を record.detail に埋め込む ──
+    // これにより manifest が一覧レベルから「クラスター値＋添付パス入りの richな NDJSON」になり、
+    // どの sink（mongo/sqlite/s3…）でも帳票の中身まで届く。
+    let manifestToWrite = manifestText; // 既定は verbatim（トレーラ込みの忠実コピー）
+    if (options.withDetail) {
+      const sleepMs = options.detailSleepMs;
+      const sleepEvery = options.detailSleepEvery;
+      if (sleepMs > 0) {
+        console.error(`--with-detail: sleep ${sleepMs}ms every ${sleepEvery} record(s)`);
+      }
+      let enriched = 0, fetched = 0;
+      for (const record of records) {
+        const id = getReportId(record);
+        if (id === null) continue;
+        try {
+          record.detail = await fetchReportDetail(credentials, id);
+          enriched++;
+        } catch (error) {
+          console.error(`detail fetch failed for report ${id}: ${error.message}`);
+        }
+        fetched++;
+        if (sleepMs > 0 && fetched % sleepEvery === 0) {
+          await new Promise((r) => setTimeout(r, sleepMs));
+        }
+      }
+      console.error(`--with-detail: embedded clusters for ${enriched}/${records.length} report(s)`);
+      const trailerLine = manifestText
+        .split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+        .find((l) => { try { return JSON.parse(l).recordType === "stream-end"; } catch { return false; } });
+      const lines = records.map((r) => JSON.stringify(r));
+      if (trailerLine) lines.push(trailerLine);
+      manifestToWrite = lines.join("\n") + "\n";
+    }
+
+    // The manifest is written verbatim (or enriched when --with-detail).
+    const manifestPath = join(archivePath, "manifests", "reports.ndjson");
+    await writeTextFile(manifestPath, manifestToWrite);
+    savedFiles.push(manifestPath);
+  }
+
+  // ── write phase receipt (SCHEMA.md §6 + plugin-specific extras) ──
+  const extras = {
+    archivePath,
+    createdAt: new Date().toISOString(),
+    requestedArtifacts: artifacts,
+    savedFiles,
+    filters: compactObject(options.filters),
+    ...(options.dryRun ? { dryRun: true } : {}),
+  };
+  emitReceipt("write", jobId, records.length, 0, false, extras);
+
+  if (options.dryRun) return;
+
+  // Completion marker written last: its absence marks an incomplete bundle.
+  const receiptPath = join(archivePath, "receipts", "archive.json");
+  await writeJsonFile(receiptPath, {
+    jobId, count: records.length,
+    producedBy: { plugin: PLUGIN, version: VERSION }, // 来歴: stdout だけでなく archive.json にも残す
+    ...extras,
+  });
+  savedFiles.push(receiptPath);
+
+  // ── verify phase: read back every saved file (exists and non-empty) ──
+  let failed = 0;
+  for (const file of savedFiles) {
+    const details = await fsp.stat(file).catch(() => null);
+    if (!details || !details.isFile() || details.size === 0) {
+      console.error(`verify failed: missing or empty ${file}`);
+      failed++;
+    }
+  }
+  emitReceipt("verify", jobId, records.length, failed, failed === 0, { archivePath });
+  if (failed > 0) process.exitCode = 1;
+}
+
+// ── push to object storage (s3 / gcs / azure) ────────────────────────────────
+//
+// 共通スケルトン pushArchiveBundle が「upload → push receipt 配置 → 読み戻して verify →
+// --cleanup（verified 時のみ削除）」を担い、各 backend は store 固有の「アップロード・存在
+// 確認・dest 計算」だけを実装する。push-s3 の確立パターンを s3/gcs/azure へ一般化したもの。
+//
+// 検証状況: s3 は既存どおり実運用検証済み。gcs は gcloud のパス意味論をローカルで確認済み
+// （cp --recursive <dir> <to> は basename を付与し <to>/<batchDir>/… を作る）だが実アップ
+// ロード検証は環境依存。azure は az CLI 不在のため実行未検証（コマンド配線は az docs 準拠）。
+
+// スキーム非依存のスラッシュ結合（s3:// / gs:// / https:// すべてに使える）。
+function joinUri(prefix, child) {
+  return joinS3Uri(prefix, child);
+}
+
+// secret（SAS / 接続文字列）は argv に載せず az が読む環境変数で渡す（AGENTS.md / 本番化方針）。
+function buildPushEnv(options) {
+  const env = { ...process.env };
+  if (options.connectionString) env.AZURE_STORAGE_CONNECTION_STRING = options.connectionString;
+  else if (options.sas) env.AZURE_STORAGE_SAS_TOKEN = options.sas;
+  // Azure で明示 secret が無ければ az login 認証を使う（既定の account-key モードは
+  // RBAC-only / listKeys 無効アカウントで失敗するため・Codex #76 P2）。s3/gcs は options.azure
+  // 未設定なので素通り。
+  else if (options.azure) env.AZURE_STORAGE_AUTH_MODE = "login";
+  return env;
+}
+
+const S3_BACKEND = {
+  store: "s3", scheme: "s3://", prefixKey: "s3Prefix", receiptName: "push-s3.json",
+  async upload(archivePath, to, batchDir, env) {
+    // aws s3 cp <dir> <dest> --recursive は <dir> の中身を <dest> 直下へ置く。
+    const destination = joinUri(to, batchDir);
+    await runCommand("aws", ["s3", "cp", archivePath, destination, "--recursive"], { env, captureStdout: false });
+    return destination;
+  },
+  async uploadReceipt(receiptPath, destination, env) {
+    await runCommand("aws", ["s3", "cp", receiptPath, joinUri(destination, `receipts/${this.receiptName}`)], { env, captureStdout: false });
+  },
+  async verify(destination, env) {
+    const r = await runCommand("aws", ["s3", "ls", joinUri(destination, `receipts/${this.receiptName}`)], { env, captureStdout: true }).catch(() => null);
+    return r !== null && r.stdout.trim().length > 0;
+  },
+};
+
+const GCS_BACKEND = {
+  store: "gcs", scheme: "gs://", prefixKey: "gcsPrefix", receiptName: "push-gcs.json",
+  async upload(archivePath, to, batchDir, env) {
+    // gcloud storage cp --recursive <dir> <to> は basename(<dir>)=batchDir を付与して
+    // <to>/<batchDir>/… を作る（ローカル検証で確認）。dest はそれと一致させる。
+    await runCommand("gcloud", ["storage", "cp", "--recursive", archivePath, to], { env, captureStdout: false });
+    return joinUri(to, batchDir);
+  },
+  async uploadReceipt(receiptPath, destination, env) {
+    await runCommand("gcloud", ["storage", "cp", receiptPath, joinUri(destination, `receipts/${this.receiptName}`)], { env, captureStdout: false });
+  },
+  async verify(destination, env) {
+    const r = await runCommand("gcloud", ["storage", "ls", joinUri(destination, `receipts/${this.receiptName}`)], { env, captureStdout: true }).catch(() => null);
+    return r !== null && r.stdout.trim().length > 0;
+  },
+};
+
+// https://<account>.blob.core.windows.net/<container>/<prefix...> を分解。
+function parseAzureTo(to) {
+  // SAS 付き URL（?sv=…&sig=… / #fragment）を --to に貼られると、--to は secret:true でないため
+  // SAS トークンが azurePrefix receipt・カタログ・表示コマンドへ漏洩する。query/fragment を含む
+  // URL は拒否し、SAS は env-only の --sas で渡させる（Codex #76 P2・secret 取り扱い契約）。
+  if (/[?#]/.test(to)) {
+    throw new Error('Azure --to must not contain a query string or SAS token (pass the SAS via --sas; --to is not secret).');
+  }
+  const m = /^https:\/\/([a-z0-9]+)\.blob\.core\.windows\.net\/([^/]+)(?:\/(.*))?$/i.exec(to);
+  if (!m) throw new Error('Azure destination must be https://<account>.blob.core.windows.net/<container>/<prefix>.');
+  return { account: m[1], container: m[2], prefix: (m[3] || "").replace(/\/+$/, "") };
+}
+
+const AZURE_BACKEND = {
+  store: "azure", scheme: "https://", prefixKey: "azurePrefix", receiptName: "push-azure.json",
+  async upload(archivePath, to, batchDir, env) {
+    const { account, container, prefix } = parseAzureTo(to);
+    const destPath = [prefix, batchDir].filter(Boolean).join("/");
+    // upload-batch は <source> の中身を相対パス保持で <container>/<destPath>/ へ置く。
+    await runCommand("az", ["storage", "blob", "upload-batch", "--account-name", account,
+      "--destination", container, "--destination-path", destPath, "--source", archivePath, "--overwrite"],
+      { env, captureStdout: false });
+    return joinUri(to, batchDir);
+  },
+  async uploadReceipt(receiptPath, destination, env) {
+    const { account, container, prefix } = parseAzureTo(destination);
+    const name = [prefix, `receipts/${this.receiptName}`].filter(Boolean).join("/");
+    await runCommand("az", ["storage", "blob", "upload", "--account-name", account,
+      "--container-name", container, "--name", name, "--file", receiptPath, "--overwrite"],
+      { env, captureStdout: false });
+  },
+  async verify(destination, env) {
+    const { account, container, prefix } = parseAzureTo(destination);
+    const name = [prefix, `receipts/${this.receiptName}`].filter(Boolean).join("/");
+    const r = await runCommand("az", ["storage", "blob", "exists", "--account-name", account,
+      "--container-name", container, "--name", name, "-o", "json"], { env, captureStdout: true }).catch(() => null);
+    if (r === null) return false;
+    try { return JSON.parse(r.stdout).exists === true; } catch { return false; }
+  },
+};
+
+const PUSH_BACKENDS = { s3: S3_BACKEND, gcs: GCS_BACKEND, azure: AZURE_BACKEND };
+
+async function pushArchiveBundle(options, backend) {
+  const archivePath = resolveArchivePath(options.archiveDir);
+  await validateArchiveDirectory(archivePath);
+
+  const jobId = `push-${timestampTag()}-${process.pid}`;
+  const archiveReceipt = await readJsonObject(join(archivePath, "receipts", "archive.json"));
+  const count = typeof archiveReceipt.count === "number" ? archiveReceipt.count : 0;
+  const batchDir = basename(archivePath);
+  const env = buildPushEnv(options);
+
+  if (options.dryRun) {
+    emitReceipt("write", jobId, count, 0, false, { archivePath, [backend.prefixKey]: joinUri(options.to, batchDir), dryRun: true });
+    return;
+  }
+
+  const receiptPath = join(archivePath, "receipts", backend.receiptName);
+  // Drop any push receipt left by a previous run BEFORE the recursive copy,
+  // so a partial/failed copy can never ship a stale "ok" receipt upstream.
+  await fsp.rm(receiptPath, { force: true });
+  // Upload the bundle first; only after the recursive copy succeeds do we
+  // write the push receipt and upload it as a final, separate object.
+  const destination = await backend.upload(archivePath, options.to, batchDir, env);
+  emitReceipt("write", jobId, count, 0, false, { archivePath, [backend.prefixKey]: destination });
+
+  await writeJsonFile(receiptPath, { jobId, count, archivePath, [backend.prefixKey]: destination, pushedAt: new Date().toISOString() });
+  await backend.uploadReceipt(receiptPath, destination, env);
+
+  // ── verify phase: read the receipt object back from the destination ──
+  const verified = await backend.verify(destination, env);
+
+  // ── --cleanup: verified:true を確認できたときだけローカルを削除する ──
+  // (PLUGINS.md: 不可逆処理は exit 0 ではなく verified receipt を条件にする)。
+  // 削除失敗は配送の失敗ではないので exit 0 のまま、ただし receipt の
+  // cleanedUp:false と stderr で必ず報告する (沈黙させない)。
+  const extras = { archivePath, [backend.prefixKey]: destination };
+  if (options.cleanup) {
+    if (verified) {
+      try {
+        await fsp.rm(archivePath, { recursive: true, force: true });
+        extras.cleanedUp = true;
+        console.error(`cleaned up local archive: ${archivePath}`);
+      } catch (error) {
+        extras.cleanedUp = false;
+        // 非 Error が throw されても二次例外で本来の失敗を隠さない
+        console.error(
+          `cleanup failed (local archive kept): ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    } else {
+      extras.cleanedUp = false; // verify 失敗時は絶対に消さない
+    }
+  }
+  emitReceipt("verify", jobId, count, verified ? 0 : count, verified, extras);
+  if (!verified) process.exitCode = 1;
+}
+
+// ── receipts (SCHEMA.md §6) ─────────────────────────────────────────────────
+
+function emitReceipt(phase, jobId, count, failedCount, verified, extras) {
+  process.stdout.write(JSON.stringify({
+    schemaVersion: "1.0", recordType: "receipt", plugin: PLUGIN,
+    producedBy: { plugin: PLUGIN, version: VERSION },
+    phase, jobId, count, failedCount, verified, ...extras,
+  }) + "\n");
+}
+
+// ── manifest parsing + stream-end validation (SCHEMA.md §2.6) ───────────────
+
+function parseManifest(text) {
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const records = [];
+  let trailer = null;
+  for (const [index, line] of lines.entries()) {
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch (error) {
+      throw new Error(`Failed to parse NDJSON line ${index + 1}: ${error.message}`);
+    }
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      throw new Error(`NDJSON line ${index + 1} is not an object.`);
+    }
+    if (row.recordType === "stream-end") trailer = row;
+    else records.push(row);
+  }
+  const isEnvelope = records.some((r) => "schemaVersion" in r);
+  if (isEnvelope && !trailer) {
+    throw new Error("truncated manifest: envelope records present but no stream-end trailer (SCHEMA.md §2.6).");
+  }
+  if (trailer && trailer.count !== records.length) {
+    throw new Error(
+      `incomplete manifest: stream-end count=${trailer.count} but received ${records.length} record(s) (SCHEMA.md §2.6).`,
+    );
+  }
+  return records;
+}
+
+/** Identifier for download/file naming, or null when the row has none. */
+function getReportId(record) {
+  const raw = record.itemId ?? record.topId;
+  return raw === undefined || raw === null ? null : String(raw);
+}
+
+// ── archive locations ───────────────────────────────────────────────────────
+
+function resolveArchivePath(out) {
+  if (out && out.trim().length > 0) return resolve(expandHome(out));
+  return resolve(defaultArchiveRoot(), timestampTag());
+}
+
+function expandHome(value) {
+  if (value === "~") return homedir();
+  if (value.startsWith(`~${sep}`) || value.startsWith("~/")) return join(homedir(), value.slice(2));
+  return value;
+}
+
+async function prepareArchiveDirectory(path, force) {
+  if (fs.existsSync(path)) {
+    const details = await fsp.stat(path);
+    if (!details.isDirectory()) throw new Error(`Archive path exists and is not a directory: ${path}`);
+    if (!force) {
+      throw new Error(
+        `Archive directory already exists: ${path}\nPick a new --out path or pass --force to reuse that directory.`,
+      );
+    }
+    // --force reuses the directory: clear the managed subdirectories so stale
+    // files from a previous run cannot leak into a later recursive push-s3.
+    for (const sub of ["manifests", "documents", "receipts"]) {
+      await fsp.rm(join(path, sub), { recursive: true, force: true });
+    }
+  }
+  for (const sub of ["manifests", "documents", "receipts"]) {
+    await fsp.mkdir(join(path, sub), { recursive: true });
+  }
+}
+
+function ensureArchiveLocationIsSafe(path, allowWorktree) {
+  if (allowWorktree) return;
+  const worktreeRoot = findUp(process.cwd(), (dir) => fs.existsSync(join(dir, ".git")));
+  if (!worktreeRoot) return;
+  const target = resolve(path);
+  const parent = resolve(worktreeRoot);
+  if (target === parent || target.startsWith(parent + sep)) {
+    throw new Error(
+      `Refusing to write archive data inside the current git worktree:\n` +
+      `  worktree: ${worktreeRoot}\n  archive:  ${path}\n` +
+      "Use a path outside the repo, or pass --allow-worktree if you really want that.",
+    );
+  }
+}
+
+function findUp(from, predicate) {
+  let current = resolve(from);
+  while (true) {
+    if (predicate(current)) return current;
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+async function validateArchiveDirectory(path) {
+  const details = await fsp.stat(path).catch(() => null);
+  if (!details || !details.isDirectory()) throw new Error(`Archive directory does not exist: ${path}`);
+  await fsp.access(join(path, "manifests", "reports.ndjson"));
+  // Require the completion marker: create writes receipts/archive.json last,
+  // so its absence means create failed mid-run and the bundle is incomplete.
+  await fsp.access(join(path, "receipts", "archive.json")).catch(() => {
+    throw new Error(
+      `Archive is incomplete (missing receipts/archive.json): ${path}\n` +
+      "The create step may have failed before finishing; re-run create.",
+    );
+  });
+}
+
+// ── credentials (flags > env > i-repo config files > TTY prompt) ────────────
+
+async function resolveCredentials(options) {
+  const config = await readMergedIRepoConfig(process.cwd());
+  const endpoint = options.endpoint ?? process.env.IREPO_ENDPOINT ?? config.endpoint;
+  const user = options.user ?? process.env.IREPO_USER ?? config.user;
+  let password = options.password ?? process.env.IREPO_PASSWORD ?? config.password;
+
+  if (!endpoint) {
+    throw new Error(
+      'i-Repo endpoint is not configured.\nPass --endpoint, set IREPO_ENDPOINT, or save it with "i-repo config set endpoint <url>".',
+    );
+  }
+  if (!user) {
+    throw new Error(
+      'i-Repo user is not configured.\nPass --user, set IREPO_USER, or save it with "i-repo config set user <name>".',
+    );
+  }
+  if (!password) {
+    if (!process.stdin.isTTY) {
+      throw new Error(
+        "i-Repo password is required.\nPass --password, set IREPO_PASSWORD, or save it in i-repo config before running this plugin.",
+      );
+    }
+    password = await promptPassword(`Password for ${user}: `);
+    if (!password) throw new Error("Password is required.");
+  }
+  return { endpoint, user, password };
+}
+
+/** Masked password prompt with Node built-ins only (raw mode + stderr echo). */
+function promptPassword(message) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const stdin = process.stdin;
+    process.stderr.write(message);
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.setEncoding("utf8");
+    let value = "";
+    const cleanup = () => {
+      stdin.setRawMode(false);
+      stdin.pause();
+      stdin.removeListener("data", onData);
+    };
+    const onData = (chunk) => {
+      for (const ch of chunk) {
+        if (ch === "") { // Ctrl+C
+          cleanup();
+          process.stderr.write("\n");
+          rejectPromise(new Error("Aborted."));
+          return;
+        }
+        if (ch === "\r" || ch === "\n") {
+          cleanup();
+          process.stderr.write("\n");
+          resolvePromise(value);
+          return;
+        }
+        if (ch === "" || ch === "\b") {
+          if (value.length > 0) {
+            value = value.slice(0, -1);
+            process.stderr.write("\b \b");
+          }
+          continue;
+        }
+        value += ch;
+        process.stderr.write("*");
+      }
+    };
+    stdin.on("data", onData);
+  });
+}
+
+async function readMergedIRepoConfig(from) {
+  const root = findUp(from, (dir) =>
+    fs.existsSync(join(dir, ".git")) || fs.existsSync(join(dir, "package.json")));
+  const userConfig = await readJsonObject(join(homedir(), ".i-repo", "i-repo.json"));
+  const projectConfig = root ? await readJsonObject(join(root, ".i-repo", "i-repo.json")) : {};
+  const localConfig = root ? await readJsonObject(join(root, ".i-repo", "i-repo.local.json")) : {};
+  return { ...userConfig, ...projectConfig, ...localConfig };
+}
+
+async function readJsonObject(path) {
+  try {
+    const parsed = JSON.parse(await fsp.readFile(path, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return parsed;
+  } catch {
+    return {};
+  }
+}
+
+// ── i-repo callbacks ────────────────────────────────────────────────────────
+
+async function listReports(credentials, filters) {
+  const args = ["rep", "list", "--format", "ndjson", ...buildListArgs(filters)];
+  const result = await runCommand(iRepoBin(), args, {
+    env: buildIRepoEnv(credentials), captureStdout: true,
+  });
+  return result.stdout;
+}
+
+/**
+ * 帳票詳細（GetReportDetail 相当）を取得し、クラスター配列を返す。
+ * 文字クラスターは value に入力値、画像クラスターは value:"Image"（実体は別途S3へ）。
+ */
+async function fetchReportDetail(credentials, reportId) {
+  const result = await runCommand(
+    iRepoBin(),
+    ["reports", "get", String(reportId), "--format", "json"],
+    { env: buildIRepoEnv(credentials), captureStdout: true },
+  );
+  let parsed = JSON.parse(result.stdout);
+  if (Array.isArray(parsed)) parsed = parsed[0] ?? {};
+  const clusters = parsed?.clusters?.cluster ?? [];
+  return {
+    sheetCount: parsed.sheetCount ?? null,
+    clusterCount: Array.isArray(clusters) ? clusters.length : 0,
+    clusters: Array.isArray(clusters) ? clusters : [],
+  };
+}
+
+function buildListArgs(filters) {
+  const args = [];
+  const push = (flag, value) => { if (value && value.length > 0) args.push(flag, value); };
+  push("--label-id", filters.labelId);
+  push("--word", filters.word);
+  push("--public-status", filters.publicStatus);
+  push("--edit-status", filters.editStatus);
+  push("--type", filters.itemType);
+  push("--definition", filters.definition);
+  push("--word-target", filters.wordTarget);
+  if (filters.history) args.push("--history");
+  push("--regist-from", filters.registFrom);
+  push("--regist-to", filters.registTo);
+  push("--update-from", filters.updateFrom);
+  push("--update-to", filters.updateTo);
+  for (const value of filters.systemKeys) push("--system-key", value);
+  return args;
+}
+
+/**
+ * Download one artifact letting the CLI pick the filename — the CLI uses the
+ * server-provided name (Content-Disposition = ファイル自動出力設定の名称) and
+ * falls back to report-<id>.<ext>. We run it in a fresh temp dir and read the
+ * single file that appears, so the chosen name reaches us without parsing any
+ * human-facing output.
+ */
+async function downloadArtifactNamed(credentials, reportId, artifact) {
+  const tempDir = await fsp.mkdtemp(join(tmpdir(), "irepo-archive-dl-"));
+  try {
+    await runCommand(
+      iRepoBin(),
+      ["rep", "download", reportId, "--file-type", artifact],
+      { env: buildIRepoEnv(credentials), captureStdout: true, cwd: tempDir },
+    );
+    const entries = await fsp.readdir(tempDir);
+    if (entries.length !== 1) {
+      throw new Error(
+        `expected exactly one downloaded file for report ${reportId} (${artifact}), found ${entries.length}`,
+      );
+    }
+    return { tempDir, tempPath: join(tempDir, entries[0]), name: entries[0] };
+  } catch (error) {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+/**
+ * rename で移動し、tmpdir と保存先が別ボリュームのとき (EXDEV) は copy+unlink。
+ * Windows ではアンチウイルス/インデクサが書込直後のファイルを一瞬開くため、
+ * rename が EPERM/EBUSY/EACCES で散発的に失敗する — CLI 本体の
+ * renameWithRetry と同じく短い指数バックオフでリトライする。
+ */
+async function moveFile(from, to) {
+  await fsp.mkdir(dirname(to), { recursive: true });
+  const transient = new Set(["EPERM", "EBUSY", "EACCES"]);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await fsp.rename(from, to);
+      return;
+    } catch (error) {
+      // throw null 等の非オブジェクトでも二次例外を起こさない (?. は安全)
+      const code = error?.code;
+      if (code === "EXDEV") {
+        await fsp.copyFile(from, to);
+        await fsp.unlink(from);
+        return;
+      }
+      if (attempt >= 9 || !transient.has(code)) throw error;
+      await new Promise((r) => setTimeout(r, 10 + attempt * 15));
+    }
+  }
+}
+
+function buildIRepoEnv(credentials) {
+  return {
+    ...process.env,
+    IREPO_ENDPOINT: credentials.endpoint,
+    IREPO_USER: credentials.user,
+    IREPO_PASSWORD: credentials.password,
+  };
+}
+
+function iRepoBin() {
+  return process.env.IREPO_BIN && process.env.IREPO_BIN.length > 0 ? process.env.IREPO_BIN : "i-repo";
+}
+
+function commandExists(command, args) {
+  return runCommand(command, args, { env: process.env, captureStdout: true })
+    .then(() => true)
+    .catch(() => false);
+}
+
+/**
+ * Build a spawn invocation that works on every OS WITHOUT shell:true.
+ * shell:true concatenates args unescaped through cmd.exe, so a filter value
+ * like `--word "a & calc"` could execute an extra command. Instead — same
+ * approach as i-repo's own plugin dispatcher — build the cmd.exe argv
+ * explicitly (each token quoted, /s strips the outer pair) and refuse
+ * cmd.exe metacharacters outright, since cmd.exe re-parses them even when
+ * quoted. POSIX spawns the argv array directly (no shell, nothing to escape).
+ */
+function spawnSpec(command, args) {
+  if (process.platform !== "win32") {
+    return { bin: command, argv: args, extra: {} };
+  }
+  // "i-repo"/"aws" may resolve to .cmd shims, which Node refuses to spawn
+  // directly — cmd.exe must run them.
+  const unsafe = [command, ...args].find((a) => /[&|<>^"%!()\r\n]/.test(a));
+  if (unsafe !== undefined) {
+    throw new Error(
+      `Refusing to run ${command}: argument contains characters unsafe for cmd.exe: ${unsafe}`,
+    );
+  }
+  const inner = [command, ...args].map((a) => `"${a}"`).join(" ");
+  return {
+    bin: process.env.ComSpec || "cmd.exe",
+    argv: ["/d", "/s", "/c", `"${inner}"`],
+    extra: { windowsVerbatimArguments: true },
+  };
+}
+
+function runCommand(command, args, options) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    let spec;
+    try {
+      spec = spawnSpec(command, args);
+    } catch (error) {
+      rejectPromise(error);
+      return;
+    }
+    const child = spawn(spec.bin, spec.argv, {
+      env: options.env,
+      cwd: options.cwd,
+      ...spec.extra,
+      // When not capturing, route the child's stdout to OUR stderr (fd 2) so
+      // child chatter (download progress, aws cp output) never pollutes the
+      // machine-readable receipts on our stdout.
+      stdio: ["inherit", options.captureStdout ? "pipe" : 2, "inherit"],
+    });
+    let stdout = "";
+    if (options.captureStdout && child.stdout) {
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+    }
+    child.on("error", (error) => {
+      if (error.code === "ENOENT") {
+        rejectPromise(new Error(
+          `Required command not found: ${command}\n` +
+          (command === "aws" ? "Install the AWS CLI or skip push-s3." : `Make sure "${command}" is on PATH.`),
+        ));
+        return;
+      }
+      rejectPromise(error);
+    });
+    // Use "close" (not "exit"): it fires after the stdout pipe has fully
+    // drained, so a large captured manifest is never truncated.
+    child.on("close", (code, signal) => {
+      if (signal) return rejectPromise(new Error(`${command} exited from signal ${signal}.`));
+      if ((code ?? 0) !== 0) {
+        return rejectPromise(new Error(`${command} ${args.join(" ")} failed with exit code ${code}.`));
+      }
+      resolvePromise({ stdout });
+    });
+  });
+}
+
+// ── small helpers ───────────────────────────────────────────────────────────
+
+/**
+ * Decide the final documents/ filename for one downloaded artifact.
+ *
+ * Base name: the CLI-saved name as-is when the server provided one
+ * (Content-Disposition = ファイル自動出力設定の名称). When the CLI fell back to
+ * its default `report-<id>.<ext>`, build `帳票ID_帳票名称.<ext>` from the
+ * manifest instead (公式 DownloadReport の ZIP 内命名 `pdf_帳票ID_帳票名称.pdf`
+ * に準拠した、ID込みで衝突しない形)。
+ *
+ * Discriminators (applied to either base):
+ *   -rev<n>      … --history で同一帳票IDが複数リビジョンあるとき
+ *   -<artifact>  … 複数タイプ要求時 (pdf と pdfLayer は同じ .pdf で衝突する)
+ *   _<帳票ID>    … それでも他帳票のサーバ名と衝突したとき (自動出力設定が
+ *                  帳票名のみ等、ID を含まない場合に起こる)
+ */
+function chooseArtifactFileName(downloadedName, ctx) {
+  const dot = downloadedName.lastIndexOf(".");
+  let stem = dot > 0 ? downloadedName.slice(0, dot) : downloadedName;
+  const ext = dot > 0 ? downloadedName.slice(dot) : fileExtensionFor(ctx.artifact);
+
+  const cliFallback = `report-${ctx.reportId}${fileExtensionFor(ctx.artifact)}`;
+  if (downloadedName === cliFallback) {
+    // サーバ名なし → manifest の帳票名称から組み立てる (日本語は保持)。
+    // 封筒 (SCHEMA.md §2.5) では帳票名称は values.name に入る。
+    // 封筒でない生の行 (recordTypes:["*"] 経由) のために record.name も見る。
+    const rawName =
+      (ctx.record.values && typeof ctx.record.values.name === "string"
+        ? ctx.record.values.name.trim()
+        : "") ||
+      (typeof ctx.record.name === "string" ? ctx.record.name.trim() : "");
+    const cleanName = rawName ? sanitizeUnicodeFileName(rawName) : "";
+    stem = cleanName
+      ? `${sanitizeFileName(ctx.reportId)}_${cleanName}`
+      : sanitizeFileName(ctx.reportId);
+  }
+
+  if (ctx.needsRev) stem += `-rev${sanitizeFileName(ctx.revNo)}`;
+  if (ctx.multipleArtifacts) stem += `-${sanitizeFileName(ctx.artifact)}`;
+
+  let fileName = `${stem}${ext}`;
+  if (ctx.usedNames.has(fileName)) fileName = `${stem}_${sanitizeFileName(ctx.reportId)}${ext}`;
+  for (let n = 2; ctx.usedNames.has(fileName); n++) {
+    fileName = `${stem}_${sanitizeFileName(ctx.reportId)}-${n}${ext}`;
+  }
+  return fileName;
+}
+
+/**
+ * 帳票名称をファイル名に使えるよう無害化する。sanitizeFileName と違い
+ * 日本語等の Unicode は保持し、パス区切り・制御文字・Windows 禁止文字のみ潰す。
+ * 末尾のドット/空白は Windows が黙って剥がすため先に剥がす — ディスク上の
+ * 名前と一致させ、usedNames の衝突検出が迂回されないようにする。
+ */
+function sanitizeUnicodeFileName(value) {
+  return value.replace(/[/\\<>:"|?*\u0000-\u001f\u007f]/g, "_").replace(/[. ]+$/, "");
+}
+
+function fileExtensionFor(artifact) {
+  return artifact === "excel" ? ".xlsx" : ".pdf"; // pdf / pdfLayer → .pdf
+}
+
+function sanitizeFileName(value) {
+  return value.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+async function writeTextFile(path, content) {
+  await fsp.mkdir(dirname(path), { recursive: true });
+  await fsp.writeFile(path, content, "utf8");
+}
+
+async function writeJsonFile(path, content) {
+  await writeTextFile(path, JSON.stringify(content, null, 2) + "\n");
+}
+
+function compactObject(input) {
+  return Object.fromEntries(Object.entries(input).filter(
+    ([, value]) => value !== undefined && value !== false &&
+      !(Array.isArray(value) && value.length === 0),
+  ));
+}
+
+function timestampTag(date = new Date()) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}T` +
+    `${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+function joinS3Uri(prefix, child) {
+  return `${prefix.replace(/\/+$/, "")}/${child.replace(/^\/+/, "")}`;
+}

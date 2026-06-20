@@ -1,0 +1,467 @@
+#!/usr/bin/env node
+/**
+ * i-repo-sqlite — sink plugin: accumulate i-repo NDJSON records into a local
+ * SQLite database (BI Ready / 検索・分析の入口).
+ *
+ * ZERO DEPENDENCIES: uses node:sqlite (Node >= 22.5) only. Cross-platform.
+ *   install: copy to ~/.i-repo/plugins/i-repo-sqlite && chmod +x
+ *   Windows: also copy i-repo-sqlite.cmd shim
+ *
+ * Usage:
+ *   i-repo rep list --format ndjson | i-repo sqlite --db ~/irepo-warehouse.db
+ *   cat manifests/reports.ndjson    | i-repo sqlite --db ./wh.db --table reports
+ *
+ * Contract (docs/PLUGINS.md / SCHEMA.md):
+ *   - reserved flags --plugin-schema / --plugin-healthcheck
+ *   - IREPO_PLUGIN_API version check (exit 11 on mismatch)
+ *   - stream-end trailer validation (§2.6): trailer count must match received
+ *     record lines; envelope records without trailer = truncated → fail
+ *   - receipts on stdout in the frozen §6 shape: write → verify phases.
+ *     verify re-reads the DB and compares counts; only verified:true receipts
+ *     may be used as a cleanup precondition.
+ *   - idempotent: records UPSERT by idempotencyKey — re-runs do not duplicate.
+ */
+"use strict";
+
+const PLUGIN = "i-repo-sqlite";
+const VERSION = "0.1.0";
+
+// ── 予約フラグ: プラグイン自身の引数より先に判定 ──────────────────────
+const argv = process.argv.slice(2);
+const { homedir } = require("node:os");
+const { resolve } = require("node:path");
+
+if (argv[0] === "--plugin-schema") {
+  process.stdout.write(JSON.stringify({
+    pluginApi: ["1"],
+    schemaVersions: ["1.0"],
+    recordTypes: ["*"],
+    name: PLUGIN,
+    version: VERSION,
+    description: "Accumulate NDJSON records into a local SQLite database (UPSERT by idempotencyKey)",
+    phases: ["write", "verify"],
+    platforms: ["macos", "linux", "windows"],
+    roles: ["sink", "read"],
+    category: "database",   // 表示カテゴリ（GUI 種別グループ表示用・脱料理）
+    input: ["stdin-ndjson"],
+    params: [
+      { name: "--db", type: "string", required: true,
+        label: "SQLite DBファイル", placeholder: "~/irepo-warehouse.db",
+        description: "Output SQLite database file (created if missing)" },
+      { name: "--table", type: "string", default: "reports",
+        label: "テーブル名",
+        description: "Destination table name (created if missing)" },
+      { name: "--dry-run", type: "boolean", label: "Dry run",
+        description: "Validate input without writing" },
+      // ── query(読み返し)で受理する選択フィルタの宣言（脱料理: host が汎用描画/転送する印）。
+      //    新しい検索意味は足さない＝既に parseQueryArgs が受理する共通フラグを宣言するだけ。
+      { name: "--since", type: "string", subcommand: "query", filter: true, label: "開始時刻（含む）",
+        placeholder: "2026-06-01 00:00:00", description: "時刻範囲の下限（半開区間 [since, until)）" },
+      { name: "--until", type: "string", subcommand: "query", filter: true, label: "終了時刻（含まない）",
+        placeholder: "2026-06-15 00:00:00", description: "時刻範囲の上限（排他）" },
+      { name: "--time-field", type: "select", subcommand: "query", filter: true, label: "時刻フィールド",
+        choices: ["loaded", "updated", "registered"], default: "loaded",
+        description: "範囲フィルタの対象時刻（取込/更新/登録）" },
+      { name: "--deleted", type: "boolean", subcommand: "query", filter: true, label: "削除済みのみ",
+        description: "deleted=true/false のレコードに絞る" },
+      { name: "--ids", type: "string", subcommand: "query", filter: true, label: "冪等キー（CSV）",
+        description: "冪等キーの完全一致（カンマ区切り）" },
+      { name: "--item-id", type: "string", subcommand: "query", filter: true, repeatable: true, label: "itemId",
+        description: "itemId の完全一致（反復可・全リビジョン取得）" },
+      { name: "--fields", type: "string", subcommand: "query", filter: true, label: "射影フィールド（CSV）",
+        description: "正準名で返却フィールドを限定（カンマ区切り）" },
+    ],
+    // ── ADC-1（gemba-adc/1.0）読み返し契約の宣言 ──────────────────────
+    subcommands: [
+      { name: "query", mode: "read", input: ["none"], output: ["ndjson"],
+        description: "着地済みレコードを正準封筒形で読み出す（ページ付き・書込ゼロ）" },
+    ],
+    // 能力タグ（開いた語彙・string[]）。CLI verify(describe-shape) は capabilities を string[] と検査する。
+    // 各タグの詳細（dialect/audience 等）は capabilityDetails で宣言する（ホストはそちらを読む）。
+    capabilities: ["native-query"],
+    // ── T2: ネイティブクエリ能力（仕様 §9）。query --native '<SQL>' で SELECT/WITH を素通し実行。
+    //    read-only はプラグインが機械強制（DatabaseSync readOnly + バリデータ）。audience 既定=human のみ。
+    capabilityDetails: {
+      "native-query": { dialect: "sql-select", input: "sql", readOnly: "enforced", audience: ["human"] },
+    },
+    dataset: [{
+      datasetApi: ["1"], contract: "gemba-adc/1.0", store: "sqlite",
+      locator: { db: { param: "--db" }, table: { param: "--table", default: "reports" } },
+      naming: "snake_case",
+      keys: { primary: "idempotency_key", upsert: true, dedupe: null },
+      contents: "cumulative",
+      fields: [
+        { name: "idempotency_key", canonical: "idempotencyKey", source: "idempotencyKey", type: "string", role: "key" },
+        { name: "record_type", canonical: "recordType", source: "recordType", type: "string" },
+        { name: "item_id", canonical: "itemId", source: "itemId", type: "string", role: "report-id" },
+        { name: "rev_no", canonical: "revNo", source: "revNo", type: "string", role: "revision" },
+        { name: "name", canonical: "name", source: "values.name", type: "string", pii: "possible" },
+        { name: "deleted", canonical: "deleted", source: "deleted", type: "boolean", storedAs: "integer" },
+        { name: "regist_time", canonical: "registTime", source: "values.registTime", type: "datetime", storedAs: "string", format: "local-datetime-slash", timezone: "local" },
+        { name: "update_time", canonical: "updateTime", source: "values.updateTime", type: "datetime", storedAs: "string", format: "local-datetime-slash", timezone: "local" },
+        { name: "raw_json", canonical: "raw", source: ".", type: "json-string", schemaRef: "envelope/1.0", pii: "likely" },
+        { name: "loaded_at", canonical: "loadedAt", type: "datetime", storedAs: "string", format: "iso8601", timezone: "utc", role: "lineage" },
+      ],
+      quirks: ["raw-json-embedded", "string-dates", "non-json-sentinel", "detail-optional"],
+    }],
+  }) + "\n");
+  process.exit(0);
+}
+
+if (argv[0] === "--plugin-healthcheck") {
+  let ok = true, hint = "";
+  try { require("node:sqlite"); }
+  catch { ok = false; hint = "Node 22.5+ が必要です（node:sqlite 内蔵モジュール）"; }
+  process.stdout.write(JSON.stringify({
+    ok,
+    checks: [{ name: "node-sqlite", ok, severity: "required",
+               hint: hint || "node:sqlite is available" }],
+  }) + "\n");
+  process.exit(ok ? 0 : 1);
+}
+
+// ── 契約バージョン確認: 非対応なら stderr + exit 11 ──────────────────
+if (process.env.IREPO_PLUGIN_API && process.env.IREPO_PLUGIN_API !== "1") {
+  console.error(`${PLUGIN}: unsupported IREPO_PLUGIN_API=${process.env.IREPO_PLUGIN_API} (supported: 1)`);
+  process.exit(11);
+}
+
+// ── query サブコマンド（ADC-1 / gemba-read/1.0・読み取り専用） ─────────
+// 共通部（envelope/時刻3形式/カーソル/フラグ解析）は lib/gemba-read.js（正本: plugins/lib/）。
+// ここにはストア固有部（SQLite読み取り・record復元・dest）だけを置く。
+if (argv[0] === "query") {
+  let G;
+  try { G = require("./lib/gemba-read.js"); }
+  catch {
+    console.error(JSON.stringify({ schemaVersion: "1.0", recordType: "error", contract: "gemba-read/1.0",
+      plugin: PLUGIN, code: "E_INTERNAL",
+      message: "gemba-read ライブラリが見つかりません（lib/gemba-read.js）。plugins/install.sh を再実行してください",
+      retryable: false }));
+    process.exit(1);
+  }
+  runQuery(argv.slice(1), G);
+  return; // native は worker 非同期完了なので、ここで配信パス（下記）への fall-through を止める
+}
+
+function runQuery(qargs, G) {
+  const { queryEnd, emitRow, queryError } = G.createReadKit(PLUGIN);
+  const opts = G.parseQueryArgs(qargs, { "--db": "db", "--table": "table" }, queryError,
+    { "--native": { key: "native" }, "--native-timeout-ms": { key: "nativeTimeoutMs" } });
+  if (!opts.db) queryError("E_ARGS", "--db <path> is required", "読み取り対象の SQLite DB", 2);
+  if (!opts.table) opts.table = "reports";
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(opts.table)) queryError("E_ARGS", `invalid table name: ${opts.table}`, null, 2);
+
+  let dbp = opts.db;
+  if (dbp.startsWith("~/")) dbp = resolve(homedir(), dbp.slice(2));
+  dbp = resolve(dbp);
+  const dest = `sqlite:${dbp}#${opts.table}`;
+
+  const fs = require("node:fs");
+  if (!fs.existsSync(dbp)) {
+    queryError("E_NOT_FOUND", `database not found: ${dbp}`, "配信が一度も成功していない可能性があります", 1, dest);
+  }
+
+  // 読み取り専用 open（§3.7）。失敗は推測せず E_CONNECT。
+  const { DatabaseSync } = require("node:sqlite");
+  let db;
+  try { db = new DatabaseSync(dbp, { readOnly: true }); }
+  catch (e) { queryError("E_CONNECT", `cannot open read-only: ${e.message}`, "WAL の場合は配信中でないか確認", 1, dest); }
+
+  // ネイティブクエリ（capability: native-query / 仕様 §9・T2）。--native が「存在」すれば（空でも）
+  // native 扱い＝空はバリデータが E_ARGS で弾く（空テキストボックスが通常クエリへ落ちて行を開示する事故防止・Codex P2）。
+  // native は自分でテーブルを指定するため table チェックは飛ばす。メイン接続は使わず worker が read-only で再オープン。
+  if (opts.native != null) {
+    try { db.close(); } catch {}
+    runNativeQuery(dbp, opts.native, opts, { queryEnd, emitRow, queryError }, dest);
+    return; // runNativeQuery が worker 経由で process.exit する
+  }
+
+  try {
+    const t = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(opts.table);
+    if (!t) { db.close(); queryError("E_NOT_FOUND", `table not found: ${opts.table}`, null, 1, dest); }
+  } catch (e) { try { db.close(); } catch {} queryError("E_INTERNAL", e.message, null, 1, dest); }
+
+  // WHERE 構築。時刻境界は lib が格納形式（loaded=ISO / 業務時刻=slashローカル）へ正規化済み。
+  const where = [], bind = [];
+  const col = opts.timeField === "updated" ? "update_time"
+    : opts.timeField === "registered" ? "regist_time" : "loaded_at";
+  const bounds = G.timeBounds(opts, col === "loaded_at" ? "iso" : "slash", queryError, dest);
+  if (bounds?.gte) { where.push(`${col} >= ?`); bind.push(bounds.gte); }
+  if (bounds?.lt) { where.push(`${col} < ?`); bind.push(bounds.lt); }
+  if (opts.deleted != null) { where.push("deleted = ?"); bind.push(opts.deleted ? 1 : 0); }
+  if (opts.ids && opts.ids.length) { where.push(`idempotency_key IN (${opts.ids.map(() => "?").join(",")})`); bind.push(...opts.ids); }
+  if (opts.itemIds.length) { where.push(`item_id IN (${opts.itemIds.map(() => "?").join(",")})`); bind.push(...opts.itemIds); }
+  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+  const timeFilter = G.buildTimeFilter(opts);
+
+  if (opts.countOnly) {
+    let total = 0;
+    try { total = db.prepare(`SELECT COUNT(*) AS n FROM "${opts.table}" ${whereSql}`).get(...bind).n; }
+    catch (e) { db.close(); queryError("E_INTERNAL", e.message, null, 1, dest); }
+    db.close();
+    const end = { count: 0, complete: true, total, nextCursor: null, dest, dedupeApplied: false };
+    if (timeFilter) end.timeFilter = timeFilter;
+    queryEnd(end);
+    process.exit(0);
+  }
+
+  // keyset ページング（idempotency_key 昇順・決定的）
+  const pageWhere = [...where], pageBind = [...bind];
+  if (opts.cursor != null) {
+    const last = G.decodeCursor(opts.cursor);
+    if (last == null) { db.close(); queryError("E_CURSOR", "カーソルが不正です", "前回の query-end.nextCursor をそのまま渡してください", 2, dest); }
+    pageWhere.push("idempotency_key > ?"); pageBind.push(last);
+  }
+  const pageWhereSql = pageWhere.length ? `WHERE ${pageWhere.join(" AND ")}` : "";
+
+  let rows;
+  try {
+    rows = db.prepare(
+      `SELECT idempotency_key, record_type, raw_json, loaded_at FROM "${opts.table}" ${pageWhereSql} ORDER BY idempotency_key ASC LIMIT ?`
+    ).all(...pageBind, opts.limit);
+  } catch (e) { db.close(); queryError("E_INTERNAL", e.message, null, 1, dest); }
+  db.close();
+
+  let lastKey = null;
+  for (const row of rows) {
+    lastKey = row.idempotency_key;
+    let record;
+    try { record = JSON.parse(row.raw_json); }
+    catch { record = { _raw: row.raw_json }; }
+    let out = record;
+    if (!opts.raw && opts.fields && record && record._raw === undefined) out = G.pickFields(record, opts.fields);
+    emitRow(row.idempotency_key, row.loaded_at, out, opts.raw);
+  }
+  const complete = rows.length < opts.limit;
+  const end = {
+    count: rows.length, complete,
+    nextCursor: complete ? null : G.encodeCursor(lastKey),
+    dest, dedupeApplied: false,
+  };
+  if (timeFilter) end.timeFilter = timeFilter;
+  queryEnd(end);
+  process.exit(0);
+}
+
+// ── ネイティブクエリ（T2・capability:native-query / 仕様 §9）─────────────
+// ホストは DSL を解釈せず素通し、プラグインがここで read-only を機械強制する。
+// 多層防御: (1) DatabaseSync({readOnly:true}) でエンジンが本体DBへの書込/DDLを拒否、
+//           (2) 下記バリデータで単一 SELECT/WITH 以外・ATTACH・スタック文・WITH内書込を拒否。
+function validateReadOnlySql(sql) {
+  const s = String(sql || "").trim().replace(/;+\s*$/, ""); // 末尾セミコロン除去
+  if (!s) return { ok: false, reason: "空のクエリ" };
+  if (s.includes(";")) return { ok: false, reason: "複数文は不可（; 区切りのスタック）" };
+  if (!/^(select|with)\b/i.test(s)) return { ok: false, reason: "SELECT / WITH で始まる単一文のみ" };
+  if (/\b(attach|detach)\b/i.test(s)) return { ok: false, reason: "ATTACH/DETACH は不可（read-only バイパス防止）" };
+  if (/^with\b/i.test(s) && /\b(insert|update|delete|replace)\b/i.test(s)) {
+    return { ok: false, reason: "WITH 内の書込文は不可" };
+  }
+  return { ok: true, sql: s };
+}
+
+function runNativeQuery(dbp, rawSql, opts, kit, dest) {
+  const { queryEnd, emitRow, queryError } = kit;
+  const v = validateReadOnlySql(rawSql);
+  if (!v.ok) {
+    queryError("E_ARGS", `native query rejected: ${v.reason}`, "read-only の単一 SELECT/WITH のみ許可（仕様 §9）", 2, dest);
+  }
+
+  const cap = opts.limit; // 行数キャップ（§9.6・parseQueryArgs が 1..1000 clamp 済み）
+  const byteCap = 1_000_000; // 結果サイズ上限 1MB（§9.6／ADC §6.4）。幅広行のメモリ/コンテキスト膨張を防ぐ。
+  let timeoutMs = parseInt(opts.nativeTimeoutMs ?? "", 10); // 実行タイムアウト（§9.6）
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 1) timeoutMs = 10000; // 既定10s
+  if (timeoutMs > 60000) timeoutMs = 60000;
+
+  // node:sqlite は同期実行で in-process の中断 API を持たない（progress handler/interrupt 無し）。
+  // worker.terminate() もネイティブ呼び出しで block 中のスレッドを止められない。確実に中断するため
+  // 別プロセスで実行し、timeout 超過時に SIGKILL で OS に殺させる（巨大集計・非終端 CTE もこれで止まる・
+  // §9.6 リソースガード／Codex P2）。行は cap、出力は byteCap で打ち切り＝CPU/時間/メモリすべて有界。
+  const childCode = `
+    const { DatabaseSync } = require("node:sqlite");
+    const [dbp, sql, capStr, byteCapStr] = process.argv.slice(1);
+    const cap = parseInt(capStr, 10), byteCap = parseInt(byteCapStr, 10);
+    const db = new DatabaseSync(dbp, { readOnly: true });
+    let n = 0, bytes = 0, truncated = false;
+    for (const row of db.prepare(sql).iterate()) {
+      if (n >= cap) { truncated = true; break; }          // 行数キャップ
+      const line = JSON.stringify(row) + "\\n";
+      if (bytes + Buffer.byteLength(line) > byteCap) { truncated = true; break; } // 結果サイズキャップ（巨大行は出さない）
+      process.stdout.write(line); bytes += Buffer.byteLength(line); n++;
+    }
+    if (truncated) process.stdout.write("__TRUNCATED__\\n");
+    db.close();
+  `;
+  const { spawnSync } = require("node:child_process");
+  const r = spawnSync(process.execPath, ["-e", childCode, dbp, v.sql, String(cap), String(byteCap)],
+    { encoding: "utf8", timeout: timeoutMs, killSignal: "SIGKILL", maxBuffer: 64 * 1024 * 1024 });
+
+  if (r.signal === "SIGKILL" || (r.error && r.error.code === "ETIMEDOUT")) {
+    queryError("E_TIMEOUT", `native query exceeded ${timeoutMs}ms`, "より絞り込んだクエリにしてください（§9.6 リソースガード）", 1, dest);
+  }
+  if (r.error || r.status !== 0) {
+    const detail = r.error ? r.error.message : (r.stderr || "").trim().slice(0, 200);
+    queryError("E_INTERNAL", `native exec failed: ${detail}`, "SELECT 文と列名を確認", 1, dest);
+  }
+
+  let truncated = false;
+  const rows = [];
+  for (const ln of (r.stdout || "").split("\n")) {
+    if (!ln) continue;
+    if (ln === "__TRUNCATED__") { truncated = true; continue; }
+    try { rows.push(JSON.parse(ln)); } catch {}
+  }
+  let i = 0;
+  for (const row of rows) { emitRow(`native:${i}`, null, row, true); i++; } // 任意形は raw で出す
+  queryEnd({ count: rows.length, complete: !truncated, truncated, nextCursor: null, dest, dedupeApplied: false, native: true });
+  process.exit(0);
+}
+
+// ── 引数解析 ─────────────────────────────────────────────────────────
+let dbPath = "", table = "reports", dryRun = false;
+for (let i = 0; i < argv.length; i++) {
+  switch (argv[i]) {
+    case "--db":      dbPath = argv[++i] ?? ""; break;
+    case "--table":   table = argv[++i] ?? "reports"; break;
+    case "--dry-run": dryRun = true; break;
+    default:
+      console.error(`unknown option: ${argv[i]}`);
+      process.exit(2);
+  }
+}
+// dry-run は --db 未指定でも入力検証だけ行える (i-repo plugin verify が使う経路)
+if (!dbPath && !dryRun) { console.error("--db <path> is required"); process.exit(2); }
+// テーブル名はSQLに直接埋まるため識別子として検証する
+if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(table)) {
+  console.error(`invalid table name: ${table}`);
+  process.exit(2);
+}
+
+if (dbPath.startsWith("~/")) dbPath = resolve(homedir(), dbPath.slice(2));
+if (dbPath) dbPath = resolve(dbPath);
+
+const jobId = `sqlite-${new Date().toISOString().replace(/[-:T]/g, "").slice(0, 15)}-${process.pid}`;
+
+const receipt = (phase, count, failedCount, verified, extra = {}) => {
+  process.stdout.write(JSON.stringify({
+    schemaVersion: "1.0", recordType: "receipt", plugin: PLUGIN,
+    producedBy: { plugin: PLUGIN, version: VERSION },
+    phase, jobId, count, failedCount, verified,
+    dest: `sqlite:${dbPath}#${table}`,
+    ...(dryRun ? { dryRun: true } : {}),
+    ...extra,
+  }) + "\n");
+};
+
+// ── stdin を読み切り、stream-end トレーラを照合（SCHEMA.md §2.6） ────
+async function readStdin() {
+  const chunks = [];
+  for await (const c of process.stdin) chunks.push(c);
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+(async () => {
+  const text = await readStdin();
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+
+  const records = [];
+  let trailer = null;
+  let envelopes = 0;
+  for (const line of lines) {
+    let obj;
+    try { obj = JSON.parse(line); }
+    catch { records.push({ _raw: line }); continue; }   // 素のJSONでない行も件数には数える
+    if (obj && obj.schemaVersion) envelopes++;
+    if (obj && obj.recordType === "stream-end") { trailer = obj; continue; }
+    records.push(obj);
+  }
+
+  // トレーラ照合: あれば count 一致が必須。封筒行があるのに無ければ不完全。
+  if (trailer) {
+    if (typeof trailer.count !== "number" || trailer.count !== records.length) {
+      console.error(`❌ incomplete stream: trailer count=${trailer.count ?? "unreadable"} but received ${records.length} record line(s)`);
+      receipt("write", records.length, records.length, false);
+      process.exit(1);
+    }
+  } else if (envelopes > 0) {
+    console.error("❌ truncated stream: envelope records present but no stream-end trailer");
+    receipt("write", records.length, records.length, false);
+    process.exit(1);
+  }
+
+  if (dryRun) {
+    receipt("write", records.length, 0, false);
+    console.error(`(dry-run) would upsert ${records.length} record(s) → ${dbPath} [${table}]`);
+    process.exit(0);
+  }
+
+  // ── 書き込み（write 相）: idempotencyKey で UPSERT ─────────────────
+  const { DatabaseSync } = require("node:sqlite");
+  const db = new DatabaseSync(dbPath);
+  db.exec("PRAGMA journal_mode=WAL");
+  db.exec(`CREATE TABLE IF NOT EXISTS "${table}" (
+    idempotency_key TEXT PRIMARY KEY,
+    record_type     TEXT,
+    item_id         TEXT,
+    rev_no          TEXT,
+    name            TEXT,
+    deleted         INTEGER,
+    regist_time     TEXT,
+    update_time     TEXT,
+    raw_json        TEXT NOT NULL,
+    loaded_at       TEXT NOT NULL
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS "idx_${table}_item" ON "${table}"(item_id)`);
+
+  const stmt = db.prepare(`INSERT INTO "${table}"
+    (idempotency_key, record_type, item_id, rev_no, name, deleted, regist_time, update_time, raw_json, loaded_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(idempotency_key) DO UPDATE SET
+      record_type=excluded.record_type, item_id=excluded.item_id, rev_no=excluded.rev_no,
+      name=excluded.name, deleted=excluded.deleted, regist_time=excluded.regist_time,
+      update_time=excluded.update_time, raw_json=excluded.raw_json, loaded_at=excluded.loaded_at`);
+
+  const now = new Date().toISOString();
+  let failed = 0;
+  const keys = [];
+  db.exec("BEGIN");
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    try {
+      const v = r.values ?? r;
+      const key = r.idempotencyKey ?? `${jobId}:${i}`;   // キーが無い行も一意に保存
+      stmt.run(
+        key,
+        r.recordType ?? null,
+        String(r.itemId ?? v.itemId ?? ""),
+        String(r.revNo ?? v.revNo ?? ""),
+        v.name ?? null,
+        r.deleted === true ? 1 : 0,
+        v.registTime ?? null,
+        v.updateTime ?? null,
+        JSON.stringify(r),
+        now
+      );
+      keys.push(key);
+    } catch (e) {
+      failed++;
+      console.error(`row ${i}: ${e.message}`);
+    }
+  }
+  db.exec("COMMIT");
+  receipt("write", records.length, failed, false);
+
+  // ── 読み戻し検証（verify 相）: 今回のキーが全件 DB に存在するか ────
+  const placeholders = keys.map(() => "?").join(",");
+  const got = keys.length
+    ? db.prepare(`SELECT COUNT(*) AS n FROM "${table}" WHERE idempotency_key IN (${placeholders})`).get(...keys).n
+    : 0;
+  const verified = failed === 0 && got === keys.length;
+  receipt("verify", records.length, failed, verified, { verifiedRows: got });
+  db.close();
+  process.exit(verified ? 0 : 1);
+})().catch((e) => {
+  console.error(`${PLUGIN}: ${e.message}`);
+  receipt("write", 0, 0, false);
+  process.exit(1);
+});

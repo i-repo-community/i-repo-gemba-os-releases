@@ -1,0 +1,530 @@
+#!/usr/bin/env node
+/**
+ * i-repo-parquet — sink plugin: write i-repo NDJSON records to Parquet / Apache Iceberg.
+ *
+ * 構想「i-Repo DataPipe」の Lakehouse Manager 相当。
+ * 帳票データを列指向の Parquet に変換し、DuckDB・Spark・Athena・BigQuery 等の
+ * 分析エンジンから直接読める形で蓄積する。Iceberg モードでは REST カタログ経由で
+ * Apache Iceberg テーブルに追記し、スキーマ進化・タイムトラベル・ACID を得る。
+ *
+ * 設計: duckdb CLI を呼ぶ薄いアダプタ（mongo が mongosh を呼ぶのと同じ流儀）。
+ *   npm 依存ゼロ。顧客が duckdb を持っていればそのまま動く（brew install duckdb）。
+ *   install: copy to ~/.i-repo/plugins/i-repo-parquet && chmod +x
+ *
+ * Usage:
+ *   # Parquet ファイル（再実行で同ファイルを上書き = 冪等）
+ *   cat manifests/reports.ndjson | i-repo parquet --out ~/warehouse/reports.parquet
+ *
+ *   # Apache Iceberg テーブルへ追記（REST カタログ + S3/MinIO）
+ *   cat manifests/reports.ndjson | i-repo parquet \
+ *     --iceberg-endpoint http://localhost:8181 --warehouse warehouse \
+ *     --iceberg-table irepo.reports \
+ *     --s3-endpoint http://localhost:9000 --s3-key-id admin --s3-secret password
+ *
+ * Contract (PLUGINS.md / SCHEMA.md):
+ *   - 予約フラグ --plugin-schema / --plugin-healthcheck
+ *   - IREPO_PLUGIN_API 不一致は exit 11
+ *   - stream-end トレーラ照合 (§2.6)
+ *   - receipt: write → verify。verify は書いた先を読み戻して件数照合し、
+ *     verified:true はそのときだけ立てる
+ *   - 冪等: Parquet モードは出力ファイルを毎回上書き（ファイル単位で冪等）。
+ *     Iceberg モードは追記（append）— 再実行は重複するため、重複排除は
+ *     クエリ側 QUALIFY か定期 compaction で行う（マニュアル参照）
+ */
+"use strict";
+
+const PLUGIN = "i-repo-parquet";
+const VERSION = "0.1.0";
+const { spawnSyncSpec } = require("./lib/spawn.js");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+const argv = process.argv.slice(2);
+
+// ── 予約フラグ ───────────────────────────────────────────────────────
+if (argv[0] === "--plugin-schema") {
+  process.stdout.write(JSON.stringify({
+    pluginApi: ["1"],
+    schemaVersions: ["1.0"],
+    recordTypes: ["*"],
+    name: PLUGIN,
+    version: VERSION,
+    description: "Write NDJSON records to Parquet / Apache Iceberg (DuckDB経由・Lakehouse Ready)",
+    phases: ["write", "verify"],
+    platforms: ["macos", "linux", "windows"],
+    roles: ["sink", "read", "analyze"],
+    category: "lakehouse",   // 表示カテゴリ（GUI 種別グループ表示用・脱料理）
+    input: ["stdin-ndjson"],
+    // ── ADC-1（gemba-read/1.0）読み返し契約の宣言 ──────────────────────
+    subcommands: [
+      { name: "query", mode: "read", input: ["none"], output: ["ndjson"],
+        description: "着地済みレコードを正準封筒形で読み出す（ページ付き・書込ゼロ）" },
+    ],
+    params: [
+      { name: "--out", type: "string",
+        label: "Parquet出力ファイル", placeholder: "~/warehouse/reports.parquet",
+        description: "Output .parquet file (Parquetモード。再実行で上書き=冪等)" },
+      { name: "--iceberg-endpoint", type: "string",
+        label: "Iceberg RESTカタログURL", placeholder: "http://localhost:8181",
+        description: "Iceberg REST catalog endpoint (Icebergモード)" },
+      { name: "--warehouse", type: "string",
+        label: "ウェアハウス名", placeholder: "warehouse",
+        description: "Iceberg warehouse name to ATTACH" },
+      { name: "--iceberg-table", type: "string",
+        label: "テーブル（ns.table）", placeholder: "irepo.reports",
+        description: "Target table as namespace.table (created if missing)" },
+      { name: "--s3-endpoint", type: "string",
+        label: "S3/MinIOエンドポイント（任意）", placeholder: "http://localhost:9000",
+        description: "Object store endpoint for Iceberg data files (MinIO等。省略時はAWS S3)" },
+      { name: "--s3-key-id", type: "string",
+        label: "S3アクセスキー（任意）",
+        description: "Object store access key id" },
+      { name: "--s3-secret", type: "string", secret: true,
+        label: "S3シークレット（任意）",
+        description: "Object store secret access key" },
+      { name: "--s3-region", type: "string", default: "us-east-1",
+        label: "S3リージョン",
+        description: "Object store region" },
+      { name: "--dry-run", type: "boolean", label: "Dry run",
+        description: "Validate input without writing" },
+      // ── query(読み返し)で受理する選択フィルタの宣言（脱料理: host が汎用描画/転送する印）。
+      //    新しい検索意味は足さない＝既に parseQueryArgs が受理する共通フラグを宣言するだけ。
+      { name: "--since", type: "string", subcommand: "query", filter: true, label: "開始時刻（含む）",
+        placeholder: "2026-06-01 00:00:00", description: "時刻範囲の下限（半開区間 [since, until)）" },
+      { name: "--until", type: "string", subcommand: "query", filter: true, label: "終了時刻（含まない）",
+        placeholder: "2026-06-15 00:00:00", description: "時刻範囲の上限（排他）" },
+      { name: "--time-field", type: "select", subcommand: "query", filter: true, label: "時刻フィールド",
+        choices: ["loaded", "updated", "registered"], default: "loaded",
+        description: "範囲フィルタの対象時刻（取込/更新/登録）" },
+      { name: "--deleted", type: "boolean", subcommand: "query", filter: true, label: "削除済みのみ",
+        description: "deleted=true/false のレコードに絞る" },
+      { name: "--ids", type: "string", subcommand: "query", filter: true, label: "冪等キー（CSV）",
+        description: "冪等キーの完全一致（カンマ区切り）" },
+      { name: "--item-id", type: "string", subcommand: "query", filter: true, repeatable: true, label: "itemId",
+        description: "itemId の完全一致（反復可・全リビジョン取得）" },
+      { name: "--fields", type: "string", subcommand: "query", filter: true, label: "射影フィールド（CSV）",
+        description: "正準名で返却フィールドを限定（カンマ区切り）" },
+    ],
+    // ── ADC-1（gemba-adc/1.0）着地スキーマ宣言。--iceberg-table の有無で2形態 ──
+    dataset: [
+      { datasetApi: ["1"], contract: "gemba-adc/1.0", store: "parquet",
+        selector: { param: "--iceberg-table", present: false },
+        locator: { out: { param: "--out" } },
+        naming: "snake_case",
+        keys: { primary: "idempotency_key", upsert: false, dedupe: null },
+        contents: "latest-batch-only",
+        fields: parquetFields(),
+        quirks: ["raw-json-embedded", "string-dates", "non-json-sentinel", "overwrite-on-rerun", "detail-optional"] },
+      { datasetApi: ["1"], contract: "gemba-adc/1.0", store: "iceberg",
+        selector: { param: "--iceberg-table", present: true },
+        // locator は query が必要とする接続フラグを**全て**宣言する（access.query の正本になる。
+        // 漏らすと読み返しがその引数なしで実行され失敗する — レビューで --warehouse 欠落を検出済み）。
+        locator: {
+          table: { param: "--iceberg-table" }, endpoint: { param: "--iceberg-endpoint" },
+          warehouse: { param: "--warehouse" },
+          s3Endpoint: { param: "--s3-endpoint" }, s3KeyId: { param: "--s3-key-id" },
+          s3Secret: { param: "--s3-secret", secret: true }, s3Region: { param: "--s3-region", default: "us-east-1" },
+        },
+        naming: "snake_case",
+        keys: { primary: "idempotency_key", upsert: false, dedupe: "latest-wins-by-key" },
+        contents: "cumulative",
+        fields: parquetFields(),
+        quirks: ["raw-json-embedded", "string-dates", "append-only-duplicates", "detail-optional"] },
+    ],
+  }) + "\n");
+  process.exit(0);
+}
+
+// flat10 列（Parquet/Iceberg 共通）。正準名でストア間命名分裂を橋渡しする。
+function parquetFields() {
+  return [
+    { name: "idempotency_key", canonical: "idempotencyKey", source: "idempotencyKey", type: "string", role: "key" },
+    { name: "record_type", canonical: "recordType", source: "recordType", type: "string" },
+    { name: "item_id", canonical: "itemId", source: "itemId", type: "string", role: "report-id" },
+    { name: "rev_no", canonical: "revNo", source: "revNo", type: "string", role: "revision" },
+    { name: "name", canonical: "name", source: "values.name", type: "string", pii: "possible" },
+    { name: "deleted", canonical: "deleted", source: "deleted", type: "boolean" },
+    { name: "regist_time", canonical: "registTime", source: "values.registTime", type: "datetime", storedAs: "string", format: "local-datetime-slash", timezone: "local" },
+    { name: "update_time", canonical: "updateTime", source: "values.updateTime", type: "datetime", storedAs: "string", format: "local-datetime-slash", timezone: "local" },
+    { name: "raw_json", canonical: "raw", source: ".", type: "json-string", schemaRef: "envelope/1.0", pii: "likely" },
+    { name: "loaded_at", canonical: "loadedAt", type: "datetime", storedAs: "string", format: "iso8601", timezone: "utc", role: "lineage" },
+  ];
+}
+
+if (argv[0] === "--plugin-healthcheck") {
+  const checks = [];
+  const has = spawnSyncSpec("duckdb", ["--version"], { encoding: "utf8" });
+  const duckOk = has.status === 0;
+  checks.push({ name: "duckdb", ok: duckOk, severity: "required",
+    hint: duckOk ? `duckdb ${String(has.stdout).trim()}`
+      : "DuckDB CLI をインストールしてください（brew install duckdb 等）" });
+  const ok = checks.every((c) => c.ok);
+  process.stdout.write(JSON.stringify({ ok, checks }) + "\n");
+  process.exit(ok ? 0 : 1);
+}
+
+// ── 契約バージョン ───────────────────────────────────────────────────
+if (process.env.IREPO_PLUGIN_API && process.env.IREPO_PLUGIN_API !== "1") {
+  console.error(`${PLUGIN}: unsupported IREPO_PLUGIN_API=${process.env.IREPO_PLUGIN_API} (supported: 1)`);
+  process.exit(11);
+}
+
+// ── query サブコマンド（ADC-1 / gemba-read/1.0・読み取り専用） ─────────
+// 着地済みレコードを「正準封筒形」で読み出す。書込・新規作成・スキーマ変更はしない。
+// 成功は末尾 query-end トレーラの存在で判定（契約 §3.4）。0件でも query-end を出す。
+// 読み取り手段は duckdb CLI を spawn（SELECT のみ）。parquet は read_parquet、
+// iceberg は write 経路と同じ ATTACH 手順で SELECT し、追記重複を QUALIFY で排除する。
+// 共通部（envelope/時刻3形式/カーソル/フラグ解析）は lib/gemba-read.js（正本: plugins/lib/）。
+// ここにはストア固有部（duckdb 実行・SQL構築・record復元・dest）だけを置く。
+if (argv[0] === "query") {
+  let G;
+  try { G = require("./lib/gemba-read.js"); }
+  catch {
+    console.error(JSON.stringify({ schemaVersion: "1.0", recordType: "error", contract: "gemba-read/1.0",
+      plugin: PLUGIN, code: "E_INTERNAL",
+      message: "gemba-read ライブラリが見つかりません（lib/gemba-read.js）。plugins/install.sh を再実行してください",
+      retryable: false }));
+    process.exit(1);
+  }
+  runQuery(argv.slice(1), G);   // 内部で process.exit。以降へは進まない。
+}
+
+function runQuery(qargs, G) {
+  const { queryEnd, emitRow, queryError } = G.createReadKit(PLUGIN);
+  const opts = G.parseQueryArgs(qargs, {
+    "--out": "out", "--iceberg-endpoint": "icebergEndpoint", "--warehouse": "warehouse",
+    "--iceberg-table": "icebergTable", "--s3-endpoint": "s3Endpoint",
+    "--s3-key-id": "s3KeyId", "--s3-secret": "s3Secret", "--s3-region": "s3Region",
+  }, queryError);
+  if (!opts.s3Region) opts.s3Region = "us-east-1";
+
+  // --iceberg-table があれば iceberg、なければ --out で parquet（write と同判定）。
+  const icebergMode = !!(opts.icebergEndpoint || opts.warehouse || opts.icebergTable);
+  if (icebergMode) {
+    if (!opts.icebergEndpoint || !opts.warehouse || !opts.icebergTable) {
+      queryError("E_ARGS", "Iceberg mode requires --iceberg-endpoint, --warehouse and --iceberg-table", null, 2);
+    }
+    if (!/^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$/.test(opts.icebergTable)) {
+      queryError("E_ARGS", "--iceberg-table must be namespace.table (e.g. irepo.reports)", null, 2);
+    }
+  } else {
+    if (!opts.out) queryError("E_ARGS", "--out <path> (Parquet) or --iceberg-* (Iceberg) is required", "読み取り対象の出力先", 2);
+  }
+
+  let outp = opts.out;
+  if (outp.startsWith("~/")) outp = path.join(os.homedir(), outp.slice(2));
+  const dest = icebergMode ? `iceberg:${opts.icebergTable}@${opts.icebergEndpoint}` : `parquet:${outp}`;
+  const dedupeApplied = icebergMode;   // append-only の重複を QUALIFY で排除（§3.3）
+
+  // duckdb 不在は推測せず E_CONNECT。
+  const has = spawnSyncSpec("duckdb", ["--version"], { encoding: "utf8" });
+  if (has.status !== 0) {
+    queryError("E_CONNECT", "duckdb CLI not found", "DuckDB CLI をインストールしてください（brew install duckdb 等）", 1, dest);
+  }
+
+  // parquet モードはファイル不在を CREATE せず E_NOT_FOUND（§3.7）。
+  if (!icebergMode && !fs.existsSync(outp)) {
+    queryError("E_NOT_FOUND", `parquet not found: ${outp}`, "配信が一度も成功していない可能性があります", 1, dest);
+  }
+
+  // ── ソース式と setup（write 経路の ATTACH 手順を踏襲） ────────────────
+  let setup = "";
+  let srcExpr;
+  if (icebergMode) {
+    const [ns, tbl] = opts.icebergTable.split(".");
+    setup = "INSTALL iceberg; LOAD iceberg; INSTALL httpfs; LOAD httpfs;\n";
+    if (opts.s3KeyId || opts.s3Endpoint) {
+      const ep = opts.s3Endpoint.replace(/^https?:\/\//, "");
+      const ssl = opts.s3Endpoint.startsWith("https://");
+      setup += `CREATE OR REPLACE SECRET obj (TYPE s3, KEY_ID ${q(opts.s3KeyId)}, SECRET ${q(opts.s3Secret)}, ` +
+        `REGION ${q(opts.s3Region)}${opts.s3Endpoint ? `, ENDPOINT ${q(ep)}, URL_STYLE 'path', USE_SSL ${ssl}` : ""});\n`;
+    }
+    setup += `ATTACH ${q(opts.warehouse)} AS ic (TYPE iceberg, ENDPOINT ${q(opts.icebergEndpoint)}, AUTHORIZATION_TYPE 'none');\n`;
+    srcExpr = `ic."${ns}"."${tbl}"`;
+  } else {
+    srcExpr = `read_parquet(${q(outp)})`;
+  }
+
+  // WHERE 構築。時刻境界は lib が格納形式（loaded=ISO / 業務時刻=slashローカル）へ正規化済み。
+  const where = [];
+  const col = opts.timeField === "updated" ? "update_time" : opts.timeField === "registered" ? "regist_time" : "loaded_at";
+  const bounds = G.timeBounds(opts, col === "loaded_at" ? "iso" : "slash", queryError, dest);
+  if (bounds?.gte) where.push(`${col} >= ${q(bounds.gte)}`);
+  if (bounds?.lt) where.push(`${col} < ${q(bounds.lt)}`);   // 半開区間 [since, until)
+  // query-end の timeFilter 報告（parquet 固有）は常に UTC ISO で持つ。
+  // timeBounds が解釈不能時に exit 済みなので、ここでの再パースは必ず成功する。
+  const sinceUtc = opts.since != null ? G.parseFlexibleDate(opts.since).toISOString() : null;
+  const untilUtc = opts.until != null ? G.parseFlexibleDate(opts.until).toISOString() : null;
+  if (opts.deleted != null) { where.push(`deleted = ${opts.deleted ? "true" : "false"}`); }
+  if (opts.ids && opts.ids.length) { where.push(`idempotency_key IN (${opts.ids.map((s) => q(s)).join(",")})`); }
+  if (opts.itemIds.length) { where.push(`item_id IN (${opts.itemIds.map((s) => q(s)).join(",")})`); }
+
+  // iceberg は追記重複があるため、冪等キー単位で loaded_at 最新の1行へ畳む（dedupHint）。
+  const dedupQual = icebergMode
+    ? " QUALIFY row_number() OVER (PARTITION BY idempotency_key ORDER BY loaded_at DESC) = 1"
+    : "";
+  const baseWhereSql = where.length ? ` WHERE ${where.join(" AND ")}` : "";
+
+  const timeFilter = (sinceUtc || untilUtc) ? { field: opts.timeField, sinceUtc, untilUtc } : null;
+
+  if (opts.countOnly) {
+    // dedup 後の総件数を数える（iceberg は重複排除後の論理件数）。
+    const sql = setup +
+      `SELECT COUNT(*) AS n FROM (SELECT idempotency_key FROM ${srcExpr}${baseWhereSql}${dedupQual}) AS t;`;
+    const r = runDuckdbJson(sql);
+    if (r.status !== 0) {
+      const msg = (r.stderr || r.stdout || "duckdb count failed").trim();
+      queryError("E_INTERNAL", msg, null, 1, dest);
+    }
+    let total = 0;
+    try { const arr = JSON.parse(r.stdout || "[]"); total = arr.length ? Number(arr[0].n) : 0; }
+    catch (e) { queryError("E_INTERNAL", `cannot parse duckdb output: ${e.message}`, null, 1, dest); }
+    const end = { count: 0, complete: true, total, nextCursor: null, dest, dedupeApplied };
+    if (timeFilter) end.timeFilter = timeFilter;
+    queryEnd(end);
+    process.exit(0);
+  }
+
+  // keyset ページング（idempotency_key 昇順・決定的）
+  const pageWhere = [...where];
+  if (opts.cursor != null) {
+    const last = G.decodeCursor(opts.cursor);
+    if (last == null) queryError("E_CURSOR", "カーソルが不正です", "前回の query-end.nextCursor をそのまま渡してください", 2, dest);
+    pageWhere.push(`idempotency_key > ${q(last)}`);
+  }
+  const pageWhereSql = pageWhere.length ? ` WHERE ${pageWhere.join(" AND ")}` : "";
+
+  // dedup を先に適用してからページングする（カーソルが論理行に乗るように）。
+  const inner = `SELECT idempotency_key, record_type, raw_json, loaded_at FROM ${srcExpr}${pageWhereSql}${dedupQual}`;
+  const sql = setup +
+    `SELECT idempotency_key, record_type, raw_json, loaded_at FROM (${inner}) AS t ` +
+    `ORDER BY idempotency_key ASC LIMIT ${opts.limit};`;
+
+  const r = runDuckdbJson(sql);
+  if (r.status !== 0) {
+    const msg = (r.stderr || r.stdout || "duckdb query failed").trim();
+    queryError("E_INTERNAL", msg, null, 1, dest);
+  }
+  let rows;
+  try { rows = JSON.parse(r.stdout || "[]"); }
+  catch (e) { queryError("E_INTERNAL", `cannot parse duckdb output: ${e.message}`, null, 1, dest); }
+
+  let lastKey = null;
+  for (const row of rows) {
+    lastKey = row.idempotency_key;
+    let record;
+    try { record = JSON.parse(row.raw_json); }
+    catch { record = { _raw: row.raw_json }; }
+    let outRec = record;
+    if (!opts.raw && opts.fields && record && record._raw === undefined) outRec = G.pickFields(record, opts.fields);
+    emitRow(row.idempotency_key, row.loaded_at, outRec, opts.raw);
+  }
+  const complete = rows.length < opts.limit;
+  const end = {
+    count: rows.length, complete,
+    nextCursor: complete ? null : G.encodeCursor(lastKey),
+    dest, dedupeApplied,
+  };
+  if (timeFilter) end.timeFilter = timeFilter;
+  queryEnd(end);
+  process.exit(0);
+}
+
+// query 用の duckdb 実行（-json で配列を得る。SELECT のみ＝読み取り専用 §3.7）。
+// SQL は -c 引数ではなく stdin で渡す: SQL は cmd.exe メタ文字（括弧・引用符等）を含むため、
+// Windows で cmd.exe 経由起動するときに引数に載せると spawnSpec が拒否する（lib/spawn.js）。
+function runDuckdbJson(sql) {
+  return spawnSyncSpec("duckdb", ["-json"], {
+    encoding: "utf8",
+    input: sql,
+    maxBuffer: 256 * 1024 * 1024,
+  });
+}
+
+// ── 引数 ─────────────────────────────────────────────────────────────
+let out = "", icebergEndpoint = "", warehouse = "", icebergTable = "";
+let s3Endpoint = "", s3KeyId = "", s3Secret = "", s3Region = "us-east-1";
+let dryRun = false;
+for (let i = 0; i < argv.length; i++) {
+  switch (argv[i]) {
+    case "--out":              out = argv[++i] ?? ""; break;
+    case "--iceberg-endpoint": icebergEndpoint = argv[++i] ?? ""; break;
+    case "--warehouse":        warehouse = argv[++i] ?? ""; break;
+    case "--iceberg-table":    icebergTable = argv[++i] ?? ""; break;
+    case "--s3-endpoint":      s3Endpoint = argv[++i] ?? ""; break;
+    case "--s3-key-id":        s3KeyId = argv[++i] ?? ""; break;
+    case "--s3-secret":        s3Secret = argv[++i] ?? ""; break;
+    case "--s3-region":        s3Region = argv[++i] ?? "us-east-1"; break;
+    case "--dry-run":          dryRun = true; break;
+    default: console.error(`unknown option: ${argv[i]}`); process.exit(2);
+  }
+}
+
+const icebergMode = !!(icebergEndpoint || warehouse || icebergTable);
+// dry-run は出力先なしでも入力検証だけ行える（plugin verify が使う経路）
+if (!dryRun) {
+  if (icebergMode) {
+    if (!icebergEndpoint || !warehouse || !icebergTable) {
+      console.error("Iceberg mode requires --iceberg-endpoint, --warehouse and --iceberg-table");
+      process.exit(2);
+    }
+    if (!/^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$/.test(icebergTable)) {
+      console.error("--iceberg-table must be namespace.table (e.g. irepo.reports)");
+      process.exit(2);
+    }
+  } else if (!out) {
+    console.error("--out (Parquet) or --iceberg-endpoint/--warehouse/--iceberg-table (Iceberg) is required");
+    process.exit(2);
+  }
+}
+if (out.startsWith("~/")) out = path.join(os.homedir(), out.slice(2));
+
+const jobId = `parquet-${new Date().toISOString().replace(/[-:T]/g, "").slice(0, 15)}-${process.pid}`;
+const dest = icebergMode ? `iceberg:${icebergTable}@${icebergEndpoint}` : `parquet:${out}`;
+
+const receipt = (phase, count, failedCount, verified, extra = {}) => {
+  process.stdout.write(JSON.stringify({
+    schemaVersion: "1.0", recordType: "receipt", plugin: PLUGIN,
+    producedBy: { plugin: PLUGIN, version: VERSION },
+    phase, jobId, count, failedCount, verified, dest,
+    ...(dryRun ? { dryRun: true } : {}),
+    ...extra,
+  }) + "\n");
+};
+
+async function readStdin() {
+  const chunks = [];
+  for await (const c of process.stdin) chunks.push(c);
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+// SQL 文字列リテラル用エスケープ（関数宣言: query 経路から先行参照されるため巻き上げ必須）
+function q(s) { return "'" + String(s).replace(/'/g, "''") + "'"; }
+
+function runDuckdb(sql) {
+  // SQL は stdin で渡す（runDuckdbJson と同じ理由・cmd.exe メタ文字回避）。
+  return spawnSyncSpec("duckdb", ["-noheader", "-list"], {
+    encoding: "utf8",
+    input: sql,
+    maxBuffer: 256 * 1024 * 1024,
+  });
+}
+
+// フラット列スキーマ（i-repo-sqlite と同じ展開。detail/artifacts は raw_json に保持）
+const COLUMNS =
+  "columns={idempotency_key:'VARCHAR', record_type:'VARCHAR', item_id:'VARCHAR', " +
+  "rev_no:'VARCHAR', name:'VARCHAR', deleted:'BOOLEAN', regist_time:'VARCHAR', " +
+  "update_time:'VARCHAR', raw_json:'VARCHAR', loaded_at:'VARCHAR'}";
+
+(async () => {
+  const text = await readStdin();
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+
+  const docs = [];
+  let trailer = null, envelopes = 0;
+  for (const line of lines) {
+    let obj;
+    try { obj = JSON.parse(line); } catch { docs.push({ _raw: line }); continue; }
+    if (obj && obj.schemaVersion) envelopes++;
+    if (obj && obj.recordType === "stream-end") { trailer = obj; continue; }
+    docs.push(obj);
+  }
+
+  // stream-end 照合（§2.6）
+  if (trailer) {
+    if (typeof trailer.count !== "number" || trailer.count !== docs.length) {
+      console.error(`❌ incomplete stream: trailer count=${trailer.count ?? "unreadable"} but received ${docs.length}`);
+      receipt("write", docs.length, docs.length, false);
+      process.exit(1);
+    }
+  } else if (envelopes > 0) {
+    console.error("❌ truncated stream: envelope records present but no stream-end trailer");
+    receipt("write", docs.length, docs.length, false);
+    process.exit(1);
+  }
+
+  // フラット行に展開（i-repo-sqlite と同じマッピング）
+  const now = new Date().toISOString();
+  const rows = docs.map((r, i) => {
+    const v = r.values ?? r;
+    return {
+      idempotency_key: r.idempotencyKey ?? `${jobId}:${i}`,
+      record_type: r.recordType ?? null,
+      item_id: String(r.itemId ?? v.itemId ?? ""),
+      rev_no: String(r.revNo ?? v.revNo ?? ""),
+      name: v.name ?? null,
+      deleted: r.deleted === true,
+      regist_time: v.registTime ?? null,
+      update_time: v.updateTime ?? null,
+      raw_json: JSON.stringify(r),
+      loaded_at: now,
+    };
+  });
+
+  if (dryRun) {
+    receipt("write", rows.length, 0, false);
+    console.error(`(dry-run) would write ${rows.length} row(s) → ${dest}`);
+    process.exit(0);
+  }
+
+  // 一時 NDJSON に書き出して duckdb に読ませる（引数長制限を回避）
+  const tmp = path.join(os.tmpdir(), `${jobId}.ndjson`);
+  fs.writeFileSync(tmp, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
+  const cleanup = () => { try { fs.unlinkSync(tmp); } catch { /* noop */ } };
+
+  const src = `read_ndjson(${q(tmp)}, ${COLUMNS})`;
+  let writeSql, verifySql;
+
+  if (icebergMode) {
+    // ── Iceberg: REST カタログに ATTACH して追記 ──────────────────────
+    const [ns, tbl] = icebergTable.split(".");
+    let setup = "INSTALL iceberg; LOAD iceberg; INSTALL httpfs; LOAD httpfs;\n";
+    if (s3KeyId || s3Endpoint) {
+      const ep = s3Endpoint.replace(/^https?:\/\//, "");
+      const ssl = s3Endpoint.startsWith("https://");
+      setup += `CREATE OR REPLACE SECRET obj (TYPE s3, KEY_ID ${q(s3KeyId)}, SECRET ${q(s3Secret)}, ` +
+        `REGION ${q(s3Region)}${s3Endpoint ? `, ENDPOINT ${q(ep)}, URL_STYLE 'path', USE_SSL ${ssl}` : ""});\n`;
+    }
+    setup += `ATTACH ${q(warehouse)} AS ic (TYPE iceberg, ENDPOINT ${q(icebergEndpoint)}, AUTHORIZATION_TYPE 'none');\n`;
+    writeSql = setup +
+      `CREATE SCHEMA IF NOT EXISTS ic."${ns}";\n` +
+      `CREATE TABLE IF NOT EXISTS ic."${ns}"."${tbl}" AS SELECT * FROM ${src} LIMIT 0;\n` +
+      `INSERT INTO ic."${ns}"."${tbl}" SELECT * FROM ${src};`;
+    verifySql = setup +
+      `SELECT count(*) FROM ic."${ns}"."${tbl}" WHERE loaded_at = ${q(now)};`;
+  } else {
+    // ── Parquet: 出力ファイルを上書き（冪等） ─────────────────────────
+    fs.mkdirSync(path.dirname(out), { recursive: true });
+    writeSql = `COPY (SELECT * FROM ${src}) TO ${q(out)} (FORMAT parquet, COMPRESSION zstd);`;
+    verifySql = `SELECT count(*) FROM read_parquet(${q(out)}) WHERE loaded_at = ${q(now)};`;
+  }
+
+  // ── write 相 ─────────────────────────────────────────────────────────
+  const w = runDuckdb(writeSql);
+  if (w.status !== 0) {
+    console.error((w.stderr || w.stdout || "duckdb write failed").trim());
+    receipt("write", rows.length, rows.length, false);
+    cleanup();
+    process.exit(1);
+  }
+  receipt("write", rows.length, 0, false);
+
+  // ── verify 相: 読み戻して今回 jobId（loaded_at）の行数を照合 ──────────
+  const v = runDuckdb(verifySql);
+  let found = -1;
+  if (v.status === 0) {
+    const lastLine = (v.stdout || "").trim().split("\n").pop();
+    found = parseInt(lastLine, 10);
+  } else {
+    console.error((v.stderr || "duckdb verify failed").trim());
+  }
+  const verified = found === rows.length;
+  receipt("verify", rows.length, verified ? 0 : rows.length, verified, { verifiedRows: found });
+  cleanup();
+  process.exit(verified ? 0 : 1);
+})().catch((e) => {
+  console.error(`${PLUGIN}: ${e.message}`);
+  receipt("write", 0, 0, false);
+  process.exit(1);
+});

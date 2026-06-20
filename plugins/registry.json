@@ -1,0 +1,188 @@
+{
+  "schemaVersion": 1,
+  "plugins": [
+    {
+      "name": "archive",
+      "file": "i-repo-archive",
+      "displayName": "i-repo-archive",
+      "version": "0.4.2",
+      "description": "Stage report archives locally, then optionally push the bundle to cloud object storage (S3 / GCS / Azure Blob)",
+      "platforms": [
+        "macos",
+        "linux",
+        "windows"
+      ],
+      "roles": [
+        "source",
+        "keep"
+      ],
+      "category": "archive",
+      "supportsQuery": false,
+      "minPluginApi": "1",
+      "publisher": "official",
+      "signature": null,
+      "files": [
+        {
+          "path": "i-repo-archive",
+          "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-archive",
+          "sha256": "f6bfad1f952ea77172fe6bb09c33d28ac6775aea0424ce2b8c7a3d29878f3dc2"
+        }
+      ]
+    },
+    {
+      "name": "bigquery",
+      "file": "i-repo-bigquery",
+      "displayName": "i-repo-bigquery",
+      "version": "0.1.0",
+      "description": "Write NDJSON records to Google BigQuery (bq CLI経由・Cloud DWH Ready)",
+      "platforms": [
+        "macos",
+        "linux",
+        "windows"
+      ],
+      "roles": [
+        "sink",
+        "read",
+        "analyze"
+      ],
+      "category": "warehouse",
+      "supportsQuery": true,
+      "minPluginApi": "1",
+      "publisher": "official",
+      "signature": null,
+      "files": [
+        {
+          "path": "i-repo-bigquery",
+          "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-bigquery",
+          "sha256": "33109757d08e7c5c1dbe6579117533b55407322eafa8775afe341008b7b25cbb"
+        }
+      ]
+    },
+    {
+      "name": "elastic",
+      "file": "i-repo-elastic",
+      "displayName": "i-repo-elastic",
+      "version": "0.1.0",
+      "description": "Index NDJSON records into Elasticsearch (日本語全文検索・中間一致・ファセット集計の写し)",
+      "platforms": [
+        "macos",
+        "linux",
+        "windows"
+      ],
+      "roles": [
+        "sink",
+        "read",
+        "search"
+      ],
+      "category": "search",
+      "supportsQuery": true,
+      "minPluginApi": "1",
+      "publisher": "official",
+      "signature": null,
+      "files": [
+        {
+          "path": "i-repo-elastic",
+          "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-elastic",
+          "sha256": "fc33404add74604276f42fd49fdde447203a5265445683ccb21b2aa37609203c"
+        }
+      ]
+    },
+    {
+      "name": "mongo",
+      "file": "i-repo-mongo",
+      "displayName": "i-repo-mongo",
+      "version": "0.1.0",
+      "description": "Upsert NDJSON records into MongoDB (帳票IDキーでネスト構造をドキュメント保持)",
+      "platforms": [
+        "macos",
+        "linux",
+        "windows"
+      ],
+      "roles": [
+        "sink",
+        "read"
+      ],
+      "category": "database",
+      "supportsQuery": true,
+      "minPluginApi": "1",
+      "publisher": "official",
+      "signature": null,
+      "files": [
+        {
+          "path": "i-repo-mongo",
+          "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-mongo",
+          "sha256": "8ebe8633617735a423a149409363958037904c44b8800e3494a3fe99bd36bea0"
+        }
+      ]
+    },
+    {
+      "name": "parquet",
+      "file": "i-repo-parquet",
+      "displayName": "i-repo-parquet",
+      "version": "0.1.0",
+      "description": "Write NDJSON records to Parquet / Apache Iceberg (DuckDB経由・Lakehouse Ready)",
+      "platforms": [
+        "macos",
+        "linux",
+        "windows"
+      ],
+      "roles": [
+        "sink",
+        "read",
+        "analyze"
+      ],
+      "category": "lakehouse",
+      "supportsQuery": true,
+      "minPluginApi": "1",
+      "publisher": "official",
+      "signature": null,
+      "files": [
+        {
+          "path": "i-repo-parquet",
+          "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-parquet",
+          "sha256": "c74a2bc1be9e0610b65abc52aa8b92d094fc8482bfe428ce468ea2b54a1f267d"
+        }
+      ]
+    },
+    {
+      "name": "sqlite",
+      "file": "i-repo-sqlite",
+      "displayName": "i-repo-sqlite",
+      "version": "0.1.0",
+      "description": "Accumulate NDJSON records into a local SQLite database (UPSERT by idempotencyKey)",
+      "platforms": [
+        "macos",
+        "linux",
+        "windows"
+      ],
+      "roles": [
+        "sink",
+        "read"
+      ],
+      "category": "database",
+      "supportsQuery": true,
+      "minPluginApi": "1",
+      "publisher": "official",
+      "signature": null,
+      "files": [
+        {
+          "path": "i-repo-sqlite",
+          "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-sqlite",
+          "sha256": "be4b23800345e1e61c95af940a96685fe92eb3ce4ec974dcbb9d6339c072af87"
+        }
+      ]
+    }
+  ],
+  "shared": [
+    {
+      "path": "lib/gemba-read.js",
+      "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/lib/gemba-read.js",
+      "sha256": "b3746c622a45f4f14d94a880d946df9e96559b3e28b156dc66ad13e1abb43cb9"
+    },
+    {
+      "path": "lib/spawn.js",
+      "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/lib/spawn.js",
+      "sha256": "5617316e0be1500801b38bc9441ab8968c6da0d6ac9f756dee5c87eab7b400b7"
+    }
+  ]
+}

@@ -1,0 +1,480 @@
+#!/usr/bin/env node
+/**
+ * i-repo-bigquery — sink plugin: write i-repo NDJSON records to Google BigQuery.
+ *
+ * 帳票データをフラット列でクラウド DWH（BigQuery）へ蓄積し、SQL・BI・ML から直接
+ * 読める形にする。i-repo-parquet（Lakehouse）のクラウドマネージド版に相当する。
+ *
+ * 設計: bq CLI（Google Cloud SDK）を呼ぶ薄いアダプタ（parquet が duckdb を、mongo が
+ *   mongosh を呼ぶのと同じ流儀）。npm 依存ゼロ。顧客が gcloud SDK を持ち、認証済み
+ *   （`gcloud auth login` / ADC、または --key-file のサービスアカウント）であれば動く。
+ *   install: copy to ~/.i-repo/plugins/i-repo-bigquery && chmod +x
+ *
+ * Usage:
+ *   # 配信（テーブルが無ければ load が作成。dataset は自動作成を試みる）
+ *   cat manifests/reports.ndjson | i-repo bigquery \
+ *     --project my-gcp-proj --dataset irepo --table reports --location asia-northeast1
+ *
+ *   # サービスアカウント鍵で認証（パスのみ。鍵の中身は子プロセスの環境変数で渡す）
+ *   ... | i-repo bigquery --project p --dataset d --table t --key-file ~/sa.json
+ *
+ * Contract (PLUGINS.md / SCHEMA.md):
+ *   - 予約フラグ --plugin-schema / --plugin-healthcheck
+ *   - IREPO_PLUGIN_API 不一致は exit 11
+ *   - stream-end トレーラ照合 (§2.6)
+ *   - receipt: write → verify。verify は書いた先を読み戻して今回 loaded_at の件数を
+ *     照合し、verified:true はそのときだけ立てる
+ *   - 冪等: BigQuery load は追記（WRITE_APPEND）。再実行は重複しうるため、重複排除は
+ *     クエリ側 QUALIFY で冪等キー単位 loaded_at 最新へ畳む（iceberg と同方針）
+ */
+"use strict";
+
+const PLUGIN = "i-repo-bigquery";
+const VERSION = "0.1.0";
+const { spawnSyncSpec } = require("./lib/spawn.js");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+const argv = process.argv.slice(2);
+
+// ── 予約フラグ ───────────────────────────────────────────────────────
+if (argv[0] === "--plugin-schema") {
+  process.stdout.write(JSON.stringify({
+    pluginApi: ["1"],
+    schemaVersions: ["1.0"],
+    recordTypes: ["*"],
+    name: PLUGIN,
+    version: VERSION,
+    description: "Write NDJSON records to Google BigQuery (bq CLI経由・Cloud DWH Ready)",
+    phases: ["write", "verify"],
+    platforms: ["macos", "linux", "windows"],
+    roles: ["sink", "read", "analyze"],
+    category: "warehouse",   // 表示カテゴリ（GUI 種別グループ表示用・脱料理）
+    input: ["stdin-ndjson"],
+    // ── ADC-1（gemba-read/1.0）読み返し契約の宣言 ──────────────────────
+    subcommands: [
+      { name: "query", mode: "read", input: ["none"], output: ["ndjson"],
+        description: "着地済みレコードを正準封筒形で読み出す（ページ付き・書込ゼロ）" },
+    ],
+    params: [
+      { name: "--project", type: "string",
+        label: "GCP プロジェクト ID", placeholder: "my-gcp-project",
+        description: "BigQuery を持つ GCP プロジェクト ID" },
+      { name: "--dataset", type: "string",
+        label: "データセット", placeholder: "irepo",
+        description: "BigQuery データセット名（無ければ作成を試みる）" },
+      { name: "--table", type: "string",
+        label: "テーブル", placeholder: "reports",
+        description: "対象テーブル名（無ければ load が作成）" },
+      { name: "--location", type: "string", default: "US",
+        label: "ロケーション", placeholder: "asia-northeast1",
+        description: "データセットのロケーション（US / asia-northeast1 等）" },
+      { name: "--key-file", type: "string",
+        label: "サービスアカウント鍵パス（任意）", placeholder: "~/sa.json",
+        description: "サービスアカウント JSON 鍵のパス。GOOGLE_APPLICATION_CREDENTIALS として bq に渡す（省略時は gcloud ADC）" },
+      { name: "--dry-run", type: "boolean", label: "Dry run",
+        description: "Validate input without writing" },
+      // ── query(読み返し)で受理する選択フィルタの宣言（既存の共通フラグのみ。新意味は足さない）。
+      { name: "--since", type: "string", subcommand: "query", filter: true, label: "開始時刻（含む）",
+        placeholder: "2026-06-01 00:00:00", description: "時刻範囲の下限（半開区間 [since, until)）" },
+      { name: "--until", type: "string", subcommand: "query", filter: true, label: "終了時刻（含まない）",
+        placeholder: "2026-06-15 00:00:00", description: "時刻範囲の上限（排他）" },
+      { name: "--time-field", type: "select", subcommand: "query", filter: true, label: "時刻フィールド",
+        choices: ["loaded", "updated", "registered"], default: "loaded",
+        description: "範囲フィルタの対象時刻（取込/更新/登録）" },
+      { name: "--deleted", type: "boolean", subcommand: "query", filter: true, label: "削除済みのみ",
+        description: "deleted=true/false のレコードに絞る" },
+      { name: "--ids", type: "string", subcommand: "query", filter: true, label: "冪等キー（CSV）",
+        description: "冪等キーの完全一致（カンマ区切り）" },
+      { name: "--item-id", type: "string", subcommand: "query", filter: true, repeatable: true, label: "itemId",
+        description: "itemId の完全一致（反復可・全リビジョン取得）" },
+      { name: "--fields", type: "string", subcommand: "query", filter: true, label: "射影フィールド（CSV）",
+        description: "正準名で返却フィールドを限定（カンマ区切り）" },
+    ],
+    // ── ADC-1（gemba-adc/1.0）着地スキーマ宣言 ──────────────────────────
+    dataset: [
+      { datasetApi: ["1"], contract: "gemba-adc/1.0", store: "bigquery",
+        // locator は query が必要とする接続フラグを**全て**宣言する（access.query の正本）。
+        // 漏らすと読み返しがその引数なしで実行され失敗する（parquet の --warehouse 欠落の教訓）。
+        locator: {
+          project: { param: "--project" }, dataset: { param: "--dataset" },
+          table: { param: "--table" }, location: { param: "--location", default: "US" },
+          keyFile: { param: "--key-file" },
+        },
+        naming: "snake_case",
+        keys: { primary: "idempotency_key", upsert: false, dedupe: "latest-wins-by-key" },
+        contents: "cumulative",
+        fields: bqFields(),
+        quirks: ["raw-json-embedded", "string-dates", "append-only-duplicates", "detail-optional"] },
+    ],
+  }) + "\n");
+  process.exit(0);
+}
+
+// flat10 列（parquet/sqlite と同じ正準名。ストア間の命名分裂を橋渡しする）。
+function bqFields() {
+  return [
+    { name: "idempotency_key", canonical: "idempotencyKey", source: "idempotencyKey", type: "string", role: "key" },
+    { name: "record_type", canonical: "recordType", source: "recordType", type: "string" },
+    { name: "item_id", canonical: "itemId", source: "itemId", type: "string", role: "report-id" },
+    { name: "rev_no", canonical: "revNo", source: "revNo", type: "string", role: "revision" },
+    { name: "name", canonical: "name", source: "values.name", type: "string", pii: "possible" },
+    { name: "deleted", canonical: "deleted", source: "deleted", type: "boolean" },
+    { name: "regist_time", canonical: "registTime", source: "values.registTime", type: "datetime", storedAs: "string", format: "local-datetime-slash", timezone: "local" },
+    { name: "update_time", canonical: "updateTime", source: "values.updateTime", type: "datetime", storedAs: "string", format: "local-datetime-slash", timezone: "local" },
+    { name: "raw_json", canonical: "raw", source: ".", type: "json-string", schemaRef: "envelope/1.0", pii: "likely" },
+    { name: "loaded_at", canonical: "loadedAt", type: "datetime", storedAs: "string", format: "iso8601", timezone: "utc", role: "lineage" },
+  ];
+}
+
+// BigQuery テーブルスキーマ（bq load --schema 用）。loaded_at は parquet と揃え STRING(ISO)。
+const BQ_SCHEMA =
+  "idempotency_key:STRING,record_type:STRING,item_id:STRING,rev_no:STRING," +
+  "name:STRING,deleted:BOOLEAN,regist_time:STRING,update_time:STRING," +
+  "raw_json:STRING,loaded_at:STRING";
+
+if (argv[0] === "--plugin-healthcheck") {
+  const checks = [];
+  const has = spawnSyncSpec("bq", ["version"], { encoding: "utf8" });
+  const bqOk = has.status === 0;
+  checks.push({ name: "bq", ok: bqOk, severity: "required",
+    hint: bqOk ? `${String(has.stdout || has.stderr).trim().split("\n")[0]}`
+      : "Google Cloud SDK の bq CLI をインストールし認証してください（gcloud init / gcloud auth login）" });
+  const ok = checks.every((c) => c.ok);
+  process.stdout.write(JSON.stringify({ ok, checks }) + "\n");
+  process.exit(ok ? 0 : 1);
+}
+
+// ── 契約バージョン ───────────────────────────────────────────────────
+if (process.env.IREPO_PLUGIN_API && process.env.IREPO_PLUGIN_API !== "1") {
+  console.error(`${PLUGIN}: unsupported IREPO_PLUGIN_API=${process.env.IREPO_PLUGIN_API} (supported: 1)`);
+  process.exit(11);
+}
+
+// ── query サブコマンド（ADC-1 / gemba-read/1.0・読み取り専用） ─────────
+// 着地済みレコードを「正準封筒形」で読み出す。書込・新規作成・スキーマ変更はしない。
+// 成功は末尾 query-end トレーラの存在で判定（契約 §3.4）。0件でも query-end を出す。
+// 読み取り手段は bq query を spawn（SELECT のみ）。append 重複は QUALIFY で排除する。
+// 共通部（envelope/時刻3形式/カーソル/フラグ解析）は lib/gemba-read.js（正本: plugins/lib/）。
+// ここにはストア固有部（bq 実行・SQL構築・record復元・dest）だけを置く。
+if (argv[0] === "query") {
+  let G;
+  try { G = require("./lib/gemba-read.js"); }
+  catch {
+    console.error(JSON.stringify({ schemaVersion: "1.0", recordType: "error", contract: "gemba-read/1.0",
+      plugin: PLUGIN, code: "E_INTERNAL",
+      message: "gemba-read ライブラリが見つかりません（lib/gemba-read.js）。plugins/install.sh を再実行してください",
+      retryable: false }));
+    process.exit(1);
+  }
+  runQuery(argv.slice(1), G);   // 内部で process.exit。以降へは進まない。
+}
+
+function runQuery(qargs, G) {
+  const { queryEnd, emitRow, queryError } = G.createReadKit(PLUGIN);
+  const opts = G.parseQueryArgs(qargs, {
+    "--project": "project", "--dataset": "dataset", "--table": "table",
+    "--location": "location", "--key-file": "keyFile",
+  }, queryError);
+  if (!opts.location) opts.location = "US";
+
+  if (!opts.project || !opts.dataset || !opts.table) {
+    queryError("E_ARGS", "BigQuery requires --project, --dataset and --table", "読み取り対象テーブルの指定", 2);
+  }
+  validateIdent(opts.project, "--project", queryError, true);
+  validateIdent(opts.dataset, "--dataset", queryError);
+  validateIdent(opts.table, "--table", queryError);
+
+  const dest = `bigquery:${opts.project}.${opts.dataset}.${opts.table}`;
+  const dedupeApplied = true; // append-only の重複を QUALIFY で排除（§3.3）
+  const fqtn = "`" + `${opts.project}.${opts.dataset}.${opts.table}` + "`";
+  const env = bqEnv(opts.keyFile);
+
+  // bq 不在は推測せず E_CONNECT。
+  if (spawnSyncSpec("bq", ["version"], { encoding: "utf8", env }).status !== 0) {
+    queryError("E_CONNECT", "bq CLI not found", "Google Cloud SDK（bq）をインストールし認証してください", 1, dest);
+  }
+
+  // WHERE 構築。時刻境界は lib が格納形式（loaded=ISO / 業務時刻=slashローカル）へ正規化済み。
+  const where = [];
+  const col = opts.timeField === "updated" ? "update_time" : opts.timeField === "registered" ? "regist_time" : "loaded_at";
+  const bounds = G.timeBounds(opts, col === "loaded_at" ? "iso" : "slash", queryError, dest);
+  if (bounds?.gte) where.push(`${col} >= ${q(bounds.gte)}`);
+  if (bounds?.lt) where.push(`${col} < ${q(bounds.lt)}`);   // 半開区間 [since, until)
+  // query-end の timeFilter 報告は常に UTC ISO で持つ（timeBounds が解釈不能時に exit 済み）。
+  const sinceUtc = opts.since != null ? G.parseFlexibleDate(opts.since).toISOString() : null;
+  const untilUtc = opts.until != null ? G.parseFlexibleDate(opts.until).toISOString() : null;
+  if (opts.deleted != null) { where.push(`deleted = ${opts.deleted ? "true" : "false"}`); }
+  if (opts.ids && opts.ids.length) { where.push(`idempotency_key IN (${opts.ids.map((s) => q(s)).join(",")})`); }
+  if (opts.itemIds.length) { where.push(`item_id IN (${opts.itemIds.map((s) => q(s)).join(",")})`); }
+
+  // append 重複を冪等キー単位で loaded_at 最新の1行へ畳む（dedupHint）。
+  const dedupQual = " QUALIFY row_number() OVER (PARTITION BY idempotency_key ORDER BY loaded_at DESC) = 1";
+  const baseWhereSql = where.length ? ` WHERE ${where.join(" AND ")}` : "";
+  const timeFilter = (sinceUtc || untilUtc) ? { field: opts.timeField, sinceUtc, untilUtc } : null;
+
+  if (opts.countOnly) {
+    const sql = `SELECT COUNT(*) AS n FROM (SELECT idempotency_key FROM ${fqtn}${baseWhereSql}${dedupQual}) AS t;`;
+    const r = runBqJson(sql, opts.location, env, 0, opts.project);
+    if (r.status !== 0) queryError(classifyErr(r), bqErrMsg(r), null, 1, dest);
+    let total = 0;
+    try { const arr = JSON.parse(r.stdout || "[]"); total = arr.length ? Number(arr[0].n) : 0; }
+    catch (e) { queryError("E_INTERNAL", `cannot parse bq output: ${e.message}`, null, 1, dest); }
+    const end = { count: 0, complete: true, total, nextCursor: null, dest, dedupeApplied };
+    if (timeFilter) end.timeFilter = timeFilter;
+    queryEnd(end);
+    process.exit(0);
+  }
+
+  // keyset ページング（idempotency_key 昇順・決定的）
+  const pageWhere = [...where];
+  if (opts.cursor != null) {
+    const last = G.decodeCursor(opts.cursor);
+    if (last == null) queryError("E_CURSOR", "カーソルが不正です", "前回の query-end.nextCursor をそのまま渡してください", 2, dest);
+    pageWhere.push(`idempotency_key > ${q(last)}`);
+  }
+  const pageWhereSql = pageWhere.length ? ` WHERE ${pageWhere.join(" AND ")}` : "";
+
+  // dedup を先に適用してからページングする（カーソルが論理行に乗るように）。
+  const inner = `SELECT idempotency_key, record_type, raw_json, loaded_at FROM ${fqtn}${pageWhereSql}${dedupQual}`;
+  const sql = `SELECT idempotency_key, record_type, raw_json, loaded_at FROM (${inner}) AS t ` +
+    `ORDER BY idempotency_key ASC LIMIT ${opts.limit};`;
+
+  const r = runBqJson(sql, opts.location, env, opts.limit, opts.project);
+  if (r.status !== 0) queryError(classifyErr(r), bqErrMsg(r), null, 1, dest);
+  let rows;
+  try { rows = JSON.parse(r.stdout || "[]"); }
+  catch (e) { queryError("E_INTERNAL", `cannot parse bq output: ${e.message}`, null, 1, dest); }
+
+  let lastKey = null;
+  for (const row of rows) {
+    lastKey = row.idempotency_key;
+    let record;
+    try { record = JSON.parse(row.raw_json); }
+    catch { record = { _raw: row.raw_json }; }
+    let outRec = record;
+    if (!opts.raw && opts.fields && record && record._raw === undefined) outRec = G.pickFields(record, opts.fields);
+    emitRow(row.idempotency_key, row.loaded_at, outRec, opts.raw);
+  }
+  const complete = rows.length < opts.limit;
+  const end = {
+    count: rows.length, complete,
+    nextCursor: complete ? null : G.encodeCursor(lastKey),
+    dest, dedupeApplied,
+  };
+  if (timeFilter) end.timeFilter = timeFilter;
+  queryEnd(end);
+  process.exit(0);
+}
+
+// query 用の bq 実行（--format=json で行配列を得る。SELECT のみ＝読み取り専用 §3.7）。
+// グローバルフラグ（--quiet/--headless/--format/--location/--project_id）はサブコマンドの前、
+// query のコマンドフラグ（--use_legacy_sql/--max_rows）は後に置く（bq の引数規約）。
+// --project_id はジョブ実行先プロジェクト（宛先テーブルに project を含めても、bq は
+// ジョブ起動に project id を要求するため明示する＝gcloud 既定 project に依存しない）。
+// maxRows>0 のときだけ --max_rows を渡す（count-only は 1 行で十分なので 0 指定）。
+function runBqJson(sql, location, env, maxRows, project) {
+  const args = ["--quiet", "--headless", "--format=json", `--location=${location}`,
+    `--project_id=${project}`, "query", "--use_legacy_sql=false"];
+  if (maxRows > 0) args.push(`--max_rows=${maxRows}`);
+  // SQL は位置引数ではなく stdin で渡す: SQL は cmd.exe メタ文字（COUNT(*) の括弧・引用符等）を
+  // 含むため、Windows で cmd.exe 経由起動するとき引数に載せると spawnSpec が拒否する（lib/spawn.js）。
+  // bq query は位置引数省略時に stdin からクエリを読む。
+  return spawnSyncSpec("bq", args, { encoding: "utf8", env, input: sql, maxBuffer: 256 * 1024 * 1024 });
+}
+
+// bq エラーの粗い分類（接続/権限 → E_CONNECT、それ以外 → E_INTERNAL）。
+function classifyErr(r) {
+  const blob = `${r.stderr || ""}\n${r.stdout || ""}`.toLowerCase();
+  if (/not found: (project|dataset|table)|notfound|404/.test(blob)) return "E_NOT_FOUND";
+  if (/credential|auth|permission|denied|403|401|could not|reauth/.test(blob)) return "E_CONNECT";
+  return "E_INTERNAL";
+}
+function bqErrMsg(r) { return (r.stderr || r.stdout || "bq query failed").trim().split("\n").slice(0, 4).join(" "); }
+
+// ── 引数 ─────────────────────────────────────────────────────────────
+let project = "", dataset = "", table = "", location = "US", keyFile = "";
+let dryRun = false;
+for (let i = 0; i < argv.length; i++) {
+  switch (argv[i]) {
+    case "--project":  project = argv[++i] ?? ""; break;
+    case "--dataset":  dataset = argv[++i] ?? ""; break;
+    case "--table":    table = argv[++i] ?? ""; break;
+    case "--location": location = argv[++i] ?? "US"; break;
+    case "--key-file": keyFile = argv[++i] ?? ""; break;
+    case "--dry-run":  dryRun = true; break;
+    default: console.error(`unknown option: ${argv[i]}`); process.exit(2);
+  }
+}
+
+// dry-run は出力先なしでも入力検証だけ行える（plugin verify が使う経路）
+if (!dryRun) {
+  if (!project || !dataset || !table) {
+    console.error("BigQuery requires --project, --dataset and --table");
+    process.exit(2);
+  }
+  validateIdent(project, "--project", null, true);
+  validateIdent(dataset, "--dataset", null);
+  validateIdent(table, "--table", null);
+}
+
+const jobId = `bigquery-${new Date().toISOString().replace(/[-:T]/g, "").slice(0, 15)}-${process.pid}`;
+const dest = `bigquery:${project}.${dataset}.${table}`;
+
+const receipt = (phase, count, failedCount, verified, extra = {}) => {
+  process.stdout.write(JSON.stringify({
+    schemaVersion: "1.0", recordType: "receipt", plugin: PLUGIN,
+    producedBy: { plugin: PLUGIN, version: VERSION },
+    phase, jobId, count, failedCount, verified, dest,
+    ...(dryRun ? { dryRun: true } : {}),
+    ...extra,
+  }) + "\n");
+};
+
+async function readStdin() {
+  const chunks = [];
+  for await (const c of process.stdin) chunks.push(c);
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+// BigQuery Standard SQL の文字列リテラル用エスケープ（バックスラッシュ方式。引用符の二重化は不可）。
+// 関数宣言: query 経路から先行参照されるため巻き上げ必須。
+function q(s) {
+  return "'" + String(s)
+    .replace(/\\/g, "\\\\").replace(/'/g, "\\'")
+    .replace(/\n/g, "\\n").replace(/\r/g, "\\r") + "'";
+}
+
+// project/dataset/table 識別子の検証（SQL/bq 引数に素で埋めるための injection ガード兼、
+// BigQuery 命名規則の早期検出）。project ID はハイフン可、dataset/table は英数と _ のみ
+// （BigQuery が `-` を許さないため、後段の bq 失敗を待たず E_ARGS/exit2 で落とす）。
+// queryError があれば E_ARGS で（query 経路）、無ければ exit 2 で（write 経路）落とす。
+function validateIdent(v, flag, queryError, allowHyphen = false) {
+  const re = allowHyphen ? /^[A-Za-z0-9_-]+$/ : /^[A-Za-z0-9_]+$/;
+  if (!re.test(v)) {
+    const msg = `${flag} に使える文字は${allowHyphen ? "英数・_・-" : "英数・_"}のみです: ${v}`;
+    if (queryError) queryError("E_ARGS", msg, null, 2);
+    else { console.error(msg); process.exit(2); }
+  }
+}
+
+// --key-file をサービスアカウント鍵として子 bq に渡す（パスのみ環境変数経由・平文ログ無し）。
+function bqEnv(kf) {
+  if (!kf) return process.env;
+  let p = kf;
+  if (p.startsWith("~/")) p = path.join(os.homedir(), p.slice(2));
+  return { ...process.env, GOOGLE_APPLICATION_CREDENTIALS: p };
+}
+
+(async () => {
+  const env = bqEnv(keyFile);
+  const text = await readStdin();
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+
+  const docs = [];
+  let trailer = null, envelopes = 0;
+  for (const line of lines) {
+    let obj;
+    try { obj = JSON.parse(line); } catch { docs.push({ _raw: line }); continue; }
+    if (obj && obj.schemaVersion) envelopes++;
+    if (obj && obj.recordType === "stream-end") { trailer = obj; continue; }
+    docs.push(obj);
+  }
+
+  // stream-end 照合（§2.6）
+  if (trailer) {
+    if (typeof trailer.count !== "number" || trailer.count !== docs.length) {
+      console.error(`❌ incomplete stream: trailer count=${trailer.count ?? "unreadable"} but received ${docs.length}`);
+      receipt("write", docs.length, docs.length, false);
+      process.exit(1);
+    }
+  } else if (envelopes > 0) {
+    console.error("❌ truncated stream: envelope records present but no stream-end trailer");
+    receipt("write", docs.length, docs.length, false);
+    process.exit(1);
+  }
+
+  // フラット行に展開（i-repo-sqlite / parquet と同じマッピング）
+  const now = new Date().toISOString();
+  const rows = docs.map((r, i) => {
+    const v = r.values ?? r;
+    return {
+      idempotency_key: r.idempotencyKey ?? `${jobId}:${i}`,
+      record_type: r.recordType ?? null,
+      item_id: String(r.itemId ?? v.itemId ?? ""),
+      rev_no: String(r.revNo ?? v.revNo ?? ""),
+      name: v.name ?? null,
+      deleted: r.deleted === true,
+      regist_time: v.registTime ?? null,
+      update_time: v.updateTime ?? null,
+      raw_json: JSON.stringify(r),
+      loaded_at: now,
+    };
+  });
+
+  if (dryRun) {
+    receipt("write", rows.length, 0, false);
+    console.error(`(dry-run) would load ${rows.length} row(s) → ${dest}`);
+    process.exit(0);
+  }
+
+  if (spawnSyncSpec("bq", ["version"], { encoding: "utf8", env }).status !== 0) {
+    console.error("bq CLI not found（Google Cloud SDK を入れて認証してください）");
+    receipt("write", rows.length, rows.length, false);
+    process.exit(1);
+  }
+
+  // データセットを用意（既存なら "already exists" を無視）。
+  const tableRef = `${project}:${dataset}.${table}`;
+  const mk = spawnSyncSpec("bq", ["--quiet", "--headless", `--location=${location}`, `--project_id=${project}`,
+    "mk", "--dataset", `${project}:${dataset}`], { encoding: "utf8", env });
+  // bq はメッセージを端末幅で折り返すため "already exists" の間に改行が入りうる
+  // （長い dataset 名でちょうど "already\nexists" になり再現）。空白を畳んでから判定する。
+  // 既存データセットは正常系: mk 失敗（exit≠0・本文は stdout 側に出る）を無視して load へ進む。
+  const mkBlob = `${mk.stderr}\n${mk.stdout}`.replace(/\s+/g, " ");
+  if (mk.status !== 0 && !/already exists/i.test(mkBlob)) {
+    console.error((mk.stderr || mk.stdout || "bq mk dataset failed").trim());
+    receipt("write", rows.length, rows.length, false);
+    process.exit(1);
+  }
+
+  // ── write 相: 一時 NDJSON を bq load で追記（テーブルが無ければスキーマ付きで作成） ──
+  const tmp = path.join(os.tmpdir(), `${jobId}.ndjson`);
+  fs.writeFileSync(tmp, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
+  const cleanup = () => { try { fs.unlinkSync(tmp); } catch { /* noop */ } };
+
+  const w = spawnSyncSpec("bq", ["--quiet", "--headless", `--location=${location}`, `--project_id=${project}`,
+    "load", "--source_format=NEWLINE_DELIMITED_JSON", "--replace=false",
+    "--schema", BQ_SCHEMA, tableRef, tmp], { encoding: "utf8", env, maxBuffer: 256 * 1024 * 1024 });
+  if (w.status !== 0) {
+    console.error((w.stderr || w.stdout || "bq load failed").trim());
+    receipt("write", rows.length, rows.length, false);
+    cleanup();
+    process.exit(1);
+  }
+  receipt("write", rows.length, 0, false);
+
+  // ── verify 相: 読み戻して今回 loaded_at の行数を照合 ──────────────────
+  const fqtn = "`" + `${project}.${dataset}.${table}` + "`";
+  const vsql = `SELECT COUNT(*) AS n FROM ${fqtn} WHERE loaded_at = ${q(now)};`;
+  // vsql は COUNT(*) の括弧等を含むため stdin で渡す（runBqJson と同じ理由・cmd.exe メタ文字回避）。
+  const v = spawnSyncSpec("bq", ["--quiet", "--headless", "--format=json", `--location=${location}`,
+    `--project_id=${project}`, "query", "--use_legacy_sql=false"],
+    { encoding: "utf8", env, input: vsql, maxBuffer: 64 * 1024 * 1024 });
+  let found = -1;
+  if (v.status === 0) {
+    try { const arr = JSON.parse(v.stdout || "[]"); found = arr.length ? Number(arr[0].n) : 0; }
+    catch { found = -1; }
+  } else {
+    console.error((v.stderr || "bq verify failed").trim());
+  }
+  const verified = found === rows.length;
+  receipt("verify", rows.length, verified ? 0 : rows.length, verified, { verifiedRows: found });
+  cleanup();
+  process.exit(verified ? 0 : 1);
+})().catch((e) => {
+  console.error(`${PLUGIN}: ${e.message}`);
+  receipt("write", 0, 0, false);
+  process.exit(1);
+});

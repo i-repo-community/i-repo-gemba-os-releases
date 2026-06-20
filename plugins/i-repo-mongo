@@ -1,0 +1,576 @@
+#!/usr/bin/env node
+/**
+ * i-repo-mongo — sink plugin: upsert i-repo NDJSON records into MongoDB.
+ *
+ * 構想「i-Repo DataPipe for NoSQL」の Data Storage Manager 相当。
+ * 帳票の XML→JSON 化されたネスト構造を、帳票ID をキーに NoSQL ドキュメントとして
+ * そのまま保持する（RDB の列展開が難しい「横に広がる」構造を自然に表現）。
+ * MotionBoard 等は CData 経由でこの MongoDB を参照できる。
+ *
+ * 設計: mongosh を呼ぶ薄いアダプタ（i-repo-s3 が aws を呼ぶのと同じ流儀）。
+ *   npm 依存ゼロ。顧客が mongosh を持っていればそのまま動く。
+ *   install: copy to ~/.i-repo/plugins/i-repo-mongo && chmod +x
+ *   Windows: also copy i-repo-mongo.cmd shim
+ *
+ * Usage:
+ *   i-repo rep list --format ndjson | i-repo mongo --uri mongodb://localhost:27017 --db irepo --collection reports
+ *
+ * Contract (PLUGINS.md / SCHEMA.md):
+ *   - 予約フラグ --plugin-schema / --plugin-healthcheck
+ *   - IREPO_PLUGIN_API 不一致は exit 11
+ *   - stream-end トレーラ照合 (§2.6)
+ *   - receipt: write → verify。verify は読み戻して件数照合し、verified:true は
+ *     そのときだけ立てる（cleanup の前提にできるのは verified:true のみ）
+ *   - 冪等: idempotencyKey（無ければ itemId:revNo）で upsert。再実行で重複しない。
+ */
+"use strict";
+
+const PLUGIN = "i-repo-mongo";
+const VERSION = "0.1.0";
+const { spawnSync } = require("node:child_process");
+const { spawnSyncSpec } = require("./lib/spawn.js");
+
+const argv = process.argv.slice(2);
+
+// 各スクリプトの先頭に差し込む接続プレリュード。mongosh は --nodb で起動し（positional URI を
+// 渡さない）、URI は env IREPO_MONGO_URI から受け取って接続する。これで URI を cmd.exe argv に
+// 載せずに済む（標準 Atlas URI の `&` や `%40` が spawnSpec のメタ文字拒否に当たる問題を回避＋
+// secret をプロセス引数に出さない）。connect() は Database を返し、既存の db.getSiblingDB(...) が
+// そのまま動く。
+const MONGO_PRELUDE = "const db = connect(process.env.IREPO_MONGO_URI);\n";
+
+// Windows で mongosh が「直接 spawn 可能な実行ファイル(.exe/.com)」として解決できるかを返す。
+//   解決できれば cmd.exe を介さず直接 spawn でき、spawnSync の timeout/killSignal が mongosh 本体に
+//   効く（cmd.exe ラップだと直下=cmd.exe しか kill されず、ネイティブクエリの client backstop が
+//   無効化される — テーマA と同種）。.cmd/.bat（npm 配布 mongosh 等）は cmd.exe ラップが要るため null。
+//   POSIX は shell 無しで直接 spawn でき timeout も効くため、そのままコマンド名を返す。
+let _directMongosh; // undefined=未解決 / string=直 spawn パス / null=ラップ必要
+function directMongosh() {
+  if (_directMongosh !== undefined) return _directMongosh;
+  if (process.platform !== "win32") { _directMongosh = "mongosh"; return _directMongosh; }
+  const r = spawnSync("where", ["mongosh"], { encoding: "utf8" });
+  const exe = r.status === 0
+    ? r.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).find((p) => /\.(exe|com)$/i.test(p))
+    : null;
+  _directMongosh = exe || null;
+  return _directMongosh;
+}
+
+// mongosh をスクリプト「stdin」経由で実行する共通ヘルパ。
+//   - スクリプト本文は stdin（input）で渡す: temp ファイルを作らない（PII をディスクに書かない・
+//     権限/後始末不要）し、--file のパス引数が cmd.exe メタ文字（os.tmpdir() がユーザー名等で `()`
+//     を含む場合）で spawnSpec に拒否される問題も起きない。mongosh は --nodb 起動でも、パイプされた
+//     stdin をスクリプトとして実行して終了する（duckdb/bq と同じ stdin 流儀）。
+//   - URI は env で渡す（argv に出さない／上記 MONGO_PRELUDE 参照）。
+//   - 実 .exe なら直接 spawn（timeout が効く）、.cmd 等は spawnSyncSpec で cmd.exe ラップ。
+//   extraOpts で timeout/killSignal/maxBuffer を上書きできる。戻り値は spawnSync の結果そのまま。
+function runMongoshScript(uri, scriptBody, extraOpts = {}) {
+  const opts = {
+    encoding: "utf8",
+    maxBuffer: 256 * 1024 * 1024,
+    ...extraOpts,
+    input: MONGO_PRELUDE + scriptBody,
+    env: { ...process.env, IREPO_MONGO_URI: uri },
+  };
+  const args = ["--nodb", "--quiet"];
+  const direct = directMongosh();
+  return direct
+    ? spawnSync(direct, args, opts)         // 直接 spawn: timeout/SIGKILL が mongosh 本体に効く
+    : spawnSyncSpec("mongosh", args, opts); // .cmd: cmd.exe ラップ（timeout は cmd.exe。server maxTimeMS が実バウンド）
+}
+
+// ── 予約フラグ ───────────────────────────────────────────────────────
+if (argv[0] === "--plugin-schema") {
+  process.stdout.write(JSON.stringify({
+    pluginApi: ["1"],
+    schemaVersions: ["1.0"],
+    recordTypes: ["*"],
+    name: PLUGIN,
+    version: VERSION,
+    description: "Upsert NDJSON records into MongoDB (帳票IDキーでネスト構造をドキュメント保持)",
+    phases: ["write", "verify"],
+    platforms: ["macos", "linux", "windows"],
+    roles: ["sink", "read"],
+    category: "database",   // 表示カテゴリ（GUI 種別グループ表示用・脱料理）
+    input: ["stdin-ndjson"],
+    params: [
+      { name: "--uri", type: "string", required: true, secret: true,
+        label: "MongoDB接続URI", placeholder: "mongodb://localhost:27017",
+        description: "MongoDB connection string (mongodb:// or mongodb+srv://)" },
+      { name: "--db", type: "string", required: true,
+        label: "データベース名", placeholder: "irepo",
+        description: "Target database name" },
+      { name: "--collection", type: "string", default: "reports",
+        label: "コレクション名",
+        description: "Target collection (created on first write)" },
+      { name: "--dry-run", type: "boolean", label: "Dry run",
+        description: "Validate input without writing" },
+      // ── query(読み返し)で受理する選択フィルタの宣言（脱料理: host が汎用描画/転送する印）。
+      //    新しい検索意味は足さない＝既に parseQueryArgs が受理する共通フラグを宣言するだけ。
+      { name: "--since", type: "string", subcommand: "query", filter: true, label: "開始時刻（含む）",
+        placeholder: "2026-06-01 00:00:00", description: "時刻範囲の下限（半開区間 [since, until)）" },
+      { name: "--until", type: "string", subcommand: "query", filter: true, label: "終了時刻（含まない）",
+        placeholder: "2026-06-15 00:00:00", description: "時刻範囲の上限（排他）" },
+      { name: "--time-field", type: "select", subcommand: "query", filter: true, label: "時刻フィールド",
+        choices: ["loaded", "updated", "registered"], default: "loaded",
+        description: "範囲フィルタの対象時刻（取込/更新/登録）" },
+      { name: "--deleted", type: "boolean", subcommand: "query", filter: true, label: "削除済みのみ",
+        description: "deleted=true/false のレコードに絞る" },
+      { name: "--ids", type: "string", subcommand: "query", filter: true, label: "冪等キー（CSV）",
+        description: "冪等キーの完全一致（カンマ区切り）" },
+      { name: "--item-id", type: "string", subcommand: "query", filter: true, repeatable: true, label: "itemId",
+        description: "itemId の完全一致（反復可・全リビジョン取得）" },
+      { name: "--fields", type: "string", subcommand: "query", filter: true, label: "射影フィールド（CSV）",
+        description: "正準名で返却フィールドを限定（カンマ区切り）" },
+    ],
+    // ── ADC-1（gemba-adc/1.0）読み返し契約の宣言 ──────────────────────
+    subcommands: [
+      { name: "query", mode: "read", input: ["none"], output: ["ndjson"],
+        description: "着地済みレコードを正準封筒形で読み出す（ページ付き・書込ゼロ）" },
+    ],
+    // 能力タグ（開いた語彙・string[]）。CLI verify(describe-shape) は capabilities を string[] と検査する。
+    // 各タグの詳細（dialect/audience 等）は capabilityDetails で宣言する（ホストはそちらを読む）。
+    capabilities: ["native-query"],
+    // ── T2: ネイティブクエリ（仕様 §9）。query --native '<find filter | aggregation pipeline>' を素通し。
+    //    read-only はプラグインが機械強制（read-only stage 限定＋$out/$merge/$where/$function 拒否）。audience 既定=human。
+    capabilityDetails: {
+      "native-query": { dialect: "mongo-aggregation", input: "json", readOnly: "enforced", audience: ["human"] },
+    },
+    // ── ADC-1（gemba-adc/1.0）着地スキーマ宣言。ネスト保持・camelCase ──
+    dataset: [{
+      datasetApi: ["1"], contract: "gemba-adc/1.0", store: "mongodb",
+      locator: { uri: { param: "--uri", secret: true }, db: { param: "--db" }, collection: { param: "--collection", default: "reports" } },
+      naming: "camelCase",
+      keys: { primary: "_id", upsert: true, dedupe: null },
+      contents: "cumulative",
+      fields: [
+        { name: "_id", canonical: "idempotencyKey", source: "idempotencyKey", type: "string", role: "key" },
+        { name: "_loadedAt", canonical: "loadedAt", type: "datetime", format: "iso8601", timezone: "utc", role: "lineage" },
+        { name: "*", canonical: "raw", source: ".", type: "object", schemaRef: "envelope/1.0", pii: "likely" },
+      ],
+      quirks: ["nested-source", "detail-optional"],
+    }],
+  }) + "\n");
+  process.exit(0);
+}
+
+if (argv[0] === "--plugin-healthcheck") {
+  const checks = [];
+  const has = spawnSyncSpec("mongosh", ["--version"], { encoding: "utf8" });
+  const mongoshOk = has.status === 0;
+  checks.push({ name: "mongosh", ok: mongoshOk, severity: "required",
+    hint: mongoshOk ? "mongosh available"
+      : "MongoDB Shell (mongosh) をインストールしてください（brew install mongosh 等）" });
+  const ok = checks.every((c) => c.ok);
+  process.stdout.write(JSON.stringify({ ok, checks }) + "\n");
+  process.exit(ok ? 0 : 1);
+}
+
+// ── 契約バージョン ───────────────────────────────────────────────────
+if (process.env.IREPO_PLUGIN_API && process.env.IREPO_PLUGIN_API !== "1") {
+  console.error(`${PLUGIN}: unsupported IREPO_PLUGIN_API=${process.env.IREPO_PLUGIN_API} (supported: 1)`);
+  process.exit(11);
+}
+
+// ── query サブコマンド（ADC-1 / gemba-read/1.0・読み取り専用） ─────────
+// 共通部（envelope/時刻3形式/カーソル/フラグ解析）は lib/gemba-read.js（正本: plugins/lib/）。
+// ここにはストア固有部（mongosh 実行・フィルタ構築・record 復元・dest）だけを置く。
+if (argv[0] === "query") {
+  let G;
+  try { G = require("./lib/gemba-read.js"); }
+  catch {
+    console.error(JSON.stringify({ schemaVersion: "1.0", recordType: "error", contract: "gemba-read/1.0",
+      plugin: PLUGIN, code: "E_INTERNAL",
+      message: "gemba-read ライブラリが見つかりません（lib/gemba-read.js）。plugins/install.sh を再実行してください",
+      retryable: false }));
+    process.exit(1);
+  }
+  runQuery(argv.slice(1), G);   // 内部で process.exit。以降へは進まない。
+}
+
+// dest 記述子: ホストは --uri から userinfo を除去して採る（§4.4）。生資格情報を出さない。
+//   host あり → mongodb:<host>/<db>.<collection> / host 無し → mongodb:<db>.<collection>
+function uriHost(u) {
+  if (!u) return "";
+  try {
+    // mongodb:// と mongodb+srv:// は WHATWG URL がそのままは解さないので scheme を差し替えて host を取り出す
+    const swapped = String(u).replace(/^mongodb(\+srv)?:\/\//i, "http://");
+    const url = new URL(swapped);
+    return url.host; // userinfo は host に含まれない。複数ホスト指定時は最初の host:port
+  } catch {
+    const m = String(u).match(/^mongodb(?:\+srv)?:\/\/(?:[^@/]*@)?([^/?,]+)/i);
+    return m ? m[1] : "";
+  }
+}
+
+// mongosh をスクリプト経由で実行。read-only に find / countDocuments のみ呼ぶ（書込メソッドは一切呼ばない）。
+function runMongoshQuery(uri, scriptBody) {
+  return runMongoshScript(uri, scriptBody);
+}
+
+// mongosh の出力から「JSON 1行ずつ」を安定 parse する。print(JSON.stringify(...)) で各行を出す前提。
+// 接続診断やヘルパ行（"OK" 等）以外の JSON 行のみ拾う。
+function parseNdjsonLines(stdout) {
+  const out = [];
+  for (const line of String(stdout || "").split("\n")) {
+    const s = line.trim();
+    if (!s || (s[0] !== "{" && s[0] !== "[")) continue;
+    try { out.push(JSON.parse(s)); } catch { /* 非 JSON 行は無視 */ }
+  }
+  return out;
+}
+
+// mongosh の stderr/stdout から接続不能を判定（E_CONNECT 振り分け用）。
+function looksLikeConnError(text) {
+  return /MongoNetworkError|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|ServerSelection|connect failed|getaddrinfo|Authentication failed|MongoServerSelectionError|topology was destroyed|connection .*closed/i
+    .test(String(text || ""));
+}
+
+function runQuery(qargs, G) {
+  const { queryEnd, emitRow, queryError } = G.createReadKit(PLUGIN);
+  const opts = G.parseQueryArgs(qargs, { "--uri": "uri", "--db": "db", "--collection": "collection" }, queryError,
+    { "--native": { key: "native" }, "--native-timeout-ms": { key: "nativeTimeoutMs" } });
+  if (!opts.collection) opts.collection = "reports";
+
+  // dest はエラー時にも添えるため、引数検証より先に（生資格情報を含めずに）組む。
+  const host = uriHost(opts.uri);
+  const dest = host
+    ? `mongodb:${host}/${opts.db}.${opts.collection}`
+    : `mongodb:${opts.db}.${opts.collection}`;
+
+  if (!opts.uri) queryError("E_ARGS", "--uri <connection-string> is required", "読み取り対象の MongoDB 接続文字列", 2, dest);
+  if (!opts.db) queryError("E_ARGS", "--db <name> is required", "読み取り対象のデータベース", 2, dest);
+
+  // ネイティブクエリ（capability: native-query / 仕様 §9・T2）。find filter / aggregation pipeline を素通し。
+  if (opts.native != null) {
+    runNativeMongo(opts, dest, G, { queryEnd, emitRow, queryError });
+    return;
+  }
+
+  // ── フィルタ構築（§3.5）。時刻境界は lib が格納形式へ正規化済み（gte/lt → $gte/$lt） ──
+  //   loaded → _loadedAt(ISO 文字列) / updated → values.updateTime(slash) / registered → values.registTime(slash)
+  const timeField = opts.timeField === "updated" ? "values.updateTime"
+    : opts.timeField === "registered" ? "values.registTime" : "_loadedAt";
+  const filter = {};
+  const bounds = G.timeBounds(opts, timeField === "_loadedAt" ? "iso" : "slash", queryError, dest);
+  if (bounds) {
+    const range = {};
+    if (bounds.gte != null) range.$gte = bounds.gte;
+    if (bounds.lt != null) range.$lt = bounds.lt;   // 半開区間 [since, until)
+    filter[timeField] = range;
+  }
+  if (opts.deleted != null) filter.deleted = opts.deleted;
+  if (opts.ids && opts.ids.length) filter._id = { $in: opts.ids };
+  if (opts.itemIds.length) filter.itemId = { $in: opts.itemIds };
+
+  const timeFilter = G.buildTimeFilter(opts);
+
+  if (opts.countOnly) {
+    const script =
+      `const coll=db.getSiblingDB(${JSON.stringify(opts.db)}).getCollection(${JSON.stringify(opts.collection)});` +
+      `print(JSON.stringify({total: coll.countDocuments(${JSON.stringify(filter)})}));`;
+    const r = runMongoshQuery(opts.uri, script);
+    if (r.status !== 0) {
+      const text = (r.stderr || r.stdout || "").trim();
+      if (looksLikeConnError(text)) queryError("E_CONNECT", `mongosh: ${scrub(firstLine(text)) || "connection failed"}`, "--uri を確認。mongod が起動しているか確認", 1, dest);
+      queryError("E_INTERNAL", scrub(firstLine(text)) || "mongosh count failed", null, 1, dest);
+    }
+    const parsed = parseNdjsonLines(r.stdout);
+    const total = parsed.length && typeof parsed[parsed.length - 1].total === "number"
+      ? parsed[parsed.length - 1].total : 0;
+    const end = { count: 0, complete: true, total, nextCursor: null, dest, dedupeApplied: false };
+    if (timeFilter) end.timeFilter = timeFilter;
+    queryEnd(end);
+    process.exit(0);
+  }
+
+  // ── keyset ページング（_id 昇順・決定的）。cursor は base64 で不透明化（sqlite 同方式） ──
+  const pageFilter = { ...filter };
+  if (opts.cursor != null) {
+    const last = G.decodeCursor(opts.cursor);
+    if (last == null) queryError("E_CURSOR", "カーソルが不正です", "前回の query-end.nextCursor をそのまま渡してください", 2, dest);
+    // 既存 _id フィルタ（--ids 由来）と両立させるため $and で合成する。
+    pageFilter.$and = [...(pageFilter.$and || []), { _id: { $gt: last } }];
+  }
+
+  // find は read-only。sort {_id:1}・limit 件。各ドキュメントを EJSON で1行ずつ出す。
+  const findScript =
+    `const coll=db.getSiblingDB(${JSON.stringify(opts.db)}).getCollection(${JSON.stringify(opts.collection)});` +
+    `const cur=coll.find(${JSON.stringify(pageFilter)}).sort({_id:1}).limit(${opts.limit});` +
+    `cur.forEach(function(d){ print(EJSON.stringify(d)); });`;
+  const r = runMongoshQuery(opts.uri, findScript);
+  if (r.status !== 0) {
+    const text = (r.stderr || r.stdout || "").trim();
+    if (looksLikeConnError(text)) queryError("E_CONNECT", `mongosh: ${scrub(firstLine(text)) || "connection failed"}`, "--uri を確認。mongod が起動しているか確認", 1, dest);
+    queryError("E_INTERNAL", scrub(firstLine(text)) || "mongosh find failed", null, 1, dest);
+  }
+
+  const rows = parseNdjsonLines(r.stdout);
+  let lastKey = null;
+  for (const doc of rows) {
+    const key = doc._id;
+    lastKey = key;
+    const loadedAt = doc._loadedAt ?? null;
+    // record 復元: _id と _loadedAt を剥がしたものが元 envelope（§3.3）。
+    const record = {};
+    for (const k of Object.keys(doc)) {
+      if (k === "_id" || k === "_loadedAt") continue;
+      record[k] = doc[k];
+    }
+    let out = record;
+    if (!opts.raw && opts.fields) out = G.pickFields(record, opts.fields);
+    emitRow(key, loadedAt, opts.raw ? doc : out, opts.raw);
+  }
+  const complete = rows.length < opts.limit;
+  const end = {
+    count: rows.length, complete,
+    nextCursor: complete ? null : G.encodeCursor(lastKey),
+    dest, dedupeApplied: false,
+  };
+  if (timeFilter) end.timeFilter = timeFilter;
+  queryEnd(end);
+  process.exit(0);
+}
+
+// ── ネイティブクエリ read-only バリデータ（mongo・T2 / 仕様 §9）─────────────
+// find filter（object）または aggregation pipeline（array）を受ける。書込/JS実行を再帰拒否し、
+// pipeline は read-only stage の whitelist のみ許可（default-deny）。
+function validateReadOnlyMongo(raw) {
+  // pipeline で許可する read-only ステージ（default-deny・§9.3）。非掲載は拒否＝$lookup/$unionWith/
+  // $graphLookup/$documents（クロスコレクション）・$out/$merge（書込）・$collStats/$currentOp 等を弾く。
+  const ALLOWED_STAGES = new Set([
+    "$match", "$project", "$group", "$sort", "$limit", "$skip", "$count",
+    "$facet", "$bucket", "$bucketAuto", "$unwind", "$addFields", "$set", "$unset",
+    "$sortByCount", "$replaceRoot", "$replaceWith", "$sample",
+  ]);
+  let v;
+  try { v = JSON.parse(String(raw)); }
+  catch (e) { return { ok: false, reason: `JSON parse 失敗: ${e.message}` }; }
+  // 書込（$out/$merge）・JS実行（$where/$function/$accumulator）・運用系を再帰拒否。
+  const FORBIDDEN = new Set(["$out", "$merge", "$function", "$where", "$accumulator", "$listSessions", "$currentOp", "$planCacheStats"]);
+  let bad = null;
+  const scan = (o) => {
+    if (bad || !o || typeof o !== "object") return;
+    if (Array.isArray(o)) { for (const x of o) scan(x); return; }
+    for (const k of Object.keys(o)) { if (FORBIDDEN.has(k)) { bad = k; return; } scan(o[k]); }
+  };
+  scan(v);
+  if (bad) return { ok: false, reason: `${bad} は read-only では不可` };
+  if (Array.isArray(v)) {
+    // pipeline は許可ステージのみ（default-deny・仕様 §9.3）。$lookup/$unionWith/$graphLookup 等の
+    // クロスコレクション読み・運用系・書込ステージをまとめて弾く。
+    for (const stage of v) {
+      if (!stage || typeof stage !== "object" || Array.isArray(stage)) {
+        return { ok: false, reason: "各ステージはオブジェクトである必要があります" };
+      }
+      for (const k of Object.keys(stage)) {
+        if (!ALLOWED_STAGES.has(k)) {
+          return { ok: false, reason: `ステージ ${k} は許可されていません（read-only の許可ステージのみ・§9.3）` };
+        }
+      }
+    }
+    return { ok: true, kind: "pipeline", pipeline: v };
+  }
+  if (v && typeof v === "object") return { ok: true, kind: "find", filter: v };
+  return { ok: false, reason: "配列(aggregation pipeline) か オブジェクト(find filter) が必要" };
+}
+
+function runNativeMongo(opts, dest, G, kit) {
+  const { queryEnd, emitRow, queryError } = kit;
+  const v = validateReadOnlyMongo(opts.native);
+  if (!v.ok) {
+    queryError("E_ARGS", `native query rejected: ${v.reason}`,
+      "read-only の find filter / aggregation pipeline のみ（$out/$merge/$where/$function 不可・仕様 §9）", 2, dest);
+  }
+  let timeoutMs = parseInt(opts.nativeTimeoutMs ?? "", 10); // 実行タイムアウト（§9.6）
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 1) timeoutMs = 10000;
+  if (timeoutMs > 60000) timeoutMs = 60000;
+  const cap = opts.limit, byteCap = 1_000_000; // 行数・出力サイズ上限（§9.6）
+  const collExpr = `db.getSiblingDB(${JSON.stringify(opts.db)}).getCollection(${JSON.stringify(opts.collection)})`;
+
+  // mongosh スクリプト。maxTimeMS で server 側もタイムアウト。pipeline には $limit cap を付ける。
+  let script;
+  if (opts.countOnly) {
+    if (v.kind === "find") {
+      script = `const c=${collExpr};print(JSON.stringify({total:c.countDocuments(${JSON.stringify(v.filter)},{maxTimeMS:${timeoutMs}})}));`;
+    } else {
+      const p = [...v.pipeline, { $count: "total" }];
+      script = `const c=${collExpr};const a=c.aggregate(${JSON.stringify(p)},{maxTimeMS:${timeoutMs}}).toArray();print(JSON.stringify({total:a.length?a[0].total:0}));`;
+    }
+  } else {
+    // 行数(cap)＋出力サイズ(byteCap)を mongosh スクリプト内で打ち切る（親が 64MB buffer する前に止め、
+    // 巨大 $facet/幅広ドキュメントでの ENOBUFS を防ぐ・Codex #38 P2）。超過時は __TRUNCATED__ を出す。
+    const cursorExpr = v.kind === "find"
+      ? `c.find(${JSON.stringify(v.filter)}).limit(${cap}).maxTimeMS(${timeoutMs})`
+      : `c.aggregate(${JSON.stringify([...v.pipeline, { $limit: cap }])},{maxTimeMS:${timeoutMs}})`;
+    script = `const c=${collExpr};const cur=${cursorExpr};let b=0;`
+      + `while(cur.hasNext()){const d=cur.next();const s=EJSON.stringify(d);`
+      + `if(b+s.length>${byteCap}){print("__TRUNCATED__");break;}print(s);b+=s.length;}`;
+  }
+
+  // 別プロセス mongosh を timeout+SIGKILL で確実に打ち切る（client 側 backstop）。server maxTimeMS の少し後に。
+  // mongosh が実 .exe なら直接 spawn のため timeout が mongosh 本体に効く。.cmd の場合は cmd.exe しか
+  // kill されないが、スクリプトの maxTimeMS がサーバ側の実バウンドとして DB 作業を止める。
+  const r = runMongoshScript(opts.uri, script,
+    { timeout: timeoutMs + 2000, killSignal: "SIGKILL", maxBuffer: 64 * 1024 * 1024 });
+  if (r.signal === "SIGKILL" || (r.error && r.error.code === "ETIMEDOUT")) {
+    queryError("E_TIMEOUT", `native query exceeded ${timeoutMs}ms`, "より絞り込んだクエリにしてください（§9.6 リソースガード）", 1, dest);
+  }
+  // ENOBUFS（万一スクリプト内 cap をすり抜けて 64MB buffer 超）は E_INTERNAL にせず truncation として扱う。
+  const enobufs = r.error && r.error.code === "ENOBUFS";
+  if (!enobufs && r.status !== 0) {
+    const text = (r.stderr || r.stdout || "").trim();
+    if (looksLikeConnError(text)) queryError("E_CONNECT", `mongosh: ${scrub(firstLine(text)) || "connection failed"}`, "--uri を確認。mongod が起動しているか確認", 1, dest);
+    queryError("E_INTERNAL", `native exec failed: ${scrub(firstLine(text))}`, "find filter / pipeline と項目名を確認", 1, dest);
+  }
+
+  if (opts.countOnly) {
+    const parsed = parseNdjsonLines(r.stdout);
+    const total = parsed.length && typeof parsed[parsed.length - 1].total === "number" ? parsed[parsed.length - 1].total : 0;
+    queryEnd({ count: 0, complete: true, total, nextCursor: null, dest, dedupeApplied: false, native: true });
+    process.exit(0);
+  }
+  // 出力サイズはスクリプト内 byteCap で抑え済み。__TRUNCATED__ マーカー or ENOBUFS で打ち切りを判定。
+  let truncated = enobufs || String(r.stdout).includes("__TRUNCATED__");
+  const parsed = parseNdjsonLines(r.stdout); // マーカー("__TRUNCATED__")は非JSONなので除外される
+  let n = 0;
+  for (const doc of parsed) {
+    const key = doc._id != null ? String(doc._id) : `native:${n}`;
+    emitRow(key, doc._loadedAt ?? null, doc, true); // 任意形は raw で
+    n++;
+  }
+  if (!truncated && n >= cap) truncated = true; // $limit cap に達した＝まだあるかも
+  queryEnd({ count: n, complete: !truncated, truncated, nextCursor: null, dest, dedupeApplied: false, native: true });
+  process.exit(0);
+}
+
+function firstLine(s) { return String(s || "").split("\n").map((l) => l.trim()).filter(Boolean)[0] || ""; }
+// mongosh のエラー文に接続文字列が混ざることがある。userinfo をマスクしてから error に載せる（ADC-1 §6.2）。
+function scrub(s) { return String(s || "").replace(/(mongodb(\+srv)?:\/\/)[^@\s/]*@/gi, "$1****@"); }
+
+// ── 引数 ─────────────────────────────────────────────────────────────
+let uri = "", db = "", collection = "reports", dryRun = false;
+for (let i = 0; i < argv.length; i++) {
+  switch (argv[i]) {
+    case "--uri":        uri = argv[++i] ?? ""; break;
+    case "--db":         db = argv[++i] ?? ""; break;
+    case "--collection": collection = argv[++i] ?? "reports"; break;
+    case "--dry-run":    dryRun = true; break;
+    default: console.error(`unknown option: ${argv[i]}`); process.exit(2);
+  }
+}
+// dry-run は接続情報なしでも入力検証だけ行える（plugin verify が使う経路）
+if (!dryRun && (!uri || !db)) {
+  console.error("--uri and --db are required");
+  process.exit(2);
+}
+
+const jobId = `mongo-${new Date().toISOString().replace(/[-:T]/g, "").slice(0, 15)}-${process.pid}`;
+const dest = uri ? `mongodb:${db}.${collection}` : `mongodb:${collection}`;
+
+const receipt = (phase, count, failedCount, verified, extra = {}) => {
+  process.stdout.write(JSON.stringify({
+    schemaVersion: "1.0", recordType: "receipt", plugin: PLUGIN,
+    producedBy: { plugin: PLUGIN, version: VERSION },
+    phase, jobId, count, failedCount, verified, dest,
+    ...(dryRun ? { dryRun: true } : {}),
+    ...extra,
+  }) + "\n");
+};
+
+async function readStdin() {
+  const chunks = [];
+  for await (const c of process.stdin) chunks.push(c);
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+// mongosh をスクリプト経由で実行（配信書き込み）。stdin 渡しなので ARG_MAX 制約は無いが、
+// 1スクリプトの規模を抑えるため呼び出し側で従来どおりチャンク分割する。
+function runMongosh(scriptBody) {
+  return runMongoshScript(uri, scriptBody);
+}
+
+const CHUNK = 500; // 1回のスクリプト（stdin 渡し）に載せる最大ドキュメント数
+function chunked(arr, n) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
+}
+
+(async () => {
+  const text = await readStdin();
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+
+  const docs = [];
+  let trailer = null, envelopes = 0;
+  for (const line of lines) {
+    let obj;
+    try { obj = JSON.parse(line); } catch { docs.push({ _raw: line }); continue; }
+    if (obj && obj.schemaVersion) envelopes++;
+    if (obj && obj.recordType === "stream-end") { trailer = obj; continue; }
+    docs.push(obj);
+  }
+
+  // stream-end 照合（§2.6）
+  if (trailer) {
+    if (typeof trailer.count !== "number" || trailer.count !== docs.length) {
+      console.error(`❌ incomplete stream: trailer count=${trailer.count ?? "unreadable"} but received ${docs.length}`);
+      receipt("write", docs.length, docs.length, false);
+      process.exit(1);
+    }
+  } else if (envelopes > 0) {
+    console.error("❌ truncated stream: envelope records present but no stream-end trailer");
+    receipt("write", docs.length, docs.length, false);
+    process.exit(1);
+  }
+
+  // 各ドキュメントに _id（帳票IDキー）と取込時刻を付与
+  const now = new Date().toISOString();
+  const prepared = docs.map((d, i) => {
+    const key = d.idempotencyKey
+      ?? (d.itemId != null ? `report:${d.itemId}:rev${d.revNo ?? "?"}` : `${jobId}:${i}`);
+    return { ...d, _id: key, _loadedAt: now };
+  });
+
+  if (dryRun) {
+    receipt("write", prepared.length, 0, false);
+    console.error(`(dry-run) would upsert ${prepared.length} document(s) → ${db || "?"}.${collection}`);
+    process.exit(0);
+  }
+
+  // ── write 相: _id で upsert（bulkWrite replaceOne upsert:true）。500件ずつ ──
+  for (const batch of chunked(prepared, CHUNK)) {
+    const writeScript =
+      `const docs=${JSON.stringify(batch)};` +
+      `const coll=db.getSiblingDB(${JSON.stringify(db)}).getCollection(${JSON.stringify(collection)});` +
+      `const ops=docs.map(d=>({replaceOne:{filter:{_id:d._id},replacement:d,upsert:true}}));` +
+      `coll.bulkWrite(ops,{ordered:false});print("OK");`;
+    const w = runMongosh(writeScript);
+    if (w.status !== 0) {
+      console.error((w.stderr || w.stdout || "mongosh write failed").trim());
+      receipt("write", prepared.length, prepared.length, false);
+      process.exit(1);
+    }
+  }
+  receipt("write", prepared.length, 0, false);
+
+  // ── verify 相: 取込キーが全件存在するか読み戻す（500件ずつ照合） ──────
+  const ids = prepared.map((d) => d._id);
+  let found = 0, verifyErr = false;
+  for (const batch of chunked(ids, CHUNK)) {
+    const verifyScript =
+      `const ids=${JSON.stringify(batch)};` +
+      `const coll=db.getSiblingDB(${JSON.stringify(db)}).getCollection(${JSON.stringify(collection)});` +
+      `print(JSON.stringify({found: coll.countDocuments({_id:{$in:ids}})}));`;
+    const v = runMongosh(verifyScript);
+    if (v.status !== 0) { verifyErr = true; break; }
+    try { found += JSON.parse((v.stdout || "").trim().split("\n").pop()).found; } catch { verifyErr = true; }
+  }
+  const verified = !verifyErr && found === ids.length;
+  receipt("verify", prepared.length, verified ? 0 : prepared.length - found, verified, { verifiedDocs: found });
+  process.exit(verified ? 0 : 1);
+})().catch((e) => {
+  console.error(`${PLUGIN}: ${e.message}`);
+  receipt("write", 0, 0, false);
+  process.exit(1);
+});
