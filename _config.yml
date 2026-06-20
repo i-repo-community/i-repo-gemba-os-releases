@@ -14,10 +14,12 @@ search_enabled: true
 include:
   - "docs"
 
-# Jekyll が無視するもの（配布スクリプトはサイトに混ぜない）
+# Jekyll が無視するもの（_site に出力しない）。
+# 注意: install.sh / install.ps1 は **exclude しない**。これらはワンライン導入
+#   （curl -fsSL https://i-repo-community.github.io/.../install.sh | bash）の配信元で、
+#   exclude すると Pages から 404 になる。フロントマター（先頭が #!/usr/bin/env …）が無いので
+#   Jekyll は素の静的ファイルとして /install.sh にそのまま出力し、nav・検索には現れない。
 exclude:
-  - install.ps1
-  - install.sh
   - README.md
   - Gemfile
   - vendor
