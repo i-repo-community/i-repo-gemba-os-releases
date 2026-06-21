@@ -274,11 +274,17 @@ curl -fsSL https://i-repo-community.github.io<span class="o">/i-repo-gemba-os-re
 (function(){
   var REPO='i-repo-community/i-repo-gemba-os-releases';
   var RELEASES='https://github.com/'+REPO+'/releases/latest';
-  var ua=(navigator.userAgent||'')+' '+(navigator.platform||'');
-  var os=/Mac/i.test(ua)?'mac':(/Win/i.test(ua)?'win':'other');
+  var uaRaw=navigator.userAgent||'';
+  var plat=navigator.platform||'';
+  var ua=uaRaw+' '+plat;
+  // iPadOS 13+ は UA 上 "Macintosh" を名乗るため maxTouchPoints で判別する（Mac はタッチ非対応＝0）。
+  // iPhone/iPod/Android も含め、スマホ・タブレットは（デスクトップアプリのため）非対応扱いにする。
+  var isIOS=/iPhone|iPad|iPod/i.test(uaRaw)||(/Mac/i.test(plat)&&navigator.maxTouchPoints>1);
+  var isMobile=isIOS||/Android/i.test(uaRaw);
+  var os=isMobile?'mobile':(/Mac/i.test(ua)?'mac':(/Win/i.test(ua)?'win':'other'));
   document.querySelectorAll('[data-os-card]').forEach(function(c){ if(c.getAttribute('data-os-card')===os) c.setAttribute('data-active','1'); });
   var h=document.getElementById('osHint');
-  if(h) h.innerHTML = os==='mac'?'→ 端末は <b>macOS</b> のようです':os==='win'?'→ 端末は <b>Windows</b> のようです':'';
+  if(h) h.innerHTML = os==='mobile'?'→ スマホ・タブレットは非対応です。<b>Windows / macOS の PC</b> でご利用ください':os==='mac'?'→ 端末は <b>macOS</b> のようです':os==='win'?'→ 端末は <b>Windows</b> のようです':'';
   var mq=document.getElementById('mq'); if(mq) mq.parentElement.insertAdjacentHTML('beforeend', mq.outerHTML.replace('id="mq"',''));
   var rules=[{id:'dl-win',re:/x64-setup\.exe$/i},{id:'dl-win-online',re:/x64-setup-online\.exe$/i},{id:'dl-mac',re:/universal\.dmg$/i}];
   function fb(){ document.querySelectorAll('.dl-btn').forEach(function(a){ a.href=RELEASES; a.classList.remove('is-loading'); }); }
