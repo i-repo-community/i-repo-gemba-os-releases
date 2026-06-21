@@ -30,11 +30,9 @@ nav_order: 2
 
 ## プラグインの更新
 
-新しいアプリ版で**同梱プラグインが新しくなっている**場合は、[初回セットアップ](manual-setup.html)と
-同じインストールコマンドを再実行すると、プラグインも最新になります。
-
-- Windows: `powershell -ExecutionPolicy Bypass -File .\plugins\install.ps1`
-- macOS / Linux: `./plugins/install.sh`
+新しいアプリ版で**同梱プラグインが新しくなっている**場合は、[プラグイン](screen-plugins.html)画面の上部に
+**「📦 同梱プラグインに更新があります」** と表示されます。**「⤴ 同梱を更新」ボタン**を押すだけで最新になります
+（ダウンロードやコマンドは不要）。
 
 > フロー一覧に「**版変更**」と出るのは、抽出プラグインが更新されたお知らせです。対処は
 > [フロー作成 ＞「版変更」と表示されたとき](screen-flows.html#version-changed) を参照してください。
