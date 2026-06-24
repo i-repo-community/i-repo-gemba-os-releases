@@ -44,7 +44,7 @@ async function loadBuiltins() {
 }
 
 const PLUGIN = "i-repo-archive";
-const VERSION = "0.5.0";
+const VERSION = "0.5.7";
 const PLUGIN_API = "1";
 const defaultArchiveRoot = () => join(homedir(), ".i-repo", "archives");
 
@@ -56,7 +56,7 @@ if (arg0 === "--plugin-schema") {
   // with subcommand bindings — GUIs render their forms from this declaration.
   console.log(JSON.stringify({
     pluginApi: [PLUGIN_API], schemaVersions: ["1.0"], recordTypes: [],
-    name: PLUGIN, version: "0.5.0",
+    name: PLUGIN, version: VERSION,
     description: "帳票を bundle 化して保管：ローカル/ファイルサーバー、または S3 / GCS / Azure Blob へ配信（create=取得、push-*=配信）",
     phases: ["write", "verify"],
     platforms: ["macos", "linux", "windows"],
@@ -94,6 +94,14 @@ if (arg0 === "--plugin-schema") {
         description: "アーカイブ bundle を Azure Blob Storage へ転送（クラウド・要 az CLI）" },
       { name: "push-local", input: ["dir"],
         description: "アーカイブ bundle を指定フォルダ/ファイルサーバー（ネットワーク共有）へ保管（外部CLI不要）" },
+      // 取り戻し（read-only）: クラウドに着地した bundle をローカルへダウンロードするだけ。
+      // mode:"read"・destructive:false。ストアへ write/delete は一切しない（cp / download-batch のみ）。
+      { name: "pull-s3", input: ["none"], mode: "read", output: ["files"], destructive: false,
+        description: "S3 のアーカイブ bundle をローカルへ取得（読み取り専用・cp のみ）" },
+      { name: "pull-gcs", input: ["none"], mode: "read", output: ["files"], destructive: false,
+        description: "Google Cloud Storage のアーカイブ bundle をローカルへ取得（読み取り専用・cp のみ）" },
+      { name: "pull-azure", input: ["none"], mode: "read", output: ["files"], destructive: false,
+        description: "Azure Blob のアーカイブ bundle をローカルへ取得（読み取り専用・download-batch のみ）" },
     ],
     params: [
       // create — host 管理（filter なし）: --out（出力先）, --endpoint/--user/--password（認証）,
@@ -164,6 +172,10 @@ if (arg0 === "--plugin-schema") {
       { name: "--to", type: "string", required: true, subcommand: "push-s3",
         label: "S3 destination", placeholder: "s3://bucket/prefix",
         description: "S3 destination for the archive bundle" },
+      { name: "--prefix", type: "string", subcommand: "push-s3", filter: false,
+        label: "保存先サブパス（任意）", placeholder: "{flow}/{date}/{batchId}",
+        tokens: ["{batchId}", "{date}", "{datetime}", "{flow}"],
+        description: "<--to>/ 配下の実行ごとフォルダ名。未指定なら batchId(UUID)。下のチップで差し込み可（{date}=YYYY-MM-DD, {datetime}=YYYYMMDDTHHMMSS, {flow}=フロー名）。区切りは途中の / だけ（先頭/末尾の / は不要）。安全な相対パスへ無害化（.. ・scheme 不可）。確実な取り戻しは {datetime} か {batchId} を含める（{date} だけだと同日再実行で同フォルダに混ざる）" },
       { name: "--cleanup", type: "boolean", subcommand: "push-s3", destructive: true,
         label: "Clean up local archive",
         description: "Delete the local archive directory after the upload is verified" },
@@ -171,6 +183,10 @@ if (arg0 === "--plugin-schema") {
       { name: "--to", type: "string", required: true, subcommand: "push-gcs",
         label: "GCS destination", placeholder: "gs://bucket/prefix",
         description: "Google Cloud Storage destination for the archive bundle" },
+      { name: "--prefix", type: "string", subcommand: "push-gcs", filter: false,
+        label: "保存先サブパス（任意）", placeholder: "{flow}/{date}/{batchId}",
+        tokens: ["{batchId}", "{date}", "{datetime}", "{flow}"],
+        description: "<--to>/ 配下の実行ごとフォルダ名。未指定なら batchId(UUID)。下のチップで差し込み可（{date}=YYYY-MM-DD, {datetime}=YYYYMMDDTHHMMSS, {flow}=フロー名）。区切りは途中の / だけ（先頭/末尾の / は不要）。安全な相対パスへ無害化（.. ・scheme 不可）。確実な取り戻しは {datetime} か {batchId} を含める（{date} だけだと同日再実行で同フォルダに混ざる）" },
       { name: "--cleanup", type: "boolean", subcommand: "push-gcs", destructive: true,
         label: "Clean up local archive",
         description: "Delete the local archive directory after the upload is verified" },
@@ -184,6 +200,10 @@ if (arg0 === "--plugin-schema") {
       { name: "--connection-string", type: "string", subcommand: "push-azure", secret: true, envVar: "AZURE_STORAGE_CONNECTION_STRING",
         label: "接続文字列（任意）",
         description: "ストレージアカウント接続文字列。値は argv ではなく環境変数で az に渡す" },
+      { name: "--prefix", type: "string", subcommand: "push-azure", filter: false,
+        label: "保存先サブパス（任意）", placeholder: "{flow}/{date}/{batchId}",
+        tokens: ["{batchId}", "{date}", "{datetime}", "{flow}"],
+        description: "<--to>/ 配下の実行ごとフォルダ名。未指定なら batchId(UUID)。下のチップで差し込み可（{date}=YYYY-MM-DD, {datetime}=YYYYMMDDTHHMMSS, {flow}=フロー名）。区切りは途中の / だけ（先頭/末尾の / は不要）。安全な相対パスへ無害化（.. ・scheme 不可）。確実な取り戻しは {datetime} か {batchId} を含める（{date} だけだと同日再実行で同フォルダに混ざる）" },
       { name: "--cleanup", type: "boolean", subcommand: "push-azure", destructive: true,
         label: "Clean up local archive",
         description: "Delete the local archive directory after the upload is verified" },
@@ -192,9 +212,24 @@ if (arg0 === "--plugin-schema") {
         label: "保存先フォルダ/ファイルサーバー",
         placeholder: "/Volumes/share/archives ・ \\\\server\\share\\archives ・ D:\\archives",
         description: "ローカル/ネットワーク共有の保存先パス（マウント済み共有を含む）" },
+      { name: "--prefix", type: "string", subcommand: "push-local", filter: false,
+        label: "保存先サブパス（任意）", placeholder: "{flow}/{date}/{batchId}",
+        tokens: ["{batchId}", "{date}", "{datetime}", "{flow}"],
+        description: "<--to>/ 配下の実行ごとフォルダ名。未指定なら batchId(UUID)。下のチップで差し込み可（{date}=YYYY-MM-DD, {datetime}=YYYYMMDDTHHMMSS, {flow}=フロー名）。区切りは途中の / だけ（先頭/末尾の / は不要）。安全な相対パスへ無害化（.. ・scheme 不可）。確実な取り戻しは {datetime} か {batchId} を含める（{date} だけだと同日再実行で同フォルダに混ざる）" },
       { name: "--cleanup", type: "boolean", subcommand: "push-local", destructive: true,
         label: "Clean up local archive",
         description: "Delete the staged local archive directory after the copy is verified" },
+      // pull-*（取り戻し・host 管理。GUI 配信フォームには出ない＝mode:read。Rust が固定引数で渡す）
+      { name: "--from", type: "string", subcommand: "pull-s3", description: "取得元 s3://bucket/prefix（着地した bundle のルート）" },
+      { name: "--out", type: "string", subcommand: "pull-s3", description: "取得先ローカルディレクトリ" },
+      { name: "--from", type: "string", subcommand: "pull-gcs", description: "取得元 gs://bucket/prefix" },
+      { name: "--out", type: "string", subcommand: "pull-gcs", description: "取得先ローカルディレクトリ" },
+      { name: "--from", type: "string", subcommand: "pull-azure", description: "取得元 https://<account>.blob.core.windows.net/<container>/<prefix>" },
+      { name: "--out", type: "string", subcommand: "pull-azure", description: "取得先ローカルディレクトリ" },
+      { name: "--sas", type: "string", subcommand: "pull-azure", secret: true, envVar: "AZURE_STORAGE_SAS_TOKEN",
+        description: "SAS トークン（任意。値は env で az に渡す）" },
+      { name: "--connection-string", type: "string", subcommand: "pull-azure", secret: true, envVar: "AZURE_STORAGE_CONNECTION_STRING",
+        description: "接続文字列（任意。値は env で az に渡す）" },
       // common to all subcommands
       { name: "--dry-run", type: "boolean", label: "Dry run", description: "Validate without writing" },
     ],
@@ -291,6 +326,9 @@ async function main() {
   if (command === "push-gcs") return pushArchiveBundle(parsePushArgs(rest, GCS_BACKEND), GCS_BACKEND);
   if (command === "push-azure") return pushArchiveBundle(parsePushArgs(rest, AZURE_BACKEND), AZURE_BACKEND);
   if (command === "push-local") return pushArchiveBundle(parsePushArgs(rest, LOCAL_BACKEND), LOCAL_BACKEND);
+  if (command === "pull-s3") return pullArchiveBundle(parsePullArgs(rest, S3_BACKEND), S3_BACKEND);
+  if (command === "pull-gcs") return pullArchiveBundle(parsePullArgs(rest, GCS_BACKEND), GCS_BACKEND);
+  if (command === "pull-azure") return pullArchiveBundle(parsePullArgs(rest, AZURE_BACKEND), AZURE_BACKEND);
   usage();
   process.exitCode = command === undefined || command === "--help" || command === "-h" ? 0 : 2;
 }
@@ -436,7 +474,7 @@ function normalizeLocalDest(to) {
 
 function parsePushArgs(argv, backend) {
   const label = `push-${backend.store}`;
-  const spec = { "--to": "value", "--dry-run": "flag", "--cleanup": "flag" };
+  const spec = { "--to": "value", "--prefix": "value", "--dry-run": "flag", "--cleanup": "flag" };
   // Azure は認証 secret を受ける（値は argv に出さず env で az に渡す。buildPushEnv 参照）。
   if (backend.store === "azure") { spec["--sas"] = "value"; spec["--connection-string"] = "value"; }
   const o = parseArgv(argv, spec, label);
@@ -454,7 +492,7 @@ function parsePushArgs(argv, backend) {
   // Azure は blob エンドポイント URL の構造（account/container/prefix）まで parse 時に検証する
   // （dry-run でも不正 URL を早期に弾く。upload 時の parseAzureTo と同基準）。
   if (backend.store === "azure") parseAzureTo(o.to);
-  const out = { archiveDir: o._[0], to: o.to, dryRun: Boolean(o["dry-run"]), cleanup: Boolean(o.cleanup) };
+  const out = { archiveDir: o._[0], to: o.to, prefix: o.prefix, dryRun: Boolean(o["dry-run"]), cleanup: Boolean(o.cleanup) };
   if (backend.store === "azure") {
     out.azure = true;
     // フラグ未指定なら env から拾う（host の secret env 注入＝envVar 宣言と整合）。
@@ -604,9 +642,9 @@ async function createArchive(options) {
 // --cleanup（verified 時のみ削除）」を担い、各 backend は store 固有の「アップロード・存在
 // 確認・dest 計算」だけを実装する。push-s3 の確立パターンを s3/gcs/azure へ一般化したもの。
 //
-// 検証状況: s3 は既存どおり実運用検証済み。gcs は gcloud のパス意味論をローカルで確認済み
-// （cp --recursive <dir> <to> は basename を付与し <to>/<batchDir>/… を作る）だが実アップ
-// ロード検証は環境依存。azure は az CLI 不在のため実行未検証（コマンド配線は az docs 準拠）。
+// 検証状況: s3 は既存どおり実運用検証済み。gcs は cp の非決定的なディレクトリ扱い（宛先既存で UUID 入れ子）を
+// 避けるため rsync（内容を決定的に同期・--delete 無し）に変更し、--prefix 込みの up/down＋verify 通過を実機
+// gcloud で確認済み。azure は az CLI 不在のため実行未検証（コマンド配線は az docs 準拠）。
 
 // スキーム非依存のスラッシュ結合（s3:// / gs:// / https:// すべてに使える）。
 function joinUri(prefix, child) {
@@ -627,9 +665,9 @@ function buildPushEnv(options) {
 
 const S3_BACKEND = {
   store: "s3", scheme: "s3://", prefixKey: "s3Prefix", receiptName: "push-s3.json",
-  async upload(archivePath, to, batchDir, env) {
-    // aws s3 cp <dir> <dest> --recursive は <dir> の中身を <dest> 直下へ置く。
-    const destination = joinUri(to, batchDir);
+  async upload(archivePath, to, destSub, env) {
+    // aws s3 cp <dir> <dest> --recursive は <dir> の中身を <dest> 直下へ置く（明示宛先）。
+    const destination = joinUri(to, destSub);
     await runCommand("aws", ["s3", "cp", archivePath, destination, "--recursive"], { env, captureStdout: false });
     return destination;
   },
@@ -640,15 +678,22 @@ const S3_BACKEND = {
     const r = await runCommand("aws", ["s3", "ls", joinUri(destination, `receipts/${this.receiptName}`)], { env, captureStdout: true }).catch(() => null);
     return r !== null && r.stdout.trim().length > 0;
   },
+  // 取り戻し（read-only）: from(リモート)→out(ローカル)。固定 argv「cp … --recursive」のみ＝書込/削除コマンドは呼ばない。
+  async download(from, out, env) {
+    await runCommand("aws", ["s3", "cp", from, out, "--recursive"], { env, captureStdout: false });
+  },
 };
 
 const GCS_BACKEND = {
   store: "gcs", scheme: "gs://", prefixKey: "gcsPrefix", receiptName: "push-gcs.json",
-  async upload(archivePath, to, batchDir, env) {
-    // gcloud storage cp --recursive <dir> <to> は basename(<dir>)=batchDir を付与して
-    // <to>/<batchDir>/… を作る（ローカル検証で確認）。dest はそれと一致させる。
-    await runCommand("gcloud", ["storage", "cp", "--recursive", archivePath, to], { env, captureStdout: false });
-    return joinUri(to, batchDir);
+  async upload(archivePath, to, destSub, env) {
+    // gcloud storage cp --recursive はディレクトリの扱いが非決定的（宛先が既存なら basename(<dir>)=UUID を
+    // 末尾に入れ子化、新規なら中身を展開）で、--prefix の任意フォルダ名と相性が悪い（実機で UUID 入れ子を確認）。
+    // → 内容を決定的に同期する rsync に変更（s3/azure の「明示宛先へ内容コピー」と等価）。--delete は付けない
+    //   ので既存オブジェクトを消さない（追加/更新のみ）。
+    const destination = joinUri(to, destSub);
+    await runCommand("gcloud", ["storage", "rsync", "--recursive", archivePath, destination], { env, captureStdout: false });
+    return destination;
   },
   async uploadReceipt(receiptPath, destination, env) {
     await runCommand("gcloud", ["storage", "cp", receiptPath, joinUri(destination, `receipts/${this.receiptName}`)], { env, captureStdout: false });
@@ -656,6 +701,11 @@ const GCS_BACKEND = {
   async verify(destination, env) {
     const r = await runCommand("gcloud", ["storage", "ls", joinUri(destination, `receipts/${this.receiptName}`)], { env, captureStdout: true }).catch(() => null);
     return r !== null && r.stdout.trim().length > 0;
+  },
+  // 取り戻し（read-only）。rsync でリモート(from)の内容をローカル(out)へ決定的に同期する。--delete 無し＝
+  // ストアもローカルも余分を消さない。from→out（リモート→ローカル）なのでストアは読むだけ＝read-only。
+  async download(from, out, env) {
+    await runCommand("gcloud", ["storage", "rsync", "--recursive", from, out], { env, captureStdout: false });
   },
 };
 
@@ -674,14 +724,14 @@ function parseAzureTo(to) {
 
 const AZURE_BACKEND = {
   store: "azure", scheme: "https://", prefixKey: "azurePrefix", receiptName: "push-azure.json",
-  async upload(archivePath, to, batchDir, env) {
+  async upload(archivePath, to, destSub, env) {
     const { account, container, prefix } = parseAzureTo(to);
-    const destPath = [prefix, batchDir].filter(Boolean).join("/");
+    const destPath = [prefix, destSub].filter(Boolean).join("/");
     // upload-batch は <source> の中身を相対パス保持で <container>/<destPath>/ へ置く。
     await runCommand("az", ["storage", "blob", "upload-batch", "--account-name", account,
       "--destination", container, "--destination-path", destPath, "--source", archivePath, "--overwrite"],
       { env, captureStdout: false });
-    return joinUri(to, batchDir);
+    return joinUri(to, destSub);
   },
   async uploadReceipt(receiptPath, destination, env) {
     const { account, container, prefix } = parseAzureTo(destination);
@@ -698,6 +748,14 @@ const AZURE_BACKEND = {
     if (r === null) return false;
     try { return JSON.parse(r.stdout).exists === true; } catch { return false; }
   },
+  // 取り戻し（read-only）。download-batch で <container>/<prefix>/* を out へ（相対パス保持）。固定 argv「download-batch」のみ。
+  async download(from, out, env) {
+    const { account, container, prefix } = parseAzureTo(from);
+    const pattern = prefix ? `${prefix}/*` : "*";
+    await runCommand("az", ["storage", "blob", "download-batch", "--account-name", account,
+      "--source", container, "--destination", out, "--pattern", pattern],
+      { env, captureStdout: false });
+  },
 };
 
 // push-local（ローカル/ファイルサーバー）: 外部CLI不要・Node fs で再帰コピーする。
@@ -706,9 +764,16 @@ const AZURE_BACKEND = {
 const LOCAL_BACKEND = {
   store: "local", scheme: "", prefixKey: "localPrefix", receiptName: "push-local.json",
   // dry-run の dest プレビュー用（共通スケルトンが joinUri の代わりに使う）。
-  joinDest(to, batchDir) { return join(to, batchDir); },
-  async upload(archivePath, to, batchDir, _env) {
-    const destination = join(to, batchDir);
+  joinDest(to, destSub) { return join(to, destSub); },
+  async upload(archivePath, to, destSub, _env) {
+    const destination = join(to, destSub);
+    // 越境ガード（多層防御）: destSub は resolvePrefixTemplate で相対パス保証済みだが、結合後も
+    // --to 配下に収まることを resolve で確認する（path.join が外へ出る事故を二重で防ぐ・Cursor P1）。
+    const root = resolve(to);
+    const resolved = resolve(destination);
+    if (resolved !== root && !resolved.startsWith(root + sep)) {
+      throw new Error(`push-local: resolved destination escapes --to (${destination}).`);
+    }
     await fsp.mkdir(destination, { recursive: true });
     // fs.cp(src, dest, {recursive}) は src ツリーを dest にミラーする（dest が src の複製になる）。
     await fsp.cp(archivePath, destination, { recursive: true });
@@ -735,11 +800,14 @@ async function pushArchiveBundle(options, backend) {
   const archiveReceipt = await readJsonObject(join(archivePath, "receipts", "archive.json"));
   const count = typeof archiveReceipt.count === "number" ? archiveReceipt.count : 0;
   const batchDir = basename(archivePath);
+  // 宛先サブパス。--prefix 指定時はテンプレ解決後の安全な相対パスが「実行ごとフォルダ」を置き換える。
+  // 未指定なら従来どおり batchDir(UUID)。destSub は宛先専用で、ローカル dir 名(batchDir)とは分離する。
+  const destSub = options.prefix ? resolvePrefixTemplate(options.prefix, { batchDir }) : batchDir;
   const env = buildPushEnv(options);
 
   if (options.dryRun) {
     // local は OS パス結合（joinDest）、cloud は scheme ベースの joinUri。
-    const previewDest = backend.joinDest ? backend.joinDest(options.to, batchDir) : joinUri(options.to, batchDir);
+    const previewDest = backend.joinDest ? backend.joinDest(options.to, destSub) : joinUri(options.to, destSub);
     emitReceipt("write", jobId, count, 0, false, { archivePath, [backend.prefixKey]: previewDest, dryRun: true });
     return;
   }
@@ -750,7 +818,7 @@ async function pushArchiveBundle(options, backend) {
   await fsp.rm(receiptPath, { force: true });
   // Upload the bundle first; only after the recursive copy succeeds do we
   // write the push receipt and upload it as a final, separate object.
-  const destination = await backend.upload(archivePath, options.to, batchDir, env);
+  const destination = await backend.upload(archivePath, options.to, destSub, env);
   emitReceipt("write", jobId, count, 0, false, { archivePath, [backend.prefixKey]: destination });
 
   await writeJsonFile(receiptPath, { jobId, count, archivePath, [backend.prefixKey]: destination, pushedAt: new Date().toISOString() });
@@ -782,6 +850,49 @@ async function pushArchiveBundle(options, backend) {
     }
   }
   emitReceipt("verify", jobId, count, verified ? 0 : count, verified, extras);
+  if (!verified) process.exitCode = 1;
+}
+
+// ── pull（取り戻し・read-only）: クラウドの bundle をローカルへ DL するだけ。store へ write/delete しない。
+function parsePullArgs(argv, backend) {
+  const label = `pull-${backend.store}`;
+  const spec = { "--from": "value", "--out": "value" };
+  if (backend.store === "azure") { spec["--sas"] = "value"; spec["--connection-string"] = "value"; }
+  const o = parseArgv(argv, spec, label);
+  if (!o.from) throw new Error(`${label} requires --from ${backend.scheme || "<source>"}…`);
+  if (!o.out) throw new Error(`${label} requires --out <local-dir>.`);
+  // read-only ガード（対称）: from は必ずリモート(scheme 一致)、out は必ずローカル(scheme 無し)。
+  // 引数逆転（local を source に／remote を dest に）＝誤アップロード/上書きを両方向で防ぐ。
+  if (backend.scheme && !o.from.startsWith(backend.scheme)) {
+    throw new Error(`${label}: --from must start with "${backend.scheme}".`);
+  }
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(o.out)) {
+    throw new Error(`${label}: --out must be a local directory (no scheme).`);
+  }
+  if (backend.store === "azure") parseAzureTo(o.from);
+  const out = { from: o.from, out: o.out };
+  if (backend.store === "azure") {
+    out.azure = true;
+    out.sas = o.sas || process.env.AZURE_STORAGE_SAS_TOKEN || "";
+    out.connectionString = o["connection-string"] || process.env.AZURE_STORAGE_CONNECTION_STRING || "";
+  }
+  return out;
+}
+
+async function pullArchiveBundle(options, backend) {
+  const jobId = `pull-${timestampTag()}-${process.pid}`;
+  const out = resolve(options.out);
+  await fsp.mkdir(out, { recursive: true });
+  const env = buildPushEnv(options); // 認証は push と同形（aws/gcloud は ambient、azure は SAS/接続文字列を env で）。
+  await backend.download(options.from, out, env); // 固定 argv（cp / download-batch のみ）。
+  // 取得成功 = マニフェストが落ちていること（read-back の土台）。無ければ取得失敗 or 空 prefix。
+  const manifest = join(out, "manifests", "reports.ndjson");
+  const verified = await fsp.stat(manifest).then((s) => s.size > 0).catch(() => false);
+  process.stdout.write(JSON.stringify({
+    schemaVersion: "1.0", recordType: "receipt", plugin: PLUGIN,
+    producedBy: { plugin: PLUGIN, version: VERSION },
+    phase: "read", jobId, verified, source: options.from, out,
+  }) + "\n");
   if (!verified) process.exitCode = 1;
 }
 
@@ -1046,18 +1157,22 @@ function buildListArgs(filters) {
 }
 
 /**
- * Download one artifact letting the CLI pick the filename — the CLI uses the
- * server-provided name (Content-Disposition = ファイル自動出力設定の名称) and
- * falls back to report-<id>.<ext>. We run it in a fresh temp dir and read the
- * single file that appears, so the chosen name reaches us without parsing any
- * human-facing output.
+ * Download one artifact into a fresh temp dir and return the single file that
+ * appears. We always force the CLI's default name `report-<id>.<ext>` via -o
+ * (never let it derive the name from the server):
+ *   - i-repo CLI は RFC5987 `filename*=UTF-8''…` を復号せず生の %XX 名で `.part` を作るため、
+ *     日本語1文字が9バイト（`%E3%83%86`）に膨張し、長い帳票名だとファイル名がファイルシステムの
+ *     上限（NAME_MAX 255B）を超えて ENAMETOOLONG で落ちる（実機報告）。既定名に固定して根本回避する。
+ *   - downloadedName が chooseArtifactFileName の cliFallback と一致するので、最終名は manifest の
+ *     帳票名称から `<帳票ID>_<帳票名称>.<ext>` で統一的に組める（サーバの自動出力設定名は使わない）。
  */
 async function downloadArtifactNamed(credentials, reportId, artifact) {
   const tempDir = await fsp.mkdtemp(join(tmpdir(), "irepo-archive-dl-"));
   try {
+    const safeName = `report-${reportId}${fileExtensionFor(artifact)}`;
     await runCommand(
       iRepoBin(),
-      ["rep", "download", reportId, "--file-type", artifact],
+      ["rep", "download", reportId, "--file-type", artifact, "-o", join(tempDir, safeName)],
       { env: buildIRepoEnv(credentials), captureStdout: true, cwd: tempDir },
     );
     const entries = await fsp.readdir(tempDir);
@@ -1211,10 +1326,16 @@ function runCommand(command, args, options) {
  *                  帳票名のみ等、ID を含まない場合に起こる)
  */
 function chooseArtifactFileName(downloadedName, ctx) {
-  const dot = downloadedName.lastIndexOf(".");
-  let stem = dot > 0 ? downloadedName.slice(0, dot) : downloadedName;
-  const ext = dot > 0 ? downloadedName.slice(dot) : fileExtensionFor(ctx.artifact);
+  // サーバ提供名（Content-Disposition = ファイル自動出力設定の名称）が percent-encoded のことがある:
+  // i-repo CLI が RFC5987 `filename*=UTF-8''…` を復号せずに書くと、Windows で帳票名が
+  // `%E5%85%AB%E7%8E%8B%E5%AD%90…pdf` のようなファイル名になる（実機報告）。表示名は復号して
+  // 元の名前（日本語等）へ戻す。%XX を含まない名前・不正な % 列はそのまま（decodeServerFileName 参照）。
+  const serverName = decodeServerFileName(downloadedName);
+  const dot = serverName.lastIndexOf(".");
+  let stem = dot > 0 ? serverName.slice(0, dot) : serverName;
+  let ext = dot > 0 ? serverName.slice(dot) : fileExtensionFor(ctx.artifact);
 
+  // fallback 判定は CLI が書いた生の名前で行う（report-<id>.<ext> は % を含まないので復号の影響なし）。
   const cliFallback = `report-${ctx.reportId}${fileExtensionFor(ctx.artifact)}`;
   if (downloadedName === cliFallback) {
     // サーバ名なし → manifest の帳票名称から組み立てる (日本語は保持)。
@@ -1229,7 +1350,18 @@ function chooseArtifactFileName(downloadedName, ctx) {
     stem = cleanName
       ? `${sanitizeFileName(ctx.reportId)}_${cleanName}`
       : sanitizeFileName(ctx.reportId);
+  } else {
+    // サーバ提供名: 復号後を無害化する。**stem だけでなく ext も**潰すのが要点 — 復号で `%2F`→`/` や
+    // `%2E%2E`→`..` が ext 側に入ると `documents/` 外への書き込み（パストラバーサル）になり得るため
+    // （Cursor P1）。sanitizeUnicodeFileName は区切り(/ \)・禁止文字を `_` 化し、末尾の `.`/空白を除く
+    // ので、`.`/`..` は空文字になる（日本語は保持）。
+    stem = sanitizeUnicodeFileName(stem);
+    ext = sanitizeUnicodeFileName(ext);
   }
+  // `..`/`.` などが全て削れて空になった basename は親ディレクトリを指すので、id ベースへ倒して
+  // 必ず `documents/` 内の正規ファイル名にする（区切りは上で除去済み＝以降は単一コンポーネント）。
+  if (!stem) stem = sanitizeFileName(ctx.reportId);
+  if (!ext || ext === ".") ext = fileExtensionFor(ctx.artifact);
 
   if (ctx.needsRev) stem += `-rev${sanitizeFileName(ctx.revNo)}`;
   if (ctx.multipleArtifacts) stem += `-${sanitizeFileName(ctx.artifact)}`;
@@ -1250,6 +1382,20 @@ function chooseArtifactFileName(downloadedName, ctx) {
  */
 function sanitizeUnicodeFileName(value) {
   return value.replace(/[/\\<>:"|?*\u0000-\u001f\u007f]/g, "_").replace(/[. ]+$/, "");
+}
+
+/**
+ * サーバ提供のファイル名が percent-encoded（RFC5987 `filename*=UTF-8''…` を CLI が復号せず書く）の
+ * とき復号して元の名前（日本語等）へ戻す。Windows で帳票名が `%E5%85%AB…` のファイル名になる問題への対応。
+ * `%XX` を含まない名前はそのまま。不正な % 列（`decodeURIComponent` が投げる）も元の名前を返す（壊さない）。
+ */
+function decodeServerFileName(name) {
+  if (!/%[0-9A-Fa-f]{2}/.test(name)) return name;
+  try {
+    return decodeURIComponent(name);
+  } catch {
+    return name;
+  }
 }
 
 function fileExtensionFor(artifact) {
@@ -1280,6 +1426,55 @@ function timestampTag(date = new Date()) {
   const pad = (n) => String(n).padStart(2, "0");
   return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}T` +
     `${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+// {date} = YYYY-MM-DD（{datetime} は timestampTag が担う）。
+function dateTag(date = new Date()) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+const PREFIX_MAX_LEN = 200; // 宛先キー総長の上限（S3/GCS/Azure のキー長・Windows パス長の安全側）。
+// push-local で危険な Windows 予約デバイス名（拡張子付きも同様に予約）。セグメント単位で弾く。
+const WIN_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i;
+
+/**
+ * --prefix テンプレートを解決し、アップロード先キーとして安全な「相対パス」へ無害化する。
+ * これはオブジェクトストレージ/ローカルの宛先キーを組み立てる security-sensitive な経路:
+ * バケット/--to の外へ出る（先頭 /・.. 上昇・ドライブ文字・UNC・scheme 注入）ことを必ず防ぐ。
+ * 無害化後に空・危険判定なら batchDir へフォールバックし、空/ルート/越境の宛先は絶対に作らない。
+ * {flow} は host が env で渡す（IREPO_FLOW_NAME）。Rust 指紋同様、値は host 由来で plugin は料理しない。
+ */
+function resolvePrefixTemplate(template, { batchDir }) {
+  // {flow} は env 生値。template と同様に制御文字を除去してから差し込む（防御深度・Cursor P2）。
+  const flow = (process.env.IREPO_FLOW_NAME || "").replace(/[\x00-\x1f\x7f]/g, "");
+  const now = new Date();
+  // 制御文字を先に除去（置換前の生入力に \0 等が混ざる事故を断つ）。
+  const substituted = String(template)
+    .replace(/[\x00-\x1f\x7f]/g, "")
+    .replace(/\{batchId\}/g, batchDir)
+    .replace(/\{datetime\}/g, timestampTag(now))
+    .replace(/\{date\}/g, dateTag(now))
+    .replace(/\{flow\}/g, flow);
+  // `/` と `\` 双方で分割（Windows 風入力が segment 跨ぎにならないよう）→ 各 segment を無害化 → 空/./.. を除去。
+  // Windows 予約デバイス名（CON/NUL/COM1…）は push-local で危険なので先頭に `_` を付けて無害化する。
+  const segments = substituted
+    .split(/[/\\]/)
+    .map((seg) => sanitizeUnicodeFileName(seg))
+    .map((seg) => (WIN_RESERVED.test(seg) ? `_${seg}` : seg))
+    .filter((seg) => seg !== "" && seg !== "." && seg !== "..");
+  const safe = segments.join("/");
+  // 再結合後ガード: 相対パスのみ許可。絶対/ドライブ/UNC/scheme 等が残ったら宛先を作らず batchDir へ倒す
+  // （path.join(base,'/abs'|'C:/x') が base を無視して外へ出る事故・scheme 注入を防ぐ）。
+  const unsafe =
+    safe === "" ||
+    safe.length > PREFIX_MAX_LEN ||
+    /^[/\\]/.test(safe) ||            // 先頭スラッシュ（絶対）
+    /^[A-Za-z]:/.test(safe) ||        // ドライブ文字 C:
+    /^\/\//.test(safe) ||             // UNC //server
+    /:\//.test(safe) ||               // scheme っぽい :/ の残骸
+    /^[a-z][a-z0-9+.-]*:/i.test(safe); // scheme（file: 等）
+  return unsafe ? batchDir : safe;
 }
 
 function joinS3Uri(prefix, child) {

@@ -547,7 +547,7 @@ function chunked(arr, n) {
       `coll.bulkWrite(ops,{ordered:false});print("OK");`;
     const w = runMongosh(writeScript);
     if (w.status !== 0) {
-      console.error((w.stderr || w.stdout || "mongosh write failed").trim());
+      console.error(scrub((w.stderr || w.stdout || "mongosh write failed").trim()));
       receipt("write", prepared.length, prepared.length, false);
       process.exit(1);
     }
@@ -570,7 +570,7 @@ function chunked(arr, n) {
   receipt("verify", prepared.length, verified ? 0 : prepared.length - found, verified, { verifiedDocs: found });
   process.exit(verified ? 0 : 1);
 })().catch((e) => {
-  console.error(`${PLUGIN}: ${e.message}`);
+  console.error(`${PLUGIN}: ${scrub(e.message)}`);
   receipt("write", 0, 0, false);
   process.exit(1);
 });

@@ -19,8 +19,26 @@
 
 const { spawnSync } = require("node:child_process");
 
-// cmd.exe が（クォートしても）再解釈してしまう危険なメタ文字。
-const CMD_META = /[&|<>^"%!()\r\n]/;
+// cmd.exe が二重引用符で囲んでも再解釈してしまう危険なメタ文字。
+//   % … 引用符内でも環境変数展開される（`"%PATH%"` は展開）。コマンドラインでは確実な escape 不可。
+//   ! … 遅延展開が有効（AutoRun 等）だと `"!VAR!"` が展開され得る。保守的に拒否。
+//   " … トークンの引用終端。埋め込みは cmd で不安定。
+//   & | < > ^ … 引用符の外では区切り/リダイレクト/escape だが、二重引用符内ではリテラル。
+//                ただし `<>"|` はそもそも Windows のパス/ファイル名に使えず、`&^` もパスでは稀なので
+//                拒否を継続する（攻撃面を最小に保つ）。
+//   \r \n … 改行はコマンドラインを分断する。
+// 注: `( )` は二重引用符内では cmd.exe に解釈されない（コマンドグループ化は引用符の外でのみ有効）。
+//     `C:\Program Files (x86)\...` 等の正当な Windows パスを通すため、許容する（拒否しない）。
+const CMD_META = /[&|<>^"%!\r\n]/;
+
+// cmd.exe 用に1トークンを二重引用符で囲む。末尾の連続バックスラッシュは2倍化する
+// （`C:\dir\` → `"C:\dir\\"`）。さもないと `\"` が閉じ引用符をエスケープし、引数境界が壊れる
+// （CommandLineToArgvW / MSVC argv パーサ規則。CMD_META は `\` を拒否しないため必須）。
+function quoteForCmd(token) {
+  const trailing = /\\+$/.exec(token);
+  const body = trailing ? token + "\\".repeat(trailing[0].length) : token;
+  return `"${body}"`;
+}
 
 // OS 非依存の spawn 仕様を作る。
 // POSIX: argv 配列をそのまま spawn（shell 無し＝エスケープ不要）。
@@ -37,7 +55,7 @@ function spawnSpec(command, args) {
       `Refusing to run ${command}: argument contains characters unsafe for cmd.exe: ${unsafe}`,
     );
   }
-  const inner = [command, ...argv].map((a) => `"${a}"`).join(" ");
+  const inner = [command, ...argv].map(quoteForCmd).join(" ");
   return {
     bin: process.env.ComSpec || "cmd.exe",
     argv: ["/d", "/s", "/c", `"${inner}"`],
@@ -59,4 +77,4 @@ function spawnSyncSpec(command, args, options = {}) {
   return spawnSync(spec.bin, spec.argv, { ...options, ...spec.extra });
 }
 
-module.exports = { spawnSpec, spawnSyncSpec, CMD_META };
+module.exports = { spawnSpec, spawnSyncSpec, quoteForCmd, CMD_META };

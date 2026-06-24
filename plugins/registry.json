@@ -5,7 +5,7 @@
       "name": "archive",
       "file": "i-repo-archive",
       "displayName": "i-repo-archive",
-      "version": "0.5.0",
+      "version": "0.5.7",
       "description": "帳票を bundle 化して保管：ローカル/ファイルサーバー、または S3 / GCS / Azure Blob へ配信（create=取得、push-*=配信）",
       "platforms": [
         "macos",
@@ -25,7 +25,7 @@
         {
           "path": "i-repo-archive",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-archive",
-          "sha256": "adbf8fe98081eb9e70de5332f56518651178500970f307fa1e54ec8f74b9c063"
+          "sha256": "f02b30cd7afb261c6071349d993a944eebfb9b673a0deafe3d6d7c03ec27a0f1"
         }
       ]
     },
@@ -111,7 +111,7 @@
         {
           "path": "i-repo-mongo",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-mongo",
-          "sha256": "158b790136ff2aebb3a1165dd09f5b9e31d753339e3c68cc9b6c734bada9b5a6"
+          "sha256": "00bbe57fd756ac01d3ab27e34a37dbedb5bf00434ef9095138ec7884534e196c"
         }
       ]
     },
@@ -182,7 +182,7 @@
     {
       "path": "lib/spawn.js",
       "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/lib/spawn.js",
-      "sha256": "dab1e5a0e2ea791a3877cca95169eafe91d8d4038828aa82c3e444e72d78b446"
+      "sha256": "767ad4fd218a2009f8a4339610899748e3745aa2c90064fccc4518538135c1ec"
     }
   ]
 }
