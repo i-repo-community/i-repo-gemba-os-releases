@@ -44,7 +44,7 @@ async function loadBuiltins() {
 }
 
 const PLUGIN = "i-repo-archive";
-const VERSION = "0.6.0";
+const VERSION = "0.6.1";
 const PLUGIN_API = "1";
 const defaultArchiveRoot = () => join(homedir(), ".i-repo", "archives");
 
@@ -521,6 +521,11 @@ async function createArchive(options) {
   const manifestText = await listReports(credentials, options.filters);
   const records = parseManifest(manifestText); // validates the stream-end trailer
   const savedFiles = [];
+  // Flat per-record landed map for the write receipt, so a fan-out host
+  // (i-repo deliver §9.4) can build the real artifact locator
+  // (bundle landedPrefix + objectKey) keyed by itemId+revNo — without needing
+  // --with-detail (which embeds the same objectKey into manifest records).
+  const landedArtifacts = [];
 
   if (!options.dryRun) {
     // ── 成果物ダウンロード（先に実行し、各レコードへ objectKey を記録） ──
@@ -554,6 +559,11 @@ async function createArchive(options) {
           // NoSQLドキュメントから添付を辿れるよう、相対 objectKey を記録（S3なら <prefix>/documents/<name>）
           (record.artifacts = record.artifacts ?? []).push({
             type: artifact, file: fileName, objectKey: `documents/${fileName}`,
+          });
+          // 同じ objectKey を receipt 向けの平坦マップにも積む（itemId+revNo で索ける）。
+          landedArtifacts.push({
+            itemId: String(reportId), revNo: revNo || null,
+            type: artifact, objectKey: `documents/${fileName}`,
           });
         } finally {
           await fsp.rm(dl.tempDir, { recursive: true, force: true });
@@ -607,6 +617,8 @@ async function createArchive(options) {
     createdAt: new Date().toISOString(),
     requestedArtifacts: artifacts,
     savedFiles,
+    // record → landed objectKey map (deliver §9.4 enrich source). Empty on dry-run.
+    artifacts: landedArtifacts,
     filters: compactObject(options.filters),
     ...(options.dryRun ? { dryRun: true } : {}),
   };
