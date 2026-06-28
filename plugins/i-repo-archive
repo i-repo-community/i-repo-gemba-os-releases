@@ -44,7 +44,7 @@ async function loadBuiltins() {
 }
 
 const PLUGIN = "i-repo-archive";
-const VERSION = "0.6.1";
+const VERSION = "0.6.2";
 const PLUGIN_API = "1";
 const defaultArchiveRoot = () => join(homedir(), ".i-repo", "archives");
 
@@ -817,12 +817,17 @@ async function pushArchiveBundle(options, backend) {
   // 宛先サブパス。--prefix 指定時はテンプレ解決後の安全な相対パスが「実行ごとフォルダ」を置き換える。
   // 未指定なら従来どおり batchDir(UUID)。destSub は宛先専用で、ローカル dir 名(batchDir)とは分離する。
   const destSub = options.prefix ? resolvePrefixTemplate(options.prefix, { batchDir }) : batchDir;
+  // --to のテンプレ（{flow} 等）を展開し、着地も dest も展開後の値で扱う（issue #89）。
+  const expandedTo = expandToTemplate(options.to);
+  // バッチ非依存の安定 store location（catalog 掲載用）。実行フォルダ destSub は含めない。
+  const dest = canonicalBundleDest(backend.store, expandedTo);
+  const storeKind = `${backend.store}-bundle`;
   const env = buildPushEnv(options);
 
   if (options.dryRun) {
     // local は OS パス結合（joinDest）、cloud は scheme ベースの joinUri。
-    const previewDest = backend.joinDest ? backend.joinDest(options.to, destSub) : joinUri(options.to, destSub);
-    emitReceipt("write", jobId, count, 0, false, { archivePath, [backend.prefixKey]: previewDest, dryRun: true });
+    const previewDest = backend.joinDest ? backend.joinDest(expandedTo, destSub) : joinUri(expandedTo, destSub);
+    emitReceipt("write", jobId, count, 0, false, { archivePath, [backend.prefixKey]: previewDest, dest, storeKind, dryRun: true });
     return;
   }
 
@@ -832,10 +837,10 @@ async function pushArchiveBundle(options, backend) {
   await fsp.rm(receiptPath, { force: true });
   // Upload the bundle first; only after the recursive copy succeeds do we
   // write the push receipt and upload it as a final, separate object.
-  const destination = await backend.upload(archivePath, options.to, destSub, env);
-  emitReceipt("write", jobId, count, 0, false, { archivePath, [backend.prefixKey]: destination });
+  const destination = await backend.upload(archivePath, expandedTo, destSub, env);
+  emitReceipt("write", jobId, count, 0, false, { archivePath, [backend.prefixKey]: destination, dest, storeKind });
 
-  await writeJsonFile(receiptPath, { jobId, count, archivePath, [backend.prefixKey]: destination, pushedAt: new Date().toISOString() });
+  await writeJsonFile(receiptPath, { jobId, count, archivePath, [backend.prefixKey]: destination, dest, storeKind, pushedAt: new Date().toISOString() });
   await backend.uploadReceipt(receiptPath, destination, env);
 
   // ── verify phase: read the receipt object back from the destination ──
@@ -845,7 +850,7 @@ async function pushArchiveBundle(options, backend) {
   // (PLUGINS.md: 不可逆処理は exit 0 ではなく verified receipt を条件にする)。
   // 削除失敗は配送の失敗ではないので exit 0 のまま、ただし receipt の
   // cleanedUp:false と stderr で必ず報告する (沈黙させない)。
-  const extras = { archivePath, [backend.prefixKey]: destination };
+  const extras = { archivePath, [backend.prefixKey]: destination, dest, storeKind };
   if (options.cleanup) {
     if (verified) {
       try {
@@ -1511,4 +1516,57 @@ function resolvePrefixTemplate(template, { batchDir }) {
 
 function joinS3Uri(prefix, child) {
   return `${prefix.replace(/\/+$/, "")}/${child.replace(/^\/+/, "")}`;
+}
+
+/**
+ * --to トークンを URI パスセグメント安全な**単一トークン**へ無害化する（issue #89）。
+ * `sanitizeUnicodeFileName` が `/\` 等を `_` に潰す（パス深さ注入防止）のに加え、URI 予約/
+ * 問題文字（`#`・`?`・`@`・`%`・空白）も `_` にする — これで dest が round-trippable かつ
+ * 全ストアで安全（azure の `[?#]` 拒否や `#` フラグメント切れを防ぐ）。Windows 予約名も無害化。
+ */
+function sanitizeToToken(value) {
+  let s = sanitizeUnicodeFileName(String(value).replace(/[\x00-\x1f\x7f]/g, ""));
+  s = s.replace(/[#?@%\s]/g, "_");
+  return WIN_RESERVED.test(s) ? `_${s}` : s;
+}
+
+/**
+ * --to のテンプレートを展開する（issue #89・§9.4a）。dest は**バッチ非依存**でなければ
+ * ならないので、--to で許すのは**安定キー `{flow}` のみ**。run-varying トークン
+ * （{batchId}/{datetime}/{date}）は --prefix（実行フォルダ）専用で、--to にあれば拒否する。
+ * {flow} は host が env(IREPO_FLOW_NAME) で渡す。scheme/bucket/区切りは保持。
+ */
+function expandToTemplate(to) {
+  const raw = String(to).replace(/[\x00-\x1f\x7f]/g, "");
+  if (/\{(batchId|datetime|date)\}/.test(raw)) {
+    throw new Error(
+      "--to must not contain run-varying tokens ({batchId}/{datetime}/{date}) — dest must be batch-independent; " +
+      "put those in --prefix. --to may use {flow} only.",
+    );
+  }
+  const flow = sanitizeToToken(process.env.IREPO_FLOW_NAME || "");
+  const expanded = raw.replace(/\{flow\}/g, flow);
+  // 空 {flow} 等で生じる連続スラッシュを畳む（scheme の :// は保持）。
+  return expanded.replace(/(?<!:)\/{2,}/g, "/");
+}
+
+/**
+ * 展開後 --to から、バッチに依らず安定した canonical な store location（dest）を作る（issue #89）。
+ * DC(gemba-os) catalog.rs の canonical_dest と同形（単一コロン）: s3:bucket/prefix・gcs:bucket/prefix・
+ * azure:account/container[/prefix]・dir:absPath。実行フォルダ（--prefix/destSub）は dest に含めない。
+ * secret(userinfo) は含めない（azure --to は query/SAS を parseAzureTo で既に拒否）。
+ */
+function canonicalBundleDest(store, expandedTo) {
+  if (store === "s3" || store === "gcs") {
+    const scheme = store === "s3" ? "s3://" : "gs://";
+    const rest = String(expandedTo).slice(scheme.length).replace(/\/+$/, ""); // bucket[/prefix...]
+    return `${store === "s3" ? "s3" : "gcs"}:${rest}`;
+  }
+  if (store === "azure") {
+    const { account, container, prefix } = parseAzureTo(expandedTo);
+    return prefix ? `azure:${account}/${container}/${prefix}` : `azure:${account}/${container}`;
+  }
+  // local: 絶対パスへ正規化して dir: スキーム（dir-bundle と同表現）。
+  const abs = resolve(normalizeLocalDest(expandedTo));
+  return `dir:${abs}`;
 }
