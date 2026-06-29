@@ -44,7 +44,7 @@ async function loadBuiltins() {
 }
 
 const PLUGIN = "i-repo-archive";
-const VERSION = "0.6.2";
+const VERSION = "0.6.3";
 const PLUGIN_API = "1";
 const defaultArchiveRoot = () => join(homedir(), ".i-repo", "archives");
 
@@ -179,6 +179,19 @@ if (arg0 === "--plugin-schema") {
       { name: "--cleanup", type: "boolean", subcommand: "push-s3", destructive: true,
         label: "Clean up local archive",
         description: "Delete the local archive directory after the upload is verified" },
+      // push-s3 無人認証（#92・push-azure と同作法）: 値は argv ではなく env で aws に渡す。
+      { name: "--access-key-id", type: "string", subcommand: "push-s3", envVar: "AWS_ACCESS_KEY_ID",
+        label: "AWS アクセスキーID（任意・無人用）",
+        description: "IAM アクセスキーID。値は環境変数 AWS_ACCESS_KEY_ID で aws に渡す（対話 aws sso login 不要で無人化）" },
+      { name: "--secret-access-key", type: "string", subcommand: "push-s3", secret: true, envVar: "AWS_SECRET_ACCESS_KEY",
+        label: "AWS シークレットアクセスキー（任意・無人用）",
+        description: "IAM シークレットアクセスキー。値は argv に出さず環境変数 AWS_SECRET_ACCESS_KEY で aws に渡す" },
+      { name: "--profile", type: "string", subcommand: "push-s3", envVar: "AWS_PROFILE",
+        label: "AWS プロファイル（任意）",
+        description: "named profile（~/.aws 構成）。値は環境変数 AWS_PROFILE で aws に渡す" },
+      { name: "--region", type: "string", subcommand: "push-s3", envVar: "AWS_REGION",
+        label: "AWS リージョン（任意）",
+        description: "リージョン。値は環境変数 AWS_REGION で aws に渡す" },
       // push-gcs
       { name: "--to", type: "string", required: true, subcommand: "push-gcs",
         label: "GCS destination", placeholder: "gs://bucket/prefix",
@@ -190,6 +203,10 @@ if (arg0 === "--plugin-schema") {
       { name: "--cleanup", type: "boolean", subcommand: "push-gcs", destructive: true,
         label: "Clean up local archive",
         description: "Delete the local archive directory after the upload is verified" },
+      // push-gcs 無人認証（#92）: SA 鍵 JSON の**パス**を env(GOOGLE_APPLICATION_CREDENTIALS)で gcloud に渡す。
+      { name: "--gcp-credentials", type: "string", subcommand: "push-gcs", envVar: "GOOGLE_APPLICATION_CREDENTIALS",
+        label: "GCP サービスアカウント鍵のパス（任意・無人用）",
+        description: "サービスアカウント鍵 JSON のファイルパス（鍵そのものではない）。env GOOGLE_APPLICATION_CREDENTIALS で受け、プラグインが gcloud CLI 用に CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE へも複写して無人化（対話 gcloud auth login 不要）" },
       // push-azure
       { name: "--to", type: "string", required: true, subcommand: "push-azure",
         label: "Azure Blob destination", placeholder: "https://<account>.blob.core.windows.net/<container>/<prefix>",
@@ -222,8 +239,13 @@ if (arg0 === "--plugin-schema") {
       // pull-*（取り戻し・host 管理。GUI 配信フォームには出ない＝mode:read。Rust が固定引数で渡す）
       { name: "--from", type: "string", subcommand: "pull-s3", description: "取得元 s3://bucket/prefix（着地した bundle のルート）" },
       { name: "--out", type: "string", subcommand: "pull-s3", description: "取得先ローカルディレクトリ" },
+      { name: "--access-key-id", type: "string", subcommand: "pull-s3", envVar: "AWS_ACCESS_KEY_ID", description: "無人取り戻し用 IAM アクセスキーID（env AWS_ACCESS_KEY_ID）" },
+      { name: "--secret-access-key", type: "string", subcommand: "pull-s3", secret: true, envVar: "AWS_SECRET_ACCESS_KEY", description: "無人取り戻し用 IAM シークレットキー（env のみ・argv 非掲載）" },
+      { name: "--profile", type: "string", subcommand: "pull-s3", envVar: "AWS_PROFILE", description: "AWS named profile（env AWS_PROFILE）" },
+      { name: "--region", type: "string", subcommand: "pull-s3", envVar: "AWS_REGION", description: "AWS リージョン（env AWS_REGION）" },
       { name: "--from", type: "string", subcommand: "pull-gcs", description: "取得元 gs://bucket/prefix" },
       { name: "--out", type: "string", subcommand: "pull-gcs", description: "取得先ローカルディレクトリ" },
+      { name: "--gcp-credentials", type: "string", subcommand: "pull-gcs", envVar: "GOOGLE_APPLICATION_CREDENTIALS", description: "無人取り戻し用 SA 鍵 JSON のパス（env GOOGLE_APPLICATION_CREDENTIALS）" },
       { name: "--from", type: "string", subcommand: "pull-azure", description: "取得元 https://<account>.blob.core.windows.net/<container>/<prefix>" },
       { name: "--out", type: "string", subcommand: "pull-azure", description: "取得先ローカルディレクトリ" },
       { name: "--sas", type: "string", subcommand: "pull-azure", secret: true, envVar: "AZURE_STORAGE_SAS_TOKEN",
@@ -350,15 +372,23 @@ function usage() {
                --history --regist-from --regist-to --update-from --update-to
                -k/--system-key <n=v> (repeatable)
   ${PLUGIN} push-s3    <archive-dir> --to s3://bucket/prefix [--cleanup] [--dry-run]
+      [--access-key-id <id> --secret-access-key <key> | --profile <name>] [--region <r>]
   ${PLUGIN} push-gcs   <archive-dir> --to gs://bucket/prefix [--cleanup] [--dry-run]
+      [--gcp-credentials <service-account-key.json path>]
   ${PLUGIN} push-azure <archive-dir> --to https://<account>.blob.core.windows.net/<container>/<prefix>
       [--sas <token> | --connection-string <cs>] [--cleanup] [--dry-run]
   ${PLUGIN} push-local <archive-dir> --to <folder|network-share path> [--cleanup] [--dry-run]
       --cleanup                Delete the local archive after the upload is verified
       (gcs requires gcloud; azure requires az CLI. push-local needs no external CLI
        (Node fs copy) and accepts a plain folder or mounted network-share path.
-       secrets are read from --sas/--connection-string or AZURE_STORAGE_* env and
-       passed to az via env, never argv)`);
+       Unattended creds are read from the flags above OR env
+       (s3: AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_PROFILE/AWS_REGION; gcs:
+       GOOGLE_APPLICATION_CREDENTIALS; azure: AZURE_STORAGE_*) and passed to the
+       cloud CLI via env, never argv — no interactive login needed.
+       Note: AWS keys are a pair (both required); --profile and IAM keys are mutually
+       exclusive. When run under \`i-repo\` (dispatch/deliver) the parent env is
+       allow-listed, so pass creds via these flags, host env-injection, or
+       \`i-repo config set pluginPassEnv "AWS_*,GOOGLE_APPLICATION_CREDENTIALS,AZURE_STORAGE_*"\`)`);
 }
 
 // ── Tiny argv parser (no dependencies) ─────────────────────────────────────
@@ -475,8 +505,13 @@ function normalizeLocalDest(to) {
 function parsePushArgs(argv, backend) {
   const label = `push-${backend.store}`;
   const spec = { "--to": "value", "--prefix": "value", "--dry-run": "flag", "--cleanup": "flag" };
-  // Azure は認証 secret を受ける（値は argv に出さず env で az に渡す。buildPushEnv 参照）。
+  // 無人認証フラグ（#92）。secret 値は argv に出さず env でクラウド CLI に渡す（buildPushEnv 参照）。
   if (backend.store === "azure") { spec["--sas"] = "value"; spec["--connection-string"] = "value"; }
+  if (backend.store === "s3") {
+    spec["--access-key-id"] = "value"; spec["--secret-access-key"] = "value";
+    spec["--profile"] = "value"; spec["--region"] = "value";
+  }
+  if (backend.store === "gcs") { spec["--gcp-credentials"] = "value"; }
   const o = parseArgv(argv, spec, label);
   if (o._.length !== 1) throw new Error(`${label} requires exactly one <archive-dir> argument.`);
   // local は scheme 付き URL ではなくファイルパス（フォルダ/ネットワーク共有）。scheme 検査を外し、
@@ -499,6 +534,10 @@ function parsePushArgs(argv, backend) {
     out.sas = o.sas || process.env.AZURE_STORAGE_SAS_TOKEN || "";
     out.connectionString = o["connection-string"] || process.env.AZURE_STORAGE_CONNECTION_STRING || "";
   }
+  // s3/gcs 無人認証（#92）。フラグ指定時のみ拾う（未指定なら ambient/host 注入の env が
+  // buildPushEnv の {...process.env} で素通り＝envVar 宣言と整合）。
+  if (backend.store === "s3") Object.assign(out, s3CredsFromArgs(o, label));
+  if (backend.store === "gcs") out.gcpCredentials = o["gcp-credentials"] || "";
   return out;
 }
 
@@ -666,6 +705,26 @@ function joinUri(prefix, child) {
 }
 
 // secret（SAS / 接続文字列）は argv に載せず az が読む環境変数で渡す（AGENTS.md / 本番化方針）。
+/**
+ * s3 無人認証フラグを検証して取り出す（#92）。IAM キーは**対**でのみ意味を持つ
+ * （AWS は片方だけだと "Partial credentials" で失敗し、明示キーは profile/ambient より
+ * 優先されるため）。キーと --profile の併用も aws では profile が黙殺されるので拒否する
+ * （usage は排他表記）。フラグ無指定時は ambient/host 注入の env が素通り。
+ */
+function s3CredsFromArgs(o, label) {
+  const accessKeyId = o["access-key-id"] || "";
+  const secretAccessKey = o["secret-access-key"] || "";
+  const profile = o.profile || "";
+  const region = o.region || "";
+  if (Boolean(accessKeyId) !== Boolean(secretAccessKey)) {
+    throw new Error(`${label}: --access-key-id and --secret-access-key must be provided together.`);
+  }
+  if ((accessKeyId || secretAccessKey) && profile) {
+    throw new Error(`${label}: use either IAM keys (--access-key-id/--secret-access-key) or --profile, not both.`);
+  }
+  return { accessKeyId, secretAccessKey, profile, region };
+}
+
 function buildPushEnv(options) {
   const env = { ...process.env };
   if (options.connectionString) env.AZURE_STORAGE_CONNECTION_STRING = options.connectionString;
@@ -674,6 +733,21 @@ function buildPushEnv(options) {
   // RBAC-only / listKeys 無効アカウントで失敗するため・Codex #76 P2）。s3/gcs は options.azure
   // 未設定なので素通り。
   else if (options.azure) env.AZURE_STORAGE_AUTH_MODE = "login";
+  // s3 無人認証（#92）: フラグ指定時に env を上書き。未指定なら ambient/host 注入が素通り。
+  if (options.accessKeyId) env.AWS_ACCESS_KEY_ID = options.accessKeyId;
+  if (options.secretAccessKey) env.AWS_SECRET_ACCESS_KEY = options.secretAccessKey;
+  if (options.profile) env.AWS_PROFILE = options.profile;
+  // AWS_REGION（CLI v2）と AWS_DEFAULT_REGION（v1/botocore 系）の双方を立てる。
+  if (options.region) { env.AWS_REGION = options.region; env.AWS_DEFAULT_REGION = options.region; }
+  // gcs 無人認証（#92）: SA 鍵パスを env で渡す（対話 login 不要）。
+  // GOOGLE_APPLICATION_CREDENTIALS は ADC/クライアントライブラリ用で、**gcloud CLI 自体は
+  // 読まない**（gcloud は CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE を読む・Codex #93 P1）。
+  // 両方を立てて gcloud storage と client-lib の双方をカバーする。フラグが無くても
+  // ambient/host 注入の GOOGLE_APPLICATION_CREDENTIALS があれば gcloud 用に複写する。
+  if (options.gcpCredentials) env.GOOGLE_APPLICATION_CREDENTIALS = options.gcpCredentials;
+  if (env.GOOGLE_APPLICATION_CREDENTIALS && !env.CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE) {
+    env.CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE = env.GOOGLE_APPLICATION_CREDENTIALS;
+  }
   return env;
 }
 
@@ -876,7 +950,13 @@ async function pushArchiveBundle(options, backend) {
 function parsePullArgs(argv, backend) {
   const label = `pull-${backend.store}`;
   const spec = { "--from": "value", "--out": "value" };
+  // 無人認証（#92・push と対称）: pull も対話ログイン無しで取り戻せる。
   if (backend.store === "azure") { spec["--sas"] = "value"; spec["--connection-string"] = "value"; }
+  if (backend.store === "s3") {
+    spec["--access-key-id"] = "value"; spec["--secret-access-key"] = "value";
+    spec["--profile"] = "value"; spec["--region"] = "value";
+  }
+  if (backend.store === "gcs") { spec["--gcp-credentials"] = "value"; }
   const o = parseArgv(argv, spec, label);
   if (!o.from) throw new Error(`${label} requires --from ${backend.scheme || "<source>"}…`);
   if (!o.out) throw new Error(`${label} requires --out <local-dir>.`);
@@ -895,6 +975,8 @@ function parsePullArgs(argv, backend) {
     out.sas = o.sas || process.env.AZURE_STORAGE_SAS_TOKEN || "";
     out.connectionString = o["connection-string"] || process.env.AZURE_STORAGE_CONNECTION_STRING || "";
   }
+  if (backend.store === "s3") Object.assign(out, s3CredsFromArgs(o, label));
+  if (backend.store === "gcs") out.gcpCredentials = o["gcp-credentials"] || "";
   return out;
 }
 
