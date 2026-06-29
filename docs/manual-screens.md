@@ -16,7 +16,7 @@ has_children: true
 | [接続先テンプレート](screen-connections.html) | 送り先を名前を付けて保存・再利用 |
 | [フロー作成](screen-flows.html) | 「どの帳票を・いつ・どこへ」を1セットにまとめる |
 | [実行状況](screen-runs.html) | 実行ログ・成功確認・再実行 |
-| [データ確認](screen-reports.html) | 送信元と送信済みを突き合わせ |
+| [帳票ライブビュー](screen-reports.html) | 送信元と送信済みを突き合わせ |
 | [クリーンアップ設定](screen-cleanup.html) | 元データの整理（保持期間・承認・ソフトデリート） |
 | [現場蓄積データ](screen-gemba.html) | 送信済みを読み取り専用で閲覧・検索 |
 | [スケジュール](screen-scheduler.html) | 定期実行・カレンダー・OS タスク登録 |
