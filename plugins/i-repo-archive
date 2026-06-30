@@ -44,7 +44,7 @@ async function loadBuiltins() {
 }
 
 const PLUGIN = "i-repo-archive";
-const VERSION = "0.6.3";
+const VERSION = "0.6.4";
 const PLUGIN_API = "1";
 const defaultArchiveRoot = () => join(homedir(), ".i-repo", "archives");
 
@@ -137,9 +137,9 @@ if (arg0 === "--plugin-schema") {
         label: "i-Reporter password", description: "Override the i-repo password for the inner i-repo call" },
       { name: "--definition-id", type: "string", subcommand: "create", filter: true,
         label: "帳票定義ID", placeholder: "空欄なら全定義", description: "Filter: 帳票定義ID（数値）" },
-      { name: "--label-id", type: "string", subcommand: "create", filter: true,
+      { name: "--label-id", type: "string", subcommand: "create", filter: true, default: "-9",
         label: "ラベルID", placeholder: "-9 で全レベル",
-        description: "Filter: ラベルID（rep list の -l）。-9 は全レベル（すべて）" },
+        description: "Filter: ラベルID（rep list の -l）。既定 -9 は全レベル（すべて）。空欄/未指定だと最上位階層のみ＝対象帳票0件になりやすいので既定を -9 にしている" },
       { name: "--word", type: "string", subcommand: "create", filter: true,
         label: "検索ワード", description: "Filter: 帳票名・備考などの検索ワード" },
       // rep list の choices は文字列（test/published）。repb download の数値コードとは別物。
@@ -469,7 +469,9 @@ function parseCreateArgs(argv) {
     user: o.user,
     password: o.password,
     filters: {
-      labelId: o["label-id"], word: o.word, publicStatus: o["public-status"],
+      // 既定 -9 = 全階層（すべて）。未指定だと rep list が最上位階層のみ＝0件になりやすいので、
+      // schema の default だけでなく直接 create 実行（GUI 非経由）でも -9 を既定にする。
+      labelId: o["label-id"] ?? "-9", word: o.word, publicStatus: o["public-status"],
       editStatus: o["edit-status"], itemType: o.type,
       definition: o["definition-id"] ?? o.definition,
       wordTarget: o["word-target"], history: Boolean(o.history),
