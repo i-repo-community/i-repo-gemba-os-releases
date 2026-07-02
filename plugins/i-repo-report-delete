@@ -1,0 +1,473 @@
+#!/usr/bin/env node
+/**
+ * i-repo-report-delete — 帳票削除（DeleteReport）を担う lifecycle プラグイン。
+ *
+ * なぜプラグインなのに削除ロジックを持たないか:
+ *   i-Reporter への削除は認証済みセッションを要するが、プラグインには
+ *   IREPO_PASSWORD が渡らない（docs/PLUGINS.md §3「パスワードは渡されません」＝
+ *   PATH 上の任意バイナリに秘密を渡さない安全設計）。そこで本プラグインは
+ *   自分では削除せず、**認証済みの組み込みコマンド `i-repo report-batches delete`
+ *   を呼び戻す薄いファサード**に徹する。削除の安全弁（フィルタ必須・allowDelete
+ *   ゲート・確認プロンプト・件数構造化）はすべて呼び戻し先の本体が持ち、本
+ *   プラグインはそれを継承する（要望書v4 要望2 / 要望7）。
+ *
+ *   価値: 組み込み `report-batches delete` は --plugin-schema に現れないため
+ *   GEMBA OS の「自己記述を読んで分岐（名前を直書きしない）」フロー抽象から
+ *   扱えなかった。role:"lifecycle" ＋ mode:destructive の自己記述を持つ本
+ *   プラグインが、その導線を開く。
+ *
+ * インストール:
+ *   macOS/Linux: このファイルを ~/.i-repo/plugins/i-repo-report-delete に置き chmod +x
+ *   Windows:     このファイルと i-repo-report-delete.cmd の両方を %USERPROFILE%\.i-repo\plugins\ へ
+ *
+ * 使い方:
+ *   i-repo report-delete delete -d 123 --edit-status 4 [--transaction-mode 1 --execute-count 500] -f
+ *   ※ 既定 allowDelete=false では本体がブロックする: i-repo config set allowDelete true
+ */
+"use strict";
+
+// 単一拡張子なしファイルを CJS/ESM 両対応にするため dynamic import で読む
+// (i-repo-archive と同作法)。
+let spawn;
+async function loadBuiltins() {
+  ({ spawn } = await import("node:child_process"));
+}
+
+const PLUGIN = "i-repo-report-delete";
+const VERSION = "0.1.5";
+const PLUGIN_API = "1";
+
+// 検索フィルタ（DeleteReport 仕様の抽出条件・すべて filter:true）。
+// フラグ名は組み込み report-batches delete と 1:1 で対応させ、そのまま転送する。
+const FILTER_PARAMS = [
+  { name: "--definition", type: "string", label: "定義ID", description: "Filter: 定義ID" },
+  { name: "--report", type: "string", label: "帳票ID", description: "Filter: 帳票ID（カンマ区切り可）" },
+  { name: "--label-id", type: "string", label: "ラベルID", description: "Filter: ラベルID（'nolabel' でラベル無し）" },
+  { name: "--public-status", type: "select", choices: ["1", "2"], label: "公開ステータス", description: "Filter: 1:テスト / 2:公開" },
+  { name: "--edit-status", type: "select", choices: ["0", "1", "2", "3", "4"], label: "編集ステータス", description: "Filter: 0:入力前 1:編集中 2:承認待ち 3:差し戻し 4:入力完了" },
+  { name: "--report-name", type: "string", label: "帳票名称", description: "Filter: 帳票名称（部分一致）" },
+  { name: "--remarks", type: "string", label: "備考", description: "Filter: 備考（部分一致）" },
+  { name: "--value", type: "string", label: "クラスター入力値", description: "Filter: クラスター入力値（部分一致）" },
+  { name: "--regist-user", type: "string", label: "登録ユーザーID", description: "Filter: 登録ユーザーID" },
+  { name: "--regist-from", type: "string", label: "登録日時(from)", placeholder: "2026/01/01 00:00:00", description: "Filter: 登録日時 from（yyyy/MM/dd HH:mm:ss）" },
+  { name: "--regist-to", type: "string", label: "登録日時(to)", placeholder: "2026/12/31 23:59:59", description: "Filter: 登録日時 to（yyyy/MM/dd HH:mm:ss）" },
+  { name: "--update-user", type: "string", label: "更新ユーザーID", description: "Filter: 更新ユーザーID" },
+  { name: "--update-from", type: "string", label: "更新日時(from)", placeholder: "2026/01/01 00:00:00", description: "Filter: 更新日時 from（yyyy/MM/dd HH:mm:ss）" },
+  { name: "--update-to", type: "string", label: "更新日時(to)", placeholder: "2026/12/31 23:59:59", description: "Filter: 更新日時 to（yyyy/MM/dd HH:mm:ss）" },
+  { name: "--deleted", type: "select", choices: ["no", "yes", "0", "1"], label: "削除済みを対象", description: "Filter: 0/no:未削除 1/yes:削除済み（物理削除対象）" },
+];
+
+// ── Reserved flags (docs/PLUGINS.md §3): answer before own args ──────────────
+// --plugin-schema は同期的に応答して exit。--plugin-healthcheck は spawn を
+// 要するため（非同期）main IIFE 内で処理する（同期 exit しないと fall-through する）。
+const arg0 = process.argv[2];
+if (arg0 === "--plugin-schema") {
+  console.log(JSON.stringify({
+    pluginApi: [PLUGIN_API], schemaVersions: ["1.0"], recordTypes: ["report"],
+    name: PLUGIN, version: VERSION,
+    description: "帳票削除（DeleteReport）— 寿命管理。認証済み組み込み report-batches delete を呼び戻す（自分では認証しない）",
+    phases: ["write"],
+    platforms: ["macos", "linux", "windows"],
+    // 価値軸: lifecycle = 着地済みデータや元帳票の寿命管理（保持・削除・クリーンアップ）。
+    // host は role だけで「保存先候補に出さない・破壊系として別枠・要ゲート」を判断できる。
+    roles: ["lifecycle"],
+    category: "lifecycle",
+    // delete はデータ入力なし（i-repo を呼び戻す）。サブコマンド全体が破壊的。
+    subcommands: [
+      { name: "delete", input: ["none"], destructive: true,
+        description: "条件に一致する帳票を削除（DeleteReport・論理削除）" },
+    ],
+    params: [
+      // 検索フィルタ（すべて filter:true・delete に紐付け）
+      ...FILTER_PARAMS.map((p) => ({ ...p, subcommand: "delete", filter: true })),
+      // 制御パラメータ（filter ではない）
+      // --mode: v1 は論理削除(0)のみ公開。物理削除(1)は当面据え置き（強ガード）。
+      { name: "--mode", type: "select", choices: ["0"], default: "0", subcommand: "delete",
+        destructive: true, label: "削除モード", description: "0:論理削除（既定）。物理削除(1)は v1 非公開" },
+      { name: "--transaction-mode", type: "select", choices: ["0", "1"], subcommand: "delete",
+        label: "トランザクションモード", description: "0:一括（既定）/ 1:1帳票1トランザクション（大量削除の負荷平準化）" },
+      { name: "--execute-count", type: "number", subcommand: "delete",
+        label: "処理件数", description: "1回の処理件数（transaction-mode=1／--drain／--receipt のとき有効）" },
+      { name: "--drain", type: "boolean", subcommand: "delete",
+        label: "段階消化", description: "対象が無くなる（result-code=8）まで execute-count 件ずつ反復削除" },
+      { name: "--receipt", type: "boolean", subcommand: "delete",
+        label: "削除receipt", description: "ドレインを実行し結果を receipt（verified/件数/errors/producedBy）として出力（要 --execute-count・--force／非対話）" },
+      { name: "--count-only", type: "boolean", subcommand: "delete",
+        label: "件数プレビュー", description: "削除せず対象件数の概算のみ表示（読み取り専用・GetReportList 近似）" },
+      { name: "--force", type: "boolean", subcommand: "delete",
+        label: "確認省略", description: "確認プロンプトを省略（無人実行）" },
+      // 認証上書き（未指定時は呼び戻し先 i-repo が config/プロンプトで解決）
+      { name: "--endpoint", type: "string", subcommand: "delete", label: "エンドポイント", description: "呼び戻す i-repo のエンドポイントを上書き" },
+      { name: "--user", type: "string", subcommand: "delete", label: "ユーザー", description: "呼び戻す i-repo のユーザーを上書き" },
+      { name: "--password", type: "string", secret: true, subcommand: "delete", label: "パスワード", description: "呼び戻す i-repo のパスワードを上書き（値は argv に出さず env で渡す）" },
+    ],
+  }));
+  process.exit(0);
+}
+
+// ── Contract version check: unsupported → stderr + exit 11 ──
+const announcedApi = process.env.IREPO_PLUGIN_API;
+if (announcedApi && announcedApi !== PLUGIN_API) {
+  console.error(`${PLUGIN}: unsupported IREPO_PLUGIN_API=${announcedApi} (supported: ${PLUGIN_API})`);
+  process.exit(11);
+}
+
+const ARG_SPEC = {
+  "--report": "value", "-r": "--report", "--label-id": "value", "-l": "--label-id",
+  "--definition": "value", "-d": "--definition", "--report-name": "value",
+  "--public-status": "value", "--edit-status": "value", "-e": "--edit-status",
+  "--remarks": "value", "--value": "value",
+  "--regist-user": "value", "--regist-from": "value", "--regist-to": "value",
+  "--update-user": "value", "--update-from": "value", "--update-to": "value",
+  "--deleted": "value", "--mode": "value", "--transaction-mode": "value",
+  "--execute-count": "value", "--drain": "flag", "--receipt": "flag",
+  "--count-only": "flag", "--force": "flag", "-f": "--force",
+  "--endpoint": "value", "--user": "value", "--password": "value",
+};
+
+// 転送するフィルタ／制御フラグ（キー = ARG_SPEC の canonical から先頭 -- を除いたもの）
+const FORWARD_FLAGS = [
+  "report", "label-id", "definition", "report-name", "public-status", "edit-status",
+  "remarks", "value", "regist-user", "regist-from", "regist-to",
+  "update-user", "update-from", "update-to", "deleted", "transaction-mode", "execute-count",
+];
+const FILTER_KEYS = [
+  "report", "label-id", "definition", "report-name", "public-status", "edit-status",
+  "remarks", "value", "regist-user", "regist-from", "regist-to",
+  "update-user", "update-from", "update-to", "deleted",
+];
+
+(async () => {
+  await loadBuiltins();
+
+  if (arg0 === "--plugin-healthcheck") {
+    await irepoHealthcheck();
+    return;
+  }
+
+  const [command, ...rest] = process.argv.slice(2);
+
+  if (command === "--help" || command === "-h" || command === undefined) {
+    printHelp();
+    process.exit(command === undefined ? 2 : 0);
+  }
+  if (command !== "delete") {
+    console.error(`${PLUGIN}: unknown subcommand "${command}". Only "delete" is supported.\nRun "${PLUGIN} --help".`);
+    process.exit(2);
+  }
+
+  let o;
+  try {
+    o = parseArgv(rest, ARG_SPEC, "delete");
+  } catch (error) {
+    console.error(`${PLUGIN}: ${error.message}`);
+    process.exit(2);
+  }
+
+  // 安全弁1（要望7・フィルタ必須ガードの前倒し）: フィルタ皆無の削除は
+  // 全件事故になりうる。呼び戻し先 SDK も throw するが、ここで fail-fast して
+  // 明快なメッセージを出す。
+  const hasFilter = FILTER_KEYS.some((k) => o[k] != null);
+  if (!hasFilter) {
+    console.error(
+      `${PLUGIN}: refusing to delete without any filter (accidental bulk-delete guard).\n` +
+      `Specify at least one of: ${FILTER_PARAMS.map((p) => p.name).join(", ")}.`,
+    );
+    process.exit(2);
+  }
+
+  // 安全弁2（物理削除の強ガード・要望2）: v1 は論理削除のみ公開。
+  if (o.mode != null && o.mode !== "0" && o.mode !== "logical") {
+    console.error(
+      `${PLUGIN}: physical delete (--mode ${o.mode}) is not exposed in v1.\n` +
+      `Only logical delete (--mode 0) is supported here. Use the built-in ` +
+      `"i-repo report-batches delete --mode physical" directly if you truly need it.`,
+    );
+    process.exit(2);
+  }
+
+  // 安全弁3（読み取り専用の逸脱防止）: --count-only は削除しないプレビュー。
+  // --receipt/--drain は実削除。併用は「プレビューのつもりが実削除」になる矛盾なので拒否。
+  if (o["count-only"] && (o.receipt || o.drain)) {
+    console.error(`${PLUGIN}: --count-only cannot be combined with --receipt/--drain (read-only preview vs actual delete).`);
+    process.exit(2);
+  }
+
+  // --drain / --receipt はドレイン＝1スライス幅が要る。経路で挙動（メッセージ/exit）を揃える。
+  if ((o.drain || o.receipt) && o["execute-count"] == null) {
+    console.error(`${PLUGIN}: --drain/--receipt requires --execute-count <n> (the per-slice width).`);
+    process.exit(2);
+  }
+
+  // receipt は stdout（json 結果）を捕捉する。未 --force だと本体の確認プロンプトが
+  // stdout に出て（confirmDestructive→iqConfirm）JSON に混ざり、削除後に parseLastJson が
+  // 壊れて「no receipt」で落ちる。捕捉と対話確認は両立しないので receipt は --force 必須。
+  if (o.receipt && !o.force) {
+    console.error(`${PLUGIN}: --receipt requires --force (receipt captures stdout; an interactive confirmation prompt would corrupt the JSON). Run with --force in a trusted non-interactive context.`);
+    process.exit(2);
+  }
+
+  // 呼び出し元のグローバル出力オプションを内側 i-repo へ引き継ぐ。dispatch は
+  // これらを IREPO_FORMAT/IREPO_QUIET/IREPO_TIMEOUT env で渡すが、内側 i-repo は
+  // その env を読まないため、対応するグローバルフラグ（サブコマンドより前）に翻訳する。
+  const globals = [];
+  if (process.env.IREPO_FORMAT) globals.push("--format", process.env.IREPO_FORMAT);
+  if (process.env.IREPO_QUIET === "1") globals.push("--quiet");
+  if (process.env.IREPO_TIMEOUT) globals.push("--timeout", process.env.IREPO_TIMEOUT);
+
+  // フィルタ／制御フラグ（フラグ名は組み込み report-batches delete と 1:1）。
+  const filterArgs = [];
+  const push = (flag, value) => { if (value != null && String(value).length > 0) filterArgs.push(flag, String(value)); };
+  for (const key of FORWARD_FLAGS) push(`--${key}`, o[key]);
+  filterArgs.push("--mode", "logical"); // v1 は常に論理削除（本体の choices は logical/physical/0/1）
+
+  // 認証は原則、呼び戻し先 i-repo が config/プロンプトで解決する。
+  // --endpoint/--user/--password が来たら env 上書きで内側へ渡す（値は argv に載せない）。
+  const env = { ...process.env };
+  if (o.endpoint != null) env.IREPO_ENDPOINT = o.endpoint;
+  if (o.user != null) env.IREPO_USER = o.user;
+  if (o.password != null) env.IREPO_PASSWORD = o.password;
+
+  // ── receipt（要望書v4 要望6）──
+  // 削除成否を exit 0 ではなく receipt で判定できるよう、ドレイン結果を §6 receipt に
+  // 写像して stdout に出す。producedBy は本プラグイン＝receipt の発行者はここ。
+  // 中身は組み込み report-batches delete --drain --format json を捕捉して得る。
+  if (o.receipt) {
+    // execute-count 必須は上の統一ガードで担保済み。
+    // 出力は必ず json（DeleteDrainResult を機械可読で受け取るため）。IREPO_TIMEOUT は
+    // 長時間ドレインのハング防止に内側へ引き継ぐ（通常経路の globals と挙動を揃える）。
+    // stderr の進捗・確認・ゲート案内は継承し、stdout（json 結果）だけ捕捉する。
+    const jsonArgs = [];
+    if (process.env.IREPO_TIMEOUT) jsonArgs.push("--timeout", process.env.IREPO_TIMEOUT);
+    if (process.env.IREPO_QUIET === "1") jsonArgs.push("--quiet"); // 内側の stderr 進捗を抑制（--format json は保持）
+    jsonArgs.push(
+      "--format", "json", "report-batches", "delete", ...filterArgs,
+      "--drain", "--execute-count", String(o["execute-count"]),
+    );
+    if (o.force) jsonArgs.push("--force");
+    const cap = await runIrepoCapture(jsonArgs, env);
+    const drain = parseLastJson(cap.stdout);
+    if (drain == null) {
+      // 結果 json を得られない＝切断扱い（トレーラ無し）。exit 0 を成功と誤読させない。
+      console.error(`${PLUGIN}: could not read drain result (treated as disconnected — no receipt).`);
+      process.exit(cap.code || 1);
+    }
+    const errors = Array.isArray(drain.errors) ? drain.errors : [];
+    const failedCount = errors.length;
+    const verified = drain.done === true && failedCount === 0; // 完走かつ無失敗のみ
+    const jobId = `report-delete-${process.env.IREPO_BATCH_ID || "job"}-${process.pid}`;
+    // §6 receipt ＋ DC 指定フィールド。count は成功件数（§6 意味）。
+    process.stdout.write(JSON.stringify({
+      schemaVersion: "1.0", recordType: "receipt", plugin: PLUGIN, phase: "delete", jobId,
+      verified,
+      targetCount: drain.targetCount ?? null,
+      successCount: drain.successCount ?? null,
+      count: drain.successCount ?? 0,
+      failedCount,
+      stoppedReason: drain.stoppedReason ?? null,
+      errors,
+      producedBy: { plugin: PLUGIN, version: VERSION },
+    }) + "\n");
+    // ドレイン完了トレーラ（result-code=8 到達の明示）。無い＝切断で切り分け可能。
+    // verified も載せる: トレーラだけ読む消費者が done を「成功」と誤読しないよう
+    // （done でも残エラーがあれば verified:false）。
+    if (drain.done === true) {
+      process.stdout.write(JSON.stringify({
+        schemaVersion: "1.0", recordType: "delete-end", plugin: PLUGIN, jobId,
+        verified, successCount: drain.successCount ?? 0, reached: "result-code=8",
+      }) + "\n");
+    }
+    process.exit(verified ? 0 : 7);
+  }
+
+  // 通常経路: stdio 継承で本体の確認プロンプト・構造化出力・allowDelete ゲート案内を
+  // そのままユーザーへ流す（要望7 の継承）。
+  const args = [...globals, "report-batches", "delete", ...filterArgs];
+  if (o["count-only"]) args.push("--count-only"); // 読み取り専用プレビュー（削除しない）
+  if (o.drain) args.push("--drain"); // 段階消化（execute-count は filterArgs 経由で転送済み）
+  if (o.force) args.push("--force");
+  const code = await runIrepo(args, env);
+  process.exit(code);
+})().catch((error) => {
+  console.error(`${PLUGIN}: ${error?.message ?? error}`);
+  process.exit(1);
+});
+
+// ── helpers ─────────────────────────────────────────────────────────────────
+
+/** i-repo を呼び戻し、その exit code を返す（stdio 継承）。 */
+function runIrepo(args, env) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const spec = spawnSpec(iRepoBin(), args);
+    const child = spawn(spec.bin, spec.argv, { env, stdio: "inherit", ...spec.extra });
+    child.on("error", (error) => {
+      if (error.code === "ENOENT") {
+        rejectPromise(new Error(`i-repo not found on PATH (set IREPO_BIN to override).`));
+        return;
+      }
+      rejectPromise(error);
+    });
+    // シグナル終了はシェル慣行 128+signum で伝える（docs/PLUGINS.md）。
+    child.on("close", (code, signal) => {
+      if (signal) {
+        const num = { SIGINT: 2, SIGTERM: 15 }[signal] ?? 0;
+        resolvePromise(num ? 128 + num : 1);
+        return;
+      }
+      resolvePromise(code ?? 0);
+    });
+  });
+}
+
+/** i-repo を呼び戻し、stdout（json 結果）を捕捉する。stderr/stdin は継承（確認・進捗はそのまま）。 */
+function runIrepoCapture(args, env) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const spec = spawnSpec(iRepoBin(), args);
+    const child = spawn(spec.bin, spec.argv, { env, stdio: ["inherit", "pipe", "inherit"], ...spec.extra });
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (c) => { stdout += c; });
+    child.on("error", (error) => {
+      if (error.code === "ENOENT") { rejectPromise(new Error(`i-repo not found on PATH (set IREPO_BIN to override).`)); return; }
+      rejectPromise(error);
+    });
+    child.on("close", (code, signal) => {
+      const exit = signal ? (128 + ({ SIGINT: 2, SIGTERM: 15 }[signal] ?? 0)) : (code ?? 0);
+      resolvePromise({ code: exit, stdout });
+    });
+  });
+}
+
+/**
+ * 捕捉した stdout から DeleteDrainResult を取り出す。
+ * 内側 --format json の出力は「単一の（pretty な複数行）JSON 文書ちょうど1つ」なので、
+ * まず全体を1オブジェクトとしてパースする（これが期待経路）。失敗時のみ、行単位の
+ * 最終 JSON オブジェクトへフォールバックする（想定外の混入があっても壊れにくく）。
+ */
+function parseLastJson(text) {
+  const whole = String(text).trim();
+  try {
+    const v = JSON.parse(whole);
+    if (v && typeof v === "object" && !Array.isArray(v)) return v;
+  } catch { /* not a single json document — fall back to line scan */ }
+  const lines = whole.split("\n").map((l) => l.trim()).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const v = JSON.parse(lines[i]);
+      if (v && typeof v === "object" && !Array.isArray(v)) return v;
+    } catch { /* not json */ }
+  }
+  return null;
+}
+
+/** healthcheck: i-repo が PATH で見つかるかだけ確認（削除は本体が担う）。 */
+function irepoHealthcheck() {
+  return new Promise((resolvePromise) => {
+    const done = (irepoOk) => {
+      console.log(JSON.stringify({
+        ok: irepoOk,
+        checks: [{
+          name: "i-repo-cli", ok: irepoOk, severity: "required",
+          hint: "Install i-repo (npm i -g i-repo) or set IREPO_BIN to its path",
+        }],
+      }));
+      process.exit(irepoOk ? 0 : 1);
+      resolvePromise();
+    };
+    try {
+      const spec = spawnSpec(iRepoBin(), ["--version"]);
+      const child = spawn(spec.bin, spec.argv, { stdio: "ignore", ...spec.extra });
+      child.on("error", () => done(false));
+      child.on("close", (code) => done((code ?? 1) === 0));
+    } catch {
+      done(false);
+    }
+  });
+}
+
+function iRepoBin() {
+  return process.env.IREPO_BIN && process.env.IREPO_BIN.length > 0 ? process.env.IREPO_BIN : "i-repo";
+}
+
+/** Windows の .cmd シム対応 spawn 仕様（i-repo-archive と同一）。 */
+function spawnSpec(command, args) {
+  if (process.platform !== "win32") {
+    return { bin: command, argv: args, extra: {} };
+  }
+  const unsafe = [command, ...args].find((a) => /[&|<>^"%!()\r\n]/.test(a));
+  if (unsafe !== undefined) {
+    throw new Error(`Refusing to run ${command}: argument contains characters unsafe for cmd.exe: ${unsafe}`);
+  }
+  const inner = [command, ...args].map((a) => `"${a}"`).join(" ");
+  return {
+    bin: process.env.ComSpec || "cmd.exe",
+    argv: ["/d", "/s", "/c", `"${inner}"`],
+    extra: { windowsVerbatimArguments: true },
+  };
+}
+
+/** 依存なしの小さな argv パーサ（i-repo-archive と同作法）。 */
+function parseArgv(argv, spec, label) {
+  const out = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    let token = argv[i];
+    if (!token.startsWith("-")) { out._.push(token); continue; }
+    let inlineValue;
+    const eq = token.indexOf("=");
+    if (eq > -1) { inlineValue = token.slice(eq + 1); token = token.slice(0, eq); }
+    let kind = spec[token];
+    if (typeof kind === "string" && kind.startsWith("--")) { token = kind; kind = spec[token]; }
+    if (!kind) throw new Error(`Unknown option for ${label}: ${token}. Run "${PLUGIN} --help".`);
+    const key = token.replace(/^--/, "");
+    if (kind === "flag") {
+      if (inlineValue !== undefined) throw new Error(`Option ${token} does not take a value.`);
+      out[key] = true;
+      continue;
+    }
+    const value = inlineValue !== undefined ? inlineValue : argv[++i];
+    if (value === undefined) throw new Error(`Option ${token} requires a value.`);
+    out[key] = value;
+  }
+  return out;
+}
+
+function printHelp() {
+  console.log(`${PLUGIN} v${VERSION} — 帳票削除（DeleteReport）lifecycle プラグイン
+
+  自分では削除せず、認証済みの組み込み "i-repo report-batches delete" を呼び戻す
+  薄いファサードです。安全弁（フィルタ必須・allowDelete ゲート・確認・件数構造化）は
+  すべて呼び戻し先の本体が担い、本プラグインはそれを継承します。
+
+Usage:
+  i-repo report-delete delete [filters...] [--transaction-mode 1 --execute-count N] [-f]
+
+Filters (最低1つ必須):
+  -d, --definition <id>      定義ID
+  -r, --report <ids>         帳票ID（カンマ区切り可）
+  -l, --label-id <id>        ラベルID（'nolabel' でラベル無し）
+      --public-status <1|2>  1:テスト / 2:公開
+  -e, --edit-status <0-4>    0:入力前 1:編集中 2:承認待ち 3:差し戻し 4:入力完了
+      --report-name <name>   帳票名称（部分一致）
+      --remarks <text>       備考（部分一致）
+      --value <text>         クラスター入力値（部分一致）
+      --regist-user <id>     登録ユーザーID
+      --regist-from <dt>     登録日時 from（yyyy/MM/dd HH:mm:ss）
+      --regist-to <dt>       登録日時 to
+      --update-user <id>     更新ユーザーID
+      --update-from <dt>     更新日時 from
+      --update-to <dt>       更新日時 to
+      --deleted <no|yes>     削除済みを対象にするか
+
+Control:
+      --transaction-mode <0|1>  0:一括（既定）/ 1:1帳票1トランザクション（大量削除の負荷平準化）
+      --execute-count <n>       1回の処理件数（transaction-mode=1／--drain／--receipt で有効）
+      --drain                   対象が無くなる（result-code=8）まで execute-count 件ずつ反復削除
+      --receipt                 ドレインし結果を receipt（verified/件数/errors/producedBy）で出力（要 --execute-count・--force）
+      --count-only              削除せず対象件数の概算のみ表示（読み取り専用）
+  -f, --force                   確認プロンプトを省略（無人実行）
+      --endpoint/--user/--password <v>  呼び戻す i-repo の認証を上書き
+
+Notes:
+  - 物理削除は v1 では非公開（論理削除のみ）。
+  - 既定 allowDelete=false では本体がブロックします: i-repo config set allowDelete true`);
+}

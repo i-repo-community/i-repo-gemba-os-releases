@@ -145,6 +145,33 @@
       ]
     },
     {
+      "name": "report-delete",
+      "file": "i-repo-report-delete",
+      "displayName": "i-repo-report-delete",
+      "version": "0.1.5",
+      "description": "帳票削除（DeleteReport）— 寿命管理。認証済み組み込み report-batches delete を呼び戻す（自分では認証しない）",
+      "platforms": [
+        "macos",
+        "linux",
+        "windows"
+      ],
+      "roles": [
+        "lifecycle"
+      ],
+      "category": "lifecycle",
+      "supportsQuery": false,
+      "minPluginApi": "1",
+      "publisher": "official",
+      "signature": null,
+      "files": [
+        {
+          "path": "i-repo-report-delete",
+          "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-report-delete",
+          "sha256": "178e730ecd596462b109e007b8971cabdbab3ff2707cef8442a110881cbac2c0"
+        }
+      ]
+    },
+    {
       "name": "sqlite",
       "file": "i-repo-sqlite",
       "displayName": "i-repo-sqlite",
