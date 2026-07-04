@@ -160,7 +160,7 @@
   <!-- HERO -->
   <section class="hero">
     <div class="wrap">
-      <span class="kick">Field Data Platform / v0.19.0</span>
+      <span class="kick">Field Data Platform / v0.20.0</span>
       <h1>現場の帳票を、<br>そのまま<mark>使えるデータ</mark>に。</h1>
       <p class="lead">i-Reporter のデータを、選んだ基盤へ自動で届ける。アプリの中で確かめる。<b>AI に日本語で聞く。</b>設定もコードも要らない。</p>
       <div class="hero-cta">
@@ -194,6 +194,36 @@
       <blockquote style="margin:26px 0 0; padding:18px 20px; background:var(--paper); border:3px solid var(--line); box-shadow:var(--shadow); font-size:clamp(16px,2.2vw,21px); font-weight:800; line-height:1.7">
         帳票定義は業務の定義であり、そこに蓄積されるデータは現場の知識の蓄積です。その定義とデータが重なり合うことで、現場の経験、判断、改善のヒントが見えてくる。<br>
         <span style="color:var(--accent)">ここに、これからの i-Reporter の大きな価値があります。</span>
+      </blockquote>
+    </div>
+  </section>
+
+  <!-- STORY / 現場スキルという、新しい引き継ぎ。 -->
+  <section class="no-sec" id="story">
+    <div class="wrap" style="max-width:880px">
+      <span class="kick">Field Skills — v0.20.0</span>
+      <h2 style="font-size:clamp(28px,4.8vw,48px); font-weight:900; letter-spacing:-.03em; line-height:1.12; margin:14px 0 22px">現場スキルという、<mark>新しい引き継ぎ。</mark></h2>
+      <div style="font-size:15.5px; line-height:1.95; color:var(--ink); display:flex; flex-direction:column; gap:16px; max-width:70ch">
+        <h3 style="font-size:18px; font-weight:900; margin:10px 0 0">製造業 ― プレス工場の田中さん（設備保全30年）</h3>
+        <p>田中さんには、誰にも教えたことのない習慣がある。点検表に「要注意」が付いた設備は、<b>翌日の作業実績と異常報告を必ず並べて見る</b>。設備NOでつなぐと、故障の“前ぶれ”が見えるからだ。数値はまだ正常の範囲。でも、要注意が付いた翌週に同じ設備の実績がわずかに落ち、異常報告に「音が違う」と一行ある——この並びが出たら、止まる前に手を打つ。</p>
+        <p>マニュアルのどこにも書いていない。若手に聞かれれば答えるが、「何をどの順で見るか」までは、言葉にしたことがなかった。田中さんは、あと2年で定年だ。</p>
+        <p>ある日、田中さんは現場AIの質問に答えた。<b>「この3枚の帳票、現場ではどんな順番・きっかけで一緒に見ますか？」</b>「まず点検表。要注意が付いたら、翌日の実績と、同じ週の異常報告。設備NOでつなぐ。P-01とプレス1号は同じ機械だから注意な」——話したことがそのまま下書きになり、田中さんが目を通して<b>確定</b>を押した。</p>
+        <p>——現場スキル「<b>プレス機まわりの保全</b>」。確定：田中。</p>
+        <p>その夜、夜勤の佐藤くんがチャットを開くと、最初にこう聞かれた。<b>「どの現場スキルを使いますか？」</b> 「プレス機まわりの保全（3帳票）」を押して、「昨日要注意になった設備、その後どう？」。AIは田中さんの見方どおりに3枚の帳票を突き合わせ、「3号機は翌日の実績が平均より8%低下、異常報告はまだ出ていません。田中さんの見方では、このパターンは点検を前倒しする場面です」と答えた。</p>
+        <p><b>田中さんは、家で寝ている。それでも田中さんの目は、現場で働いている。</b></p>
+        <h3 style="font-size:18px; font-weight:900; margin:18px 0 0">建設業 ― 現場監督の山本さん（現場20年）</h3>
+        <p>山本さんが毎朝、朝礼の前にやることがある。<b>昨日までのKY活動シートとヒヤリハット報告、そして当日の作業予定</b>を重ねて見るのだ。</p>
+        <p>ハインリッヒの法則——<b>1件の重大事故の裏には、29の軽微な事故と、300のヒヤリハットがある</b>。だから山本さんは“300”を数える。同じ場所、同じ作業種で、ヒヤリハットが2件重なっていたら、それは偶然ではない。<b>今日の作業予定にその場所・その作業があるなら、朝礼で真っ先に潰す</b>。「3階の開口部、今週ヒヤリが2件出とる。今日の配筋はそこや。養生を先にやれ」</p>
+        <p>これも、どの安全マニュアルにも書いていない。「シートは毎日書かせているのに、活かせているのは山本さんだけ」と所長は言う。</p>
+        <p>山本さんは、その見方を現場スキルにした。——現場スキル「<b>朝礼前の安全先読み</b>」。KYシート・ヒヤリハット・当日作業予定の3枚を、場所と作業種でつなぐ。確定：山本。</p>
+        <p>新任の木村さんは、朝礼前に自分のPCで聞く。「今日の作業予定で、先に潰すべき場所は？」 AIは山本さんの見方で3枚を突き合わせ、ヒヤリハットの重なりと当日予定の交点を挙げる。<b>しかも木村さんが使ったのは、会社支給の Claude。協力会社の主任は自分の Codex で同じスキルを使った。</b>書き出された見方は、どのAIでも同じように働く。</p>
+        <h3 style="font-size:18px; font-weight:900; margin:18px 0 0">引き継ぎの言葉が変わる</h3>
+        <p>これまで、現場の引き継ぎはこうだった——「<b>分からんことがあったら、田中さんに聞け</b>」。これからは、こうなる——「<b>まず、田中さんのスキルで聞け</b>」。</p>
+        <p>渡るのは“見方”だけ。帳票の中身や個人情報はAIに送られない。AIが勝手に作った知識でもない。<b>人が確認し、名前と日付で署名した見方</b>だけが、スキルになる。そしてそのスキルは、標準形式（Agent Skills）で書き出せば、Claude でも Codex でも——<b>この先現れるどのAIでも</b>——同じように働く。</p>
+      </div>
+      <blockquote style="margin:26px 0 0; padding:18px 20px; background:var(--paper2); border:3px solid var(--line); box-shadow:var(--shadow); font-size:clamp(16px,2.2vw,21px); font-weight:800; line-height:1.7">
+        ベテランの定年で、現場の知が消える時代は終わる。<br>
+        <span style="color:var(--accent)">現場の暗黙知は、持ち運べるスキルになった。</span>
       </blockquote>
     </div>
   </section>
@@ -269,7 +299,7 @@
         <figure class="tile"><div class="shot"><div class="shot-bar"><span class="dot"></span> プラグイン <span class="idx">09</span></div><div class="shot-body"><img src="assets/img/screen-plugins.png" alt="プラグイン" onerror="this.style.display='none'"></div></div><h4>プラグイン</h4><p>送り先部品の状態・フォルダ・削除。</p></figure>
         <figure class="tile"><div class="shot"><div class="shot-bar"><span class="dot"></span> クラウド配信先 <span class="idx">GCS</span></div><div class="shot-body"><img src="assets/img/screen-cloud.png" alt="クラウド配信先（GCS バケットの実例）" onerror="this.style.display='none'"></div></div><h4>クラウド配信先（着地点）</h4><p>S3 / GCS / Azure Blob へ bundle 配信。上位フォルダ名も自由化（{date} 等）。</p></figure>
         <figure class="tile"><div class="shot"><div class="shot-bar"><span class="dot"></span> エージェント接続 <span class="idx">10</span></div><div class="shot-body"><img src="assets/img/screen-mcp.png" alt="エージェント接続" onerror="this.style.display='none'"></div></div><h4>エージェント接続</h4><p>AI ツールへ読み取り専用で接続（MCP）。</p></figure>
-        <figure class="tile star" style="grid-column:span 2"><div class="shot"><div class="shot-bar"><span class="dot"></span> Ontology Studio <span class="idx">★ NEW</span></div><div class="shot-body"><img src="assets/img/screen-ontology.png" alt="Ontology Studio" onerror="this.style.display='none'"></div></div><h4>Ontology Studio</h4><p>帳票の項目に型と意味（現場のノウハウ）を付け、人が確認して現場 AI の根拠にする。<strong>業務の重なり（NEW）</strong>：複数の帳票を“一緒に見る見方”ごと書き留め、AI が帳票をまたいで答える。チャットからも「重なりで聞く」で1クリック。</p></figure>
+        <figure class="tile star" style="grid-column:span 2"><div class="shot"><div class="shot-bar"><span class="dot"></span> Ontology Studio <span class="idx">★ NEW</span></div><div class="shot-body"><img src="assets/img/screen-ontology.png" alt="Ontology Studio" onerror="this.style.display='none'"></div></div><h4>Ontology Studio</h4><p>帳票の項目に型と意味を付け、人が確認して<strong>現場スキル（NEW）</strong>に育てる。複数の帳票をまたぐ“見方”をAIインタビューで引き出して確定すると、現場AIは「どの現場スキルを使いますか？」から始まる。書き出せばお使いの Claude / Codex でもそのまま働く。</p></figure>
         <figure class="tile star" style="grid-column:span 2"><div class="shot"><div class="shot-bar"><span class="dot"></span> 現場 AI チャット <span class="idx">★ 11</span></div><div class="shot-body"><img src="assets/img/screen-agent.png" alt="現場 AI チャット" onerror="this.style.display='none'"></div></div><h4>現場 AI チャット</h4><p>現場データについて、アプリの中で AI に日本語で質問。意味づけした帳票は“この現場の言葉”で根拠つきに答える。</p></figure>
         <figure class="tile"><div class="shot"><div class="shot-bar"><span class="dot"></span> 概要 <span class="idx">00</span></div><div class="shot-body"><img src="assets/img/screen-overview.png" alt="概要" onerror="this.style.display='none'"></div></div><h4>概要</h4><p>全体の状況をひと目で。</p></figure>
       </div>
