@@ -24,3 +24,4 @@ has_children: true
 | [プラグイン](screen-plugins.html) | 送り先部品の状態・フォルダ・削除 |
 | [エージェント接続](screen-mcp.html) | Claude / Codex に読み取り専用でつなぐ |
 | [現場 AI チャット](screen-agent.html) | アプリ内で AI に日本語で質問 |
+| [Ontology Studio（現場スキル）](screen-ontology.html) | 帳票に意味を付け、ベテランの“見方”を現場スキルにする |
