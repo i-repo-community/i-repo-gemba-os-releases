@@ -44,7 +44,7 @@ async function loadBuiltins() {
 }
 
 const PLUGIN = "i-repo-archive";
-const VERSION = "0.6.4";
+const VERSION = "0.8.0";
 const PLUGIN_API = "1";
 const defaultArchiveRoot = () => join(homedir(), ".i-repo", "archives");
 
@@ -136,7 +136,8 @@ if (arg0 === "--plugin-schema") {
       { name: "--password", type: "string", subcommand: "create", secret: true, envVar: "IREPO_PASSWORD",
         label: "i-Reporter password", description: "Override the i-repo password for the inner i-repo call" },
       { name: "--definition-id", type: "string", subcommand: "create", filter: true,
-        label: "帳票定義ID", placeholder: "空欄なら全定義", description: "Filter: 帳票定義ID（数値）" },
+        label: "帳票定義ID", placeholder: "空欄なら全定義",
+        description: "Filter: 帳票定義ID（数値・改版前後の全リビジョン配下を対象）" },
       { name: "--label-id", type: "string", subcommand: "create", filter: true, default: "-9",
         label: "ラベルID", placeholder: "-9 で全レベル",
         description: "Filter: ラベルID（rep list の -l）。既定 -9 は全レベル（すべて）。空欄/未指定だと最上位階層のみ＝対象帳票0件になりやすいので既定を -9 にしている" },
@@ -368,7 +369,7 @@ function usage() {
       --dry-run                Resolve inputs and report without writing
       --endpoint/--user/--password <v>   Override i-repo credentials
       Filters: -l/--label-id -w/--word --public-status -e/--edit-status
-               -t/--type -d/--definition --definition-id --word-target
+               -t/--type -d/--definition --definition-id（系譜全体） --word-target
                --history --regist-from --regist-to --update-from --update-to
                -k/--system-key <n=v> (repeatable)
   ${PLUGIN} push-s3    <archive-dir> --to s3://bucket/prefix [--cleanup] [--dry-run]
@@ -1267,6 +1268,10 @@ function buildListArgs(filters) {
   push("--edit-status", filters.editStatus);
   push("--type", filters.itemType);
   push("--definition", filters.definition);
+  // 定義フィルタは常に系譜全体（改版で定義IDが変わっても過去・中間・未来の全リビジョン配下）。
+  // 帳票は作成時リビジョンのIDにぶら下がるため、これが無いと改版またぎの帳票が静かに配信漏れする。
+  // definitionHistory は系譜のどのIDを渡しても同じ集合を返す＝フロー保存IDの世代を気にしなくてよい。
+  if (filters.definition) args.push("--definition-history");
   push("--word-target", filters.wordTarget);
   if (filters.history) args.push("--history");
   push("--regist-from", filters.registFrom);

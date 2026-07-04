@@ -5,7 +5,7 @@
       "name": "archive",
       "file": "i-repo-archive",
       "displayName": "i-repo-archive",
-      "version": "0.6.4",
+      "version": "0.8.0",
       "description": "帳票を bundle 化して保管：ローカル/ファイルサーバー、または S3 / GCS / Azure Blob へ配信（create=取得、push-*=配信）",
       "platforms": [
         "macos",
@@ -25,7 +25,7 @@
         {
           "path": "i-repo-archive",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-archive",
-          "sha256": "5dec62f4aeaf80e0a502b59f1806f7f4ae0f00181c9994c607c15300e368720e"
+          "sha256": "dd23113f8e3675cf061ff511494fc451fedc1ddae99acc6262918a640b01e9aa"
         }
       ]
     },
