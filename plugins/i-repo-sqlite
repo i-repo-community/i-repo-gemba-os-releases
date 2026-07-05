@@ -24,12 +24,18 @@
 "use strict";
 
 const PLUGIN = "i-repo-sqlite";
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
 // ── 予約フラグ: プラグイン自身の引数より先に判定 ──────────────────────
 const argv = process.argv.slice(2);
 const { homedir } = require("node:os");
 const { resolve } = require("node:path");
+
+/** テーブルに指定列があるか（PRAGMA table_info）。endpoint_fp の有無判定を write/query で共有する。 */
+function hasColumn(db, table, col) {
+  try { return db.prepare(`PRAGMA table_info("${table}")`).all().some((c) => c.name === col); }
+  catch { return false; }
+}
 
 if (argv[0] === "--plugin-schema") {
   process.stdout.write(JSON.stringify({
@@ -70,6 +76,8 @@ if (argv[0] === "--plugin-schema") {
         description: "itemId の完全一致（反復可・全リビジョン取得）" },
       { name: "--fields", type: "string", subcommand: "query", filter: true, label: "射影フィールド（CSV）",
         description: "正準名で返却フィールドを限定（カンマ区切り）" },
+      { name: "--endpoint-fp", type: "string", subcommand: "query", filter: true, label: "テナント指紋（endpointFp）",
+        description: "配信元 i-Reporter の endpointFp に厳格一致で絞る（未タグ=旧配信は除外・gemba-adc/1.1 §3.9）" },
     ],
     // ── ADC-1（gemba-adc/1.0）読み返し契約の宣言 ──────────────────────
     subcommands: [
@@ -85,7 +93,7 @@ if (argv[0] === "--plugin-schema") {
       "native-query": { dialect: "sql-select", input: "sql", readOnly: "enforced", audience: ["human"] },
     },
     dataset: [{
-      datasetApi: ["1"], contract: "gemba-adc/1.0", store: "sqlite",
+      datasetApi: ["1"], contract: "gemba-adc/1.1", store: "sqlite",
       locator: { db: { param: "--db" }, table: { param: "--table", default: "reports" } },
       naming: "snake_case",
       keys: { primary: "idempotency_key", upsert: true, dedupe: null },
@@ -101,6 +109,7 @@ if (argv[0] === "--plugin-schema") {
         { name: "update_time", canonical: "updateTime", source: "values.updateTime", type: "datetime", storedAs: "string", format: "local-datetime-slash", timezone: "local" },
         { name: "raw_json", canonical: "raw", source: ".", type: "json-string", schemaRef: "envelope/1.0", pii: "likely" },
         { name: "loaded_at", canonical: "loadedAt", type: "datetime", storedAs: "string", format: "iso8601", timezone: "utc", role: "lineage" },
+        { name: "endpoint_fp", canonical: "endpointFp", source: "provenance.endpointFingerprint", type: "string", role: "tenant", description: "配信元 i-Reporter エンドポイントの正準指紋（テナント同一性・gemba-adc/1.1）。旧配信行は NULL" },
       ],
       quirks: ["raw-json-embedded", "string-dates", "non-json-sentinel", "detail-optional"],
     }],
@@ -183,6 +192,13 @@ function runQuery(qargs, G) {
 
   // WHERE 構築。時刻境界は lib が格納形式（loaded=ISO / 業務時刻=slashローカル）へ正規化済み。
   const where = [], bind = [];
+  // テナント厳格フィルタ（gemba-adc/1.1 §3.9）: endpoint_fp に完全一致（NULL=未タグは自動除外）。
+  // 列が無い旧 DB（endpoint_fp 導入前）では全行が未タグ扱い＝厳格に何も返さない（0=1）。
+  // 絞るときだけ列 probe すればよい（未指定なら調べない）。
+  if (opts.endpointFp) {
+    if (hasColumn(db, opts.table, "endpoint_fp")) { where.push("endpoint_fp = ?"); bind.push(opts.endpointFp); }
+    else where.push("0 = 1");
+  }
   const col = opts.timeField === "updated" ? "update_time"
     : opts.timeField === "registered" ? "regist_time" : "loaded_at";
   const bounds = G.timeBounds(opts, col === "loaded_at" ? "iso" : "slash", queryError, dest);
@@ -318,12 +334,15 @@ function runNativeQuery(dbp, rawSql, opts, kit, dest) {
 }
 
 // ── 引数解析 ─────────────────────────────────────────────────────────
-let dbPath = "", table = "reports", dryRun = false;
+let dbPath = "", table = "reports", dryRun = false, endpointFpFlag = "";
 for (let i = 0; i < argv.length; i++) {
   switch (argv[i]) {
     case "--db":      dbPath = argv[++i] ?? ""; break;
     case "--table":   table = argv[++i] ?? "reports"; break;
     case "--dry-run": dryRun = true; break;
+    // 配信元テナント指紋のフォールバック刻印値（gemba-adc/1.1）。各レコードが provenance を
+    // 持たない（旧マニフェスト等）ときの保険。通常はレコードの provenance.endpointFingerprint を優先。
+    case "--endpoint-fp": endpointFpFlag = (argv[++i] ?? "").trim(); break;
     default:
       console.error(`unknown option: ${argv[i]}`);
       process.exit(2);
@@ -409,17 +428,23 @@ async function readStdin() {
     regist_time     TEXT,
     update_time     TEXT,
     raw_json        TEXT NOT NULL,
-    loaded_at       TEXT NOT NULL
+    loaded_at       TEXT NOT NULL,
+    endpoint_fp     TEXT
   )`);
+  // 既存テーブル（endpoint_fp 導入前）への後方互換マイグレーション（gemba-adc/1.1）。
+  // 列が無ければ足す。既存行の endpoint_fp は NULL のまま＝厳格 query で「未タグ＝除外」になる。
+  if (!hasColumn(db, table, "endpoint_fp")) db.exec(`ALTER TABLE "${table}" ADD COLUMN endpoint_fp TEXT`);
   db.exec(`CREATE INDEX IF NOT EXISTS "idx_${table}_item" ON "${table}"(item_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS "idx_${table}_efp" ON "${table}"(endpoint_fp)`);
 
   const stmt = db.prepare(`INSERT INTO "${table}"
-    (idempotency_key, record_type, item_id, rev_no, name, deleted, regist_time, update_time, raw_json, loaded_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?)
+    (idempotency_key, record_type, item_id, rev_no, name, deleted, regist_time, update_time, raw_json, loaded_at, endpoint_fp)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(idempotency_key) DO UPDATE SET
       record_type=excluded.record_type, item_id=excluded.item_id, rev_no=excluded.rev_no,
       name=excluded.name, deleted=excluded.deleted, regist_time=excluded.regist_time,
-      update_time=excluded.update_time, raw_json=excluded.raw_json, loaded_at=excluded.loaded_at`);
+      update_time=excluded.update_time, raw_json=excluded.raw_json, loaded_at=excluded.loaded_at,
+      endpoint_fp=COALESCE(excluded.endpoint_fp, "${table}".endpoint_fp)`);
 
   const now = new Date().toISOString();
   let failed = 0;
@@ -430,6 +455,9 @@ async function readStdin() {
     try {
       const v = r.values ?? r;
       const key = r.idempotencyKey ?? `${jobId}:${i}`;   // キーが無い行も一意に保存
+      // テナント指紋: レコード自身の provenance（マニフェスト由来・SSOT）を最優先。無ければ
+      // load フラグ（--endpoint-fp）で補完。どちらも無ければ NULL（＝厳格 query で除外・gemba-adc/1.1）。
+      const efp = r.provenance?.endpointFingerprint || endpointFpFlag || null;
       stmt.run(
         key,
         r.recordType ?? null,
@@ -440,7 +468,8 @@ async function readStdin() {
         v.registTime ?? null,
         v.updateTime ?? null,
         JSON.stringify(r),
-        now
+        now,
+        efp
       );
       keys.push(key);
     } catch (e) {

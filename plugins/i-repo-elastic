@@ -24,7 +24,7 @@
 "use strict";
 
 const PLUGIN = "i-repo-elastic";
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
 const argv = process.argv.slice(2);
 
@@ -89,6 +89,8 @@ if (argv[0] === "--plugin-schema") {
       // capability: keyword-search（elastic の本領）。全文検索＝帳票のどこかに語を含むものを引く。
       { name: "--q", type: "string", subcommand: "query", filter: true, label: "全文検索",
         placeholder: "漏れ 不良", description: "全文検索（語をどこかに含む帳票。スペース区切りは AND）" },
+      { name: "--endpoint-fp", type: "string", subcommand: "query", filter: true, label: "テナント指紋（endpointFp）",
+        description: "配信元 i-Reporter の endpointFp に厳格一致で絞る（未タグ=旧配信は除外・gemba-adc/1.1 §3.9）" },
     ],
     // ── ADC-1（gemba-read/1.0）読み返し契約の宣言 ──────────────────────
     subcommands: [
@@ -97,7 +99,7 @@ if (argv[0] === "--plugin-schema") {
     ],
     // ── ADC-1（gemba-adc/1.0）着地スキーマ宣言。ネスト保持・camelCase・動的マッピング無効 ──
     dataset: [{
-      datasetApi: ["1"], contract: "gemba-adc/1.0", store: "elasticsearch",
+      datasetApi: ["1"], contract: "gemba-adc/1.1", store: "elasticsearch",
       // locator は query が必要とする接続フラグを**全て**宣言する（認証フラグ含む。
       // 漏らすと access.query 経路で認証が脱落し 401 へ退行する — レビューで検出済み）。
       locator: {
@@ -111,6 +113,7 @@ if (argv[0] === "--plugin-schema") {
       fields: [
         { name: "_id", canonical: "idempotencyKey", source: "idempotencyKey", type: "string", role: "key" },
         { name: "_loadedAt", canonical: "loadedAt", type: "datetime", format: "iso8601", timezone: "utc", role: "lineage" },
+        { name: "_endpointFp", canonical: "endpointFp", source: "provenance.endpointFingerprint", type: "string", role: "tenant", description: "配信元 i-Reporter エンドポイントの正準指紋（テナント同一性・gemba-adc/1.1）。旧配信ドキュメントには存在しない" },
         { name: "*", canonical: "raw", source: ".", type: "object", schemaRef: "envelope/1.0", pii: "likely" },
       ],
       quirks: ["nested-source", "dynamic-mapping-off", "detail-optional"],
@@ -215,6 +218,9 @@ function runQuery(qargs, G) {
     if (opts.deleted != null) filter.push({ term: { deleted: opts.deleted } });
     if (opts.ids && opts.ids.length) filter.push({ terms: { _id: opts.ids } });
     if (opts.itemIds.length) filter.push({ terms: { "itemId.keyword": opts.itemIds } });
+    // テナント厳格フィルタ（gemba-adc/1.1 §3.9）: _endpointFp に完全一致。フィールドを持たない
+    // 旧ドキュメント（未タグ）は term が当たらず自動除外＝厳格。--endpoint-fp 未指定なら絞らない。
+    if (opts.endpointFp) filter.push({ term: { "_endpointFp.keyword": opts.endpointFp } });
     return filter;
   }
 
@@ -368,8 +374,9 @@ function runQuery(qargs, G) {
     for (const hit of hits) {
       lastSort = Array.isArray(hit.sort) && hit.sort.length ? hit.sort[hit.sort.length - 1] : hit._id;
       const src = hit._source || {};
-      // record 復元: _source から _loadedAt を除いたもの（write の doc 形 { ...envelope, _loadedAt } の逆）。
-      const { _loadedAt, ...record } = src;
+      // record 復元: _source から内部 lineage フィールド（_loadedAt / _endpointFp）を除いたもの
+      //（write の doc 形 { ...envelope, _loadedAt, _endpointFp? } の逆）。
+      const { _loadedAt, _endpointFp, ...record } = src;
       let out = record;
       if (!opts.raw && opts.fields && record && record._raw === undefined) out = G.pickFields(record, opts.fields);
       emitRow(hit._id, _loadedAt ?? null, opts.raw ? src : out, opts.raw);
@@ -410,7 +417,7 @@ function validateReadOnlyEsBody(raw) {
 }
 
 // ── 引数 ─────────────────────────────────────────────────────────────
-let url = "", index = "irepo-reports", apiKey = "", user = "", password = "", dryRun = false;
+let url = "", index = "irepo-reports", apiKey = "", user = "", password = "", dryRun = false, endpointFpFlag = "";
 let apiKeySeen = false, passwordSeen = false;
 for (let i = 0; i < argv.length; i++) {
   switch (argv[i]) {
@@ -420,6 +427,9 @@ for (let i = 0; i < argv.length; i++) {
     case "--user":     user = argv[++i] ?? ""; break;
     case "--password": password = argv[++i] ?? ""; passwordSeen = true; break;
     case "--dry-run":  dryRun = true; break;
+    // 配信元テナント指紋のフォールバック刻印値（gemba-adc/1.1）。各レコードが provenance を
+    // 持たないときの保険。通常はレコードの provenance.endpointFingerprint を優先。
+    case "--endpoint-fp": endpointFpFlag = (argv[++i] ?? "").trim(); break;
     default: console.error(`unknown option: ${argv[i]}`); process.exit(2);
   }
 }
@@ -517,7 +527,12 @@ function chunked(arr, n) {
   const prepared = docs.map((d, i) => {
     const key = d.idempotencyKey
       ?? (d.itemId != null ? `report:${d.itemId}:rev${d.revNo ?? "?"}` : `${jobId}:${i}`);
-    return { id: key, doc: { ...d, _loadedAt: now } };
+    // テナント指紋: レコードの provenance（マニフェスト由来・SSOT）を最優先。無ければ load フラグで補完。
+    // どちらも無ければフィールド自体を付けない（＝厳格 query の term が当たらず除外・gemba-adc/1.1）。
+    const efp = d.provenance?.endpointFingerprint || endpointFpFlag || "";
+    const doc = { ...d, _loadedAt: now };
+    if (efp) doc._endpointFp = efp;
+    return { id: key, doc };
   });
 
   if (dryRun) {

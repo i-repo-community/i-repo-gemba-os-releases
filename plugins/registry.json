@@ -62,7 +62,7 @@
       "name": "elastic",
       "file": "i-repo-elastic",
       "displayName": "i-repo-elastic",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "description": "Index NDJSON records into Elasticsearch (日本語全文検索・中間一致・ファセット集計の写し)",
       "platforms": [
         "macos",
@@ -83,7 +83,7 @@
         {
           "path": "i-repo-elastic",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-elastic",
-          "sha256": "4a63fa145a749f223b5ec461e641eb9de78b523567ec46105ca0d47d47501055"
+          "sha256": "8d85611d505acbef03a8ee68970640e734f47231dc428c1b5181d9b17760ff30"
         }
       ]
     },
@@ -175,7 +175,7 @@
       "name": "sqlite",
       "file": "i-repo-sqlite",
       "displayName": "i-repo-sqlite",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "description": "Accumulate NDJSON records into a local SQLite database (UPSERT by idempotencyKey)",
       "platforms": [
         "macos",
@@ -195,7 +195,7 @@
         {
           "path": "i-repo-sqlite",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-sqlite",
-          "sha256": "7bfdc6a0702dc42a5da3e880483fc447581b2911d9224fef815573f567f3be33"
+          "sha256": "7318a9e962bcdddf53a61d97c5011fb905539992d450980eaaaf87f50fa84bdd"
         }
       ]
     }
@@ -204,7 +204,7 @@
     {
       "path": "lib/gemba-read.js",
       "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/lib/gemba-read.js",
-      "sha256": "c5e7643d636ae837a3b9fe0ae90dce3a446d2d9a565ea1effcddfb4d8ecad0a2"
+      "sha256": "80fd8fb23e625fcc4b9febca96cb357ca7883eff6332776c0811b1aa613e7cb8"
     },
     {
       "path": "lib/spawn.js",

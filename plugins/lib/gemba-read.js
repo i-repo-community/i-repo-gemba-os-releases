@@ -107,7 +107,7 @@ function pickFields(record, paths) {
 // connSpec: 接続フラグの宣言 { "--db": "db", "--table": "table", ... }（フラグ → opts キー。
 // すべて値を取る文字列フラグ）。共通フラグはここで一括処理し、未知フラグは E_ARGS。
 // 戻り値 opts: { since, until, timeField, deleted, ids, itemIds, fields, limit, cursor,
-//               countOnly, raw, <connSpec の各キー> }
+//               countOnly, raw, endpointFp, <connSpec の各キー> }
 // extraFlags: プラグインが capability で名乗る追加の選択フラグ（脱料理の拡張点・fail-open）。
 //   { "--q": { key: "q" }, "--cluster": { key: "clusters", repeatable: true } } の形。
 //   宣言したプラグインだけがそのフラグを受理する。未宣言プラグインでは閉集合のまま＝未知フラグは E_ARGS。
@@ -116,7 +116,7 @@ function parseQueryArgs(qargs, connSpec, queryError, extraFlags = {}) {
   const opts = {
     since: null, until: null, timeField: "loaded", deleted: null,
     ids: null, itemIds: [], fields: null, limit: 100, cursor: null,
-    countOnly: false, raw: false,
+    countOnly: false, raw: false, endpointFp: null,
   };
   for (const k of Object.values(connSpec)) opts[k] = opts[k] ?? "";
   for (const spec of Object.values(extraFlags)) {
@@ -141,6 +141,10 @@ function parseQueryArgs(qargs, connSpec, queryError, extraFlags = {}) {
       case "--ids": opts.ids = (qargs[++i] ?? "").split(",").map((s) => s.trim()).filter(Boolean); break;
       case "--item-id": opts.itemIds.push(qargs[++i] ?? ""); break;
       case "--fields": opts.fields = (qargs[++i] ?? "").split(",").map((s) => s.trim()).filter(Boolean); break;
+      // テナント（配信元 i-Reporter エンドポイント）の指紋で厳格に絞る（gemba-adc/1.1）。空文字は未指定扱い。
+      // 各 sink は endpoint_fp 列/フィールドと完全一致でフィルタし、未タグ（NULL・列/フィールド無し）は
+      // 除外する（＝別テナント・出所不明の混在行を読み返しから外す。仕様 §3.9）。
+      case "--endpoint-fp": { const v = (qargs[++i] ?? "").trim(); opts.endpointFp = v || null; break; }
       case "--limit": opts.limit = parseInt(qargs[++i] ?? "100", 10); break;
       case "--cursor": opts.cursor = qargs[++i] ?? null; break;
       case "--count-only": opts.countOnly = true; break;
