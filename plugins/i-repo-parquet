@@ -34,7 +34,7 @@
 "use strict";
 
 const PLUGIN = "i-repo-parquet";
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 const { spawnSyncSpec } = require("./lib/spawn.js");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -105,10 +105,12 @@ if (argv[0] === "--plugin-schema") {
         description: "itemId の完全一致（反復可・全リビジョン取得）" },
       { name: "--fields", type: "string", subcommand: "query", filter: true, label: "射影フィールド（CSV）",
         description: "正準名で返却フィールドを限定（カンマ区切り）" },
+      { name: "--endpoint-fp", type: "string", subcommand: "query", filter: true, label: "テナント指紋（endpointFp）",
+        description: "配信元 i-Reporter の endpointFp に厳格一致で絞る（未タグ=旧配信は除外・gemba-adc/1.1 §3.9）" },
     ],
     // ── ADC-1（gemba-adc/1.0）着地スキーマ宣言。--iceberg-table の有無で2形態 ──
     dataset: [
-      { datasetApi: ["1"], contract: "gemba-adc/1.0", store: "parquet",
+      { datasetApi: ["1"], contract: "gemba-adc/1.1", store: "parquet",
         selector: { param: "--iceberg-table", present: false },
         locator: { out: { param: "--out" } },
         naming: "snake_case",
@@ -116,7 +118,7 @@ if (argv[0] === "--plugin-schema") {
         contents: "latest-batch-only",
         fields: parquetFields(),
         quirks: ["raw-json-embedded", "string-dates", "non-json-sentinel", "overwrite-on-rerun", "detail-optional"] },
-      { datasetApi: ["1"], contract: "gemba-adc/1.0", store: "iceberg",
+      { datasetApi: ["1"], contract: "gemba-adc/1.1", store: "iceberg",
         selector: { param: "--iceberg-table", present: true },
         // locator は query が必要とする接続フラグを**全て**宣言する（access.query の正本になる。
         // 漏らすと読み返しがその引数なしで実行され失敗する — レビューで --warehouse 欠落を検出済み）。
@@ -149,6 +151,7 @@ function parquetFields() {
     { name: "update_time", canonical: "updateTime", source: "values.updateTime", type: "datetime", storedAs: "string", format: "local-datetime-slash", timezone: "local" },
     { name: "raw_json", canonical: "raw", source: ".", type: "json-string", schemaRef: "envelope/1.0", pii: "likely" },
     { name: "loaded_at", canonical: "loadedAt", type: "datetime", storedAs: "string", format: "iso8601", timezone: "utc", role: "lineage" },
+    { name: "endpoint_fp", canonical: "endpointFp", source: "provenance.endpointFingerprint", type: "string", role: "tenant", description: "配信元 i-Reporter エンドポイントの正準指紋（テナント同一性・gemba-adc/1.1）。旧配信行は NULL/列不在" },
   ];
 }
 
@@ -248,6 +251,17 @@ function runQuery(qargs, G) {
 
   // WHERE 構築。時刻境界は lib が格納形式（loaded=ISO / 業務時刻=slashローカル）へ正規化済み。
   const where = [];
+  // テナント厳格フィルタ（gemba-adc/1.1 §3.9）: endpoint_fp に完全一致。列を持たない旧ストア
+  // （v0.2.0 以前の parquet ファイル / iceberg テーブル）はエラーにせず 0 件（厳格・fail-closed）。
+  // 列 probe（DESCRIBE）は絞るときだけ行う。未指定なら全件（後方互換）。
+  if (opts.endpointFp) {
+    const probe = runDuckdbJson(setup +
+      `SELECT column_name FROM (DESCRIBE SELECT * FROM ${srcExpr}) WHERE column_name = ${q("endpoint_fp")};`);
+    let hasCol = false;
+    if (probe.status === 0) { try { hasCol = parseDuckdbJsonArrays(probe.stdout).length > 0; } catch { hasCol = false; } }
+    if (hasCol) where.push(`endpoint_fp = ${q(opts.endpointFp)}`);
+    else where.push("false");   // 列不在＝未タグ扱いで厳格に 0 件（DuckDB は WHERE false を許容）
+  }
   const col = opts.timeField === "updated" ? "update_time" : opts.timeField === "registered" ? "regist_time" : "loaded_at";
   const bounds = G.timeBounds(opts, col === "loaded_at" ? "iso" : "slash", queryError, dest);
   if (bounds?.gte) where.push(`${col} >= ${q(bounds.gte)}`);
@@ -278,7 +292,7 @@ function runQuery(qargs, G) {
       queryError("E_INTERNAL", msg, null, 1, dest);
     }
     let total = 0;
-    try { const arr = JSON.parse(r.stdout || "[]"); total = arr.length ? Number(arr[0].n) : 0; }
+    try { const arr = parseDuckdbJsonArrays(r.stdout); total = arr.length ? Number(arr[0].n) : 0; }
     catch (e) { queryError("E_INTERNAL", `cannot parse duckdb output: ${e.message}`, null, 1, dest); }
     const end = { count: 0, complete: true, total, nextCursor: null, dest, dedupeApplied };
     if (timeFilter) end.timeFilter = timeFilter;
@@ -307,7 +321,7 @@ function runQuery(qargs, G) {
     queryError("E_INTERNAL", msg, null, 1, dest);
   }
   let rows;
-  try { rows = JSON.parse(r.stdout || "[]"); }
+  try { rows = parseDuckdbJsonArrays(r.stdout); }
   catch (e) { queryError("E_INTERNAL", `cannot parse duckdb output: ${e.message}`, null, 1, dest); }
 
   let lastKey = null;
@@ -342,10 +356,33 @@ function runDuckdbJson(sql) {
   });
 }
 
+// duckdb -json は「1 文につき 1 配列」を文ごとに出力する。iceberg 経路は実クエリの前に setup 文
+// （CREATE SECRET 等）が [{"Success":true}] を吐くため stdout に複数の JSON 配列が並ぶ。しかも複数行
+// 結果は配列が改行をまたぐ（行頭 '[' 判定では取りこぼす）。文字列リテラル/エスケープを尊重して括弧深度で
+// top-level 配列を切り出し、最後の配列（＝実クエリ結果）だけを parse する。parquet 単文経路は配列 1 個の
+// まま不変。gemba-adc/1.1 のテナント列 probe（DESCRIBE）も iceberg では setup 前置になるためこれを通す。
+function parseDuckdbJsonArrays(stdout) {
+  const text = String(stdout || "");
+  let depth = 0, inStr = false, esc = false, start = -1, last = null;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === "[") { if (depth === 0) start = i; depth++; }
+    else if (c === "]") { if (--depth === 0 && start >= 0) last = text.slice(start, i + 1); }
+  }
+  return last ? JSON.parse(last) : [];
+}
+
 // ── 引数 ─────────────────────────────────────────────────────────────
 let out = "", icebergEndpoint = "", warehouse = "", icebergTable = "";
 let s3Endpoint = "", s3KeyId = "", s3Secret = "", s3Region = "us-east-1";
-let dryRun = false;
+let dryRun = false, endpointFpFlag = "";
 for (let i = 0; i < argv.length; i++) {
   switch (argv[i]) {
     case "--out":              out = argv[++i] ?? ""; break;
@@ -357,6 +394,9 @@ for (let i = 0; i < argv.length; i++) {
     case "--s3-secret":        s3Secret = argv[++i] ?? ""; break;
     case "--s3-region":        s3Region = argv[++i] ?? "us-east-1"; break;
     case "--dry-run":          dryRun = true; break;
+    // 配信元テナント指紋のフォールバック刻印値（gemba-adc/1.1）。レコードが provenance を持たない
+    // ときの保険。通常はレコードの provenance.endpointFingerprint を優先。
+    case "--endpoint-fp":      endpointFpFlag = (argv[++i] ?? "").trim(); break;
     default: console.error(`unknown option: ${argv[i]}`); process.exit(2);
   }
 }
@@ -415,7 +455,7 @@ function runDuckdb(sql) {
 const COLUMNS =
   "columns={idempotency_key:'VARCHAR', record_type:'VARCHAR', item_id:'VARCHAR', " +
   "rev_no:'VARCHAR', name:'VARCHAR', deleted:'BOOLEAN', regist_time:'VARCHAR', " +
-  "update_time:'VARCHAR', raw_json:'VARCHAR', loaded_at:'VARCHAR'}";
+  "update_time:'VARCHAR', raw_json:'VARCHAR', loaded_at:'VARCHAR', endpoint_fp:'VARCHAR'}";
 
 (async () => {
   const text = await readStdin();
@@ -459,6 +499,9 @@ const COLUMNS =
       update_time: v.updateTime ?? null,
       raw_json: JSON.stringify(r),
       loaded_at: now,
+      // テナント指紋: レコードの provenance（マニフェスト由来・SSOT）を最優先。無ければ load フラグで
+      // 補完。どちらも無ければ NULL（＝厳格 query で除外・gemba-adc/1.1 §3.9）。
+      endpoint_fp: r.provenance?.endpointFingerprint || endpointFpFlag || null,
     };
   });
 
@@ -487,10 +530,14 @@ const COLUMNS =
         `REGION ${q(s3Region)}${s3Endpoint ? `, ENDPOINT ${q(ep)}, URL_STYLE 'path', USE_SSL ${ssl}` : ""});\n`;
     }
     setup += `ATTACH ${q(warehouse)} AS ic (TYPE iceberg, ENDPOINT ${q(icebergEndpoint)}, AUTHORIZATION_TYPE 'none');\n`;
+    // endpoint_fp（gemba-adc/1.1）: 新規テーブルは src の全列（endpoint_fp 含む）で作られる。
+    // v0.2.0 以前に作られた既存テーブルには列が無いので ADD COLUMN IF NOT EXISTS で追補し（Iceberg の
+    // スキーマ進化）、列順に依存しない INSERT ... BY NAME で追記する（既存行の endpoint_fp は NULL＝未タグ）。
     writeSql = setup +
       `CREATE SCHEMA IF NOT EXISTS ic."${ns}";\n` +
       `CREATE TABLE IF NOT EXISTS ic."${ns}"."${tbl}" AS SELECT * FROM ${src} LIMIT 0;\n` +
-      `INSERT INTO ic."${ns}"."${tbl}" SELECT * FROM ${src};`;
+      `ALTER TABLE ic."${ns}"."${tbl}" ADD COLUMN IF NOT EXISTS endpoint_fp VARCHAR;\n` +
+      `INSERT INTO ic."${ns}"."${tbl}" BY NAME SELECT * FROM ${src};`;
     verifySql = setup +
       `SELECT count(*) FROM ic."${ns}"."${tbl}" WHERE loaded_at = ${q(now)};`;
   } else {

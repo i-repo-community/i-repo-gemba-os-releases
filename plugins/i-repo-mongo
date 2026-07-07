@@ -26,7 +26,7 @@
 "use strict";
 
 const PLUGIN = "i-repo-mongo";
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 const { spawnSync } = require("node:child_process");
 const { spawnSyncSpec } = require("./lib/spawn.js");
 
@@ -122,6 +122,8 @@ if (argv[0] === "--plugin-schema") {
         description: "itemId の完全一致（反復可・全リビジョン取得）" },
       { name: "--fields", type: "string", subcommand: "query", filter: true, label: "射影フィールド（CSV）",
         description: "正準名で返却フィールドを限定（カンマ区切り）" },
+      { name: "--endpoint-fp", type: "string", subcommand: "query", filter: true, label: "テナント指紋（endpointFp）",
+        description: "配信元 i-Reporter の endpointFp に厳格一致で絞る（未タグ=旧配信は除外・gemba-adc/1.1 §3.9）" },
     ],
     // ── ADC-1（gemba-adc/1.0）読み返し契約の宣言 ──────────────────────
     subcommands: [
@@ -138,7 +140,7 @@ if (argv[0] === "--plugin-schema") {
     },
     // ── ADC-1（gemba-adc/1.0）着地スキーマ宣言。ネスト保持・camelCase ──
     dataset: [{
-      datasetApi: ["1"], contract: "gemba-adc/1.0", store: "mongodb",
+      datasetApi: ["1"], contract: "gemba-adc/1.1", store: "mongodb",
       locator: { uri: { param: "--uri", secret: true }, db: { param: "--db" }, collection: { param: "--collection", default: "reports" } },
       naming: "camelCase",
       keys: { primary: "_id", upsert: true, dedupe: null },
@@ -146,6 +148,7 @@ if (argv[0] === "--plugin-schema") {
       fields: [
         { name: "_id", canonical: "idempotencyKey", source: "idempotencyKey", type: "string", role: "key" },
         { name: "_loadedAt", canonical: "loadedAt", type: "datetime", format: "iso8601", timezone: "utc", role: "lineage" },
+        { name: "_endpointFp", canonical: "endpointFp", source: "provenance.endpointFingerprint", type: "string", role: "tenant", description: "配信元 i-Reporter エンドポイントの正準指紋（テナント同一性・gemba-adc/1.1）。旧配信ドキュメントには存在しない" },
         { name: "*", canonical: "raw", source: ".", type: "object", schemaRef: "envelope/1.0", pii: "likely" },
       ],
       quirks: ["nested-source", "detail-optional"],
@@ -213,8 +216,17 @@ function runMongoshQuery(uri, scriptBody) {
 function parseNdjsonLines(stdout) {
   const out = [];
   for (const line of String(stdout || "").split("\n")) {
-    const s = line.trim();
-    if (!s || (s[0] !== "{" && s[0] !== "[")) continue;
+    let s = line.trim();
+    if (!s) continue;
+    // mongosh 2.x は --nodb --quiet でも stdin スクリプト実行時に REPL プロンプト（"> " や接続後の
+    // "<db>> "）を stdout に前置する。この前置があると最初の print 行が "test> {...}" となり、素朴に
+    // s[0] を見ると JSON 行を取りこぼす（count 0・先頭行欠落）。JSON 開始文字までを捨ててから parse
+    // する（プロンプト混入耐性・EJSON/JSON.stringify 出力は必ず { か [ で始まる1行）。
+    if (s[0] !== "{" && s[0] !== "[") {
+      const i = s.search(/[{[]/);
+      if (i < 0) continue;
+      s = s.slice(i);
+    }
     try { out.push(JSON.parse(s)); } catch { /* 非 JSON 行は無視 */ }
   }
   return out;
@@ -262,6 +274,9 @@ function runQuery(qargs, G) {
   if (opts.deleted != null) filter.deleted = opts.deleted;
   if (opts.ids && opts.ids.length) filter._id = { $in: opts.ids };
   if (opts.itemIds.length) filter.itemId = { $in: opts.itemIds };
+  // テナント厳格フィルタ（gemba-adc/1.1 §3.9）: _endpointFp に完全一致。フィールドを持たない
+  // 旧ドキュメント（未タグ）は等値に当たらず自動除外＝厳格。--endpoint-fp 未指定なら絞らない。
+  if (opts.endpointFp) filter._endpointFp = opts.endpointFp;
 
   const timeFilter = G.buildTimeFilter(opts);
 
@@ -311,10 +326,10 @@ function runQuery(qargs, G) {
     const key = doc._id;
     lastKey = key;
     const loadedAt = doc._loadedAt ?? null;
-    // record 復元: _id と _loadedAt を剥がしたものが元 envelope（§3.3）。
+    // record 復元: 内部フィールド（_id / _loadedAt / _endpointFp）を剥がしたものが元 envelope（§3.3）。
     const record = {};
     for (const k of Object.keys(doc)) {
-      if (k === "_id" || k === "_loadedAt") continue;
+      if (k === "_id" || k === "_loadedAt" || k === "_endpointFp") continue;
       record[k] = doc[k];
     }
     let out = record;
@@ -449,13 +464,16 @@ function firstLine(s) { return String(s || "").split("\n").map((l) => l.trim()).
 function scrub(s) { return String(s || "").replace(/(mongodb(\+srv)?:\/\/)[^@\s/]*@/gi, "$1****@"); }
 
 // ── 引数 ─────────────────────────────────────────────────────────────
-let uri = "", db = "", collection = "reports", dryRun = false;
+let uri = "", db = "", collection = "reports", dryRun = false, endpointFpFlag = "";
 for (let i = 0; i < argv.length; i++) {
   switch (argv[i]) {
     case "--uri":        uri = argv[++i] ?? ""; break;
     case "--db":         db = argv[++i] ?? ""; break;
     case "--collection": collection = argv[++i] ?? "reports"; break;
     case "--dry-run":    dryRun = true; break;
+    // 配信元テナント指紋のフォールバック刻印値（gemba-adc/1.1）。各レコードが provenance を
+    // 持たないときの保険。通常はレコードの provenance.endpointFingerprint を優先。
+    case "--endpoint-fp": endpointFpFlag = (argv[++i] ?? "").trim(); break;
     default: console.error(`unknown option: ${argv[i]}`); process.exit(2);
   }
 }
@@ -529,7 +547,12 @@ function chunked(arr, n) {
   const prepared = docs.map((d, i) => {
     const key = d.idempotencyKey
       ?? (d.itemId != null ? `report:${d.itemId}:rev${d.revNo ?? "?"}` : `${jobId}:${i}`);
-    return { ...d, _id: key, _loadedAt: now };
+    // テナント指紋: レコードの provenance（マニフェスト由来・SSOT）を最優先。無ければ load フラグで補完。
+    // どちらも無ければフィールド自体を付けない（＝厳格 query の等値が当たらず除外・gemba-adc/1.1）。
+    const efp = d.provenance?.endpointFingerprint || endpointFpFlag || "";
+    const doc = { ...d, _id: key, _loadedAt: now };
+    if (efp) doc._endpointFp = efp;
+    return doc;
   });
 
   if (dryRun) {
@@ -564,7 +587,10 @@ function chunked(arr, n) {
       `print(JSON.stringify({found: coll.countDocuments({_id:{$in:ids}})}));`;
     const v = runMongosh(verifyScript);
     if (v.status !== 0) { verifyErr = true; break; }
-    try { found += JSON.parse((v.stdout || "").trim().split("\n").pop()).found; } catch { verifyErr = true; }
+    // parseNdjsonLines を通す（mongosh 2.x の REPL プロンプト前置に耐える・query 経路と同じ）。
+    const parsed = parseNdjsonLines(v.stdout);
+    const last = parsed.length ? parsed[parsed.length - 1] : null;
+    if (last && typeof last.found === "number") found += last.found; else verifyErr = true;
   }
   const verified = !verifyErr && found === ids.length;
   receipt("verify", prepared.length, verified ? 0 : prepared.length - found, verified, { verifiedDocs: found });

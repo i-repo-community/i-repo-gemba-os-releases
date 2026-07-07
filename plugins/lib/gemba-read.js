@@ -28,6 +28,11 @@ function createReadKit(PLUGIN) {
     qEmit({ schemaVersion: "1.0", recordType: raw ? "row-raw" : "row", contract: CONTRACT,
       plugin: PLUGIN, key, loadedAt, record });
 
+  /** aggregate-row 行（gemba-adc/1.2 §aggregate）。dimensions{}＝group_by の値、measures{}＝集計値（数値）。 */
+  const emitAggRow = (dimensions, measures) =>
+    qEmit({ schemaVersion: "1.0", recordType: "aggregate-row", contract: CONTRACT,
+      plugin: PLUGIN, dimensions, measures });
+
   /** error envelope を stderr に1行出して exit（§3.3/§3.8）。stdout は汚さない。 */
   const queryError = (code, message, hint, exitCode, dest) => {
     const e = { schemaVersion: "1.0", recordType: "error", contract: CONTRACT, plugin: PLUGIN, code, message };
@@ -38,7 +43,7 @@ function createReadKit(PLUGIN) {
     process.exit(exitCode);
   };
 
-  return { qEmit, queryEnd, emitRow, queryError };
+  return { qEmit, queryEnd, emitRow, emitAggRow, queryError };
 }
 
 // ── 時刻（§2.6/§3.5）────────────────────────────────────────────────
@@ -201,6 +206,143 @@ function buildTimeFilter(opts) {
   return { field: opts.timeField ?? "loaded", sinceUtc, untilUtc };
 }
 
+// ── 構造化集計 aggregate（gemba-adc/1.2）─────────────────────────────
+// エージェント面の集計は生方言（native）でなく構造で受ける（audience:["human"] 境界を保つ）。
+// フィルタ語彙は query と同一（access.query.filters[]）。次元(group_by)と指標(measure)を追加。
+const AGG_GRANULARITIES = ["year", "month", "day", "hour"]; // MVP。quarter/week は将来
+const AGG_MEASURE_OPS = ["count", "count_distinct", "sum", "avg"]; // 全て数値。min/max は非数値ゆえ将来
+
+// 時刻バケットの substr 長（"YYYY-MM-DDTHH…" / "YYYY/MM/DD HH…" とも位置が揃う）。
+function bucketSubstrLen(granularity) {
+  return { year: 4, month: 7, day: 10, hour: 13 }[granularity] || null;
+}
+
+// tz 解決（§aggregate・DC 合意）: リクエスト tz を最優先。無ければ field.timezone が
+// 「具体」（IANA or "utc"）のときだけ既定採用。記号値（"local"/"unknown"）は未解決＝明示必須（暗黙禁止）。
+// システムは Asia/Tokyo 等を勝手に仮定しない（非-JST 顧客の月境界誤算を封じる）。
+function resolveBucketTz(requestTz, fieldTimezone, queryError, dest) {
+  // 具体 tz（IANA or UTC）だけ受理する。記号値（local/unknown）・空・綴り誤りは未解決/不正として弾く
+  // （Intl.DateTimeFormat が無効な timeZone に RangeError を投げるのを利用・ゼロ依存）。
+  const concrete = (raw) => {
+    const tz = (raw || "").trim();
+    if (!tz || tz === "local" || tz === "unknown") return null; // 記号/空＝未解決
+    const norm = tz === "utc" ? "UTC" : tz;
+    try { new Intl.DateTimeFormat("en-US", { timeZone: norm }); return norm; } catch { return "INVALID"; }
+  };
+  const rawReq = (requestTz || "").trim();
+  if (rawReq) {
+    // request で明示したなら具体値でなければ E_ARGS（記号 tz・不正 IANA を素通りさせない・§3.10）。
+    const r = concrete(rawReq);
+    if (!r || r === "INVALID") {
+      queryError("E_ARGS", `date_bucket: tz が不正です: ${rawReq}`,
+        "具体 IANA（例 Asia/Tokyo）または UTC を渡す（local/unknown は不可）", 2, dest);
+    }
+    return r;
+  }
+  // request 未指定: field.timezone が具体 IANA/UTC のときだけ既定採用（記号値は明示必須）。
+  const f = concrete(fieldTimezone);
+  if (f && f !== "INVALID") return f;
+  queryError("E_ARGS",
+    "date_bucket: タイムゾーンを解決できません（field.timezone が記号値のため tz を明示指定してください・例 Asia/Tokyo）",
+    "date:<field>:<granularity>:<tz> の tz を具体 IANA で渡す", 2, dest);
+}
+
+// --group-by <spec>: "field:<canonical>" | "date:<field>:<granularity>:<tz>"
+function parseGroupBySpec(spec, queryError) {
+  const s = String(spec || "").trim();
+  if (s.startsWith("field:")) {
+    const field = s.slice("field:".length).trim();
+    if (!field) queryError("E_ARGS", `--group-by field: フィールド名が空です`, "field:<canonical>", 2);
+    return { kind: "field", field };
+  }
+  if (s.startsWith("date:")) {
+    const parts = s.slice("date:".length).split(":");
+    const [field, granularity, ...tzRest] = parts;
+    const tz = tzRest.join(":"); // IANA に ":" は無いが将来のオフセット表記に備え結合
+    if (!field || !granularity) queryError("E_ARGS", `--group-by date: 形式は date:<field>:<granularity>:<tz>`, null, 2);
+    if (!AGG_GRANULARITIES.includes(granularity))
+      queryError("E_ARGS", `--group-by date: 未対応の granularity: ${granularity}`, `対応: ${AGG_GRANULARITIES.join("|")}`, 2);
+    return { kind: "date", field, granularity, tz };
+  }
+  queryError("E_ARGS", `--group-by の形式が不正です: ${s}`, "field:<canonical> または date:<field>:<granularity>:<tz>", 2);
+}
+
+// SQL 識別子として安全か（列別名の SQL インジェクション防止＝別名でサブクエリを注入し
+// WHERE(テナント絞り)を回避して越境リードする攻撃を封じる）。英字/_ 始まりの英数字・_ のみ許可。
+const SAFE_ALIAS = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+// --measure <spec>: "count" | "count_distinct:<field>[:<alias>]" | "sum:<field>[:<alias>]" | "avg:<field>[:<alias>]"
+function parseMeasureSpec(spec, queryError) {
+  const s = String(spec || "").trim();
+  let m;
+  if (s === "count") m = { op: "count", alias: "count" };
+  else {
+    const [op, field, alias] = s.split(":");
+    if (!AGG_MEASURE_OPS.includes(op)) queryError("E_ARGS", `--measure 未対応の op: ${op}`, `対応: ${AGG_MEASURE_OPS.join("|")}`, 2);
+    if (op === "count") m = { op: "count", alias: alias || "count" };
+    else {
+      if (!field) queryError("E_ARGS", `--measure ${op} は field 必須（${op}:<field>[:<alias>]）`, null, 2);
+      m = { op, field, alias: alias || `${op}_${field}` };
+    }
+  }
+  // alias は SQL の `AS "<alias>"` に埋まる。安全な識別子だけ許す（field は後段で FIELD_META 照合され
+  // 越境しないため、ここで弾くべきは主にエージェント供給の別名）。
+  if (!SAFE_ALIAS.test(m.alias)) queryError("E_ARGS", `--measure の alias が不正です: ${m.alias}`, "英数字と _ のみ（先頭は英字/_）", 2);
+  return m;
+}
+
+// aggregate の引数解析。フィルタ語彙は query と共通（since/until/time-field/deleted/ids/item-id/endpoint-fp）。
+// connSpec は接続フラグ（query と同じ）。戻り opts に groupBy[]/measures[]/orderBy/limit を足す。
+function parseAggregateArgs(aargs, connSpec, queryError, extraFlags = {}) {
+  const opts = {
+    since: null, until: null, timeField: "loaded", deleted: null, ids: null, itemIds: [],
+    endpointFp: null, groupBy: [], measures: [], orderBy: null, limit: 100, noPiiDimensions: false,
+  };
+  for (const k of Object.values(connSpec)) opts[k] = opts[k] ?? "";
+  for (const spec of Object.values(extraFlags)) {
+    if (spec.repeatable) opts[spec.key] = opts[spec.key] ?? [];
+    else if (opts[spec.key] === undefined) opts[spec.key] = null;
+  }
+  for (let i = 0; i < aargs.length; i++) {
+    const a = aargs[i];
+    if (Object.prototype.hasOwnProperty.call(connSpec, a)) { opts[connSpec[a]] = aargs[++i] ?? ""; continue; }
+    if (Object.prototype.hasOwnProperty.call(extraFlags, a)) {
+      const spec = extraFlags[a]; const v = aargs[++i] ?? "";
+      if (spec.repeatable) opts[spec.key].push(v); else opts[spec.key] = v;
+      continue;
+    }
+    switch (a) {
+      case "--group-by": opts.groupBy.push(parseGroupBySpec(aargs[++i] ?? "", queryError)); break;
+      case "--measure": opts.measures.push(parseMeasureSpec(aargs[++i] ?? "", queryError)); break;
+      case "--order-by": {
+        const [by, dir] = (aargs[++i] ?? "").split(":");
+        opts.orderBy = { by: by || "", dir: dir === "asc" ? "asc" : "desc" };
+        break;
+      }
+      case "--since": opts.since = aargs[++i] ?? null; break;
+      case "--until": opts.until = aargs[++i] ?? null; break;
+      case "--time-field": opts.timeField = aargs[++i] ?? "loaded"; break;
+      case "--deleted": opts.deleted = (aargs[++i] === "true"); break;
+      case "--ids": opts.ids = (aargs[++i] ?? "").split(",").map((s) => s.trim()).filter(Boolean); break;
+      case "--item-id": opts.itemIds.push(aargs[++i] ?? ""); break;
+      case "--endpoint-fp": { const v = (aargs[++i] ?? "").trim(); opts.endpointFp = v || null; break; }
+      case "--limit": opts.limit = parseInt(aargs[++i] ?? "100", 10); break;
+      // ブリッジが tenant-scoped セッションで付与する多層 PII ゲート（値なしフラグ）。
+      // 立っていれば pii 宣言フィールドを次元(group_by/date_bucket)に使うのを拒否する。
+      case "--no-pii-dimensions": opts.noPiiDimensions = true; break;
+      default:
+        queryError("E_ARGS", `unknown aggregate option: ${a}`, "gemba-adc/1.2 §aggregate の閉じたフラグ集合のみ", 2);
+    }
+  }
+  if (!["loaded", "updated", "registered"].includes(opts.timeField))
+    queryError("E_ARGS", `invalid --time-field: ${opts.timeField}`, "loaded|updated|registered", 2);
+  if (!opts.groupBy.length) queryError("E_ARGS", "--group-by は1件以上必要です", "field:<canonical> / date:<field>:<granularity>:<tz>", 2);
+  if (!opts.measures.length) opts.measures = [{ op: "count", alias: "count" }]; // 既定 count
+  if (!Number.isFinite(opts.limit) || opts.limit < 1) opts.limit = 100;
+  if (opts.limit > 1000) opts.limit = 1000;
+  return opts;
+}
+
 module.exports = {
   CONTRACT,
   createReadKit,
@@ -212,4 +354,11 @@ module.exports = {
   parseQueryArgs,
   timeBounds,
   buildTimeFilter,
+  AGG_GRANULARITIES,
+  AGG_MEASURE_OPS,
+  bucketSubstrLen,
+  resolveBucketTz,
+  parseGroupBySpec,
+  parseMeasureSpec,
+  parseAggregateArgs,
 };

@@ -30,7 +30,7 @@
 "use strict";
 
 const PLUGIN = "i-repo-bigquery";
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 const { spawnSyncSpec } = require("./lib/spawn.js");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -91,10 +91,12 @@ if (argv[0] === "--plugin-schema") {
         description: "itemId の完全一致（反復可・全リビジョン取得）" },
       { name: "--fields", type: "string", subcommand: "query", filter: true, label: "射影フィールド（CSV）",
         description: "正準名で返却フィールドを限定（カンマ区切り）" },
+      { name: "--endpoint-fp", type: "string", subcommand: "query", filter: true, label: "テナント指紋（endpointFp）",
+        description: "配信元 i-Reporter の endpointFp に厳格一致で絞る（未タグ=旧配信は除外・gemba-adc/1.1 §3.9）" },
     ],
     // ── ADC-1（gemba-adc/1.0）着地スキーマ宣言 ──────────────────────────
     dataset: [
-      { datasetApi: ["1"], contract: "gemba-adc/1.0", store: "bigquery",
+      { datasetApi: ["1"], contract: "gemba-adc/1.1", store: "bigquery",
         // locator は query が必要とする接続フラグを**全て**宣言する（access.query の正本）。
         // 漏らすと読み返しがその引数なしで実行され失敗する（parquet の --warehouse 欠落の教訓）。
         locator: {
@@ -125,14 +127,16 @@ function bqFields() {
     { name: "update_time", canonical: "updateTime", source: "values.updateTime", type: "datetime", storedAs: "string", format: "local-datetime-slash", timezone: "local" },
     { name: "raw_json", canonical: "raw", source: ".", type: "json-string", schemaRef: "envelope/1.0", pii: "likely" },
     { name: "loaded_at", canonical: "loadedAt", type: "datetime", storedAs: "string", format: "iso8601", timezone: "utc", role: "lineage" },
+    { name: "endpoint_fp", canonical: "endpointFp", source: "provenance.endpointFingerprint", type: "string", role: "tenant", description: "配信元 i-Reporter エンドポイントの正準指紋（テナント同一性・gemba-adc/1.1）。旧配信行は NULL/列不在" },
   ];
 }
 
 // BigQuery テーブルスキーマ（bq load --schema 用）。loaded_at は parquet と揃え STRING(ISO)。
+// endpoint_fp（gemba-adc/1.1）: NULLABLE STRING。既存表には load 時に ALLOW_FIELD_ADDITION で追補する。
 const BQ_SCHEMA =
   "idempotency_key:STRING,record_type:STRING,item_id:STRING,rev_no:STRING," +
   "name:STRING,deleted:BOOLEAN,regist_time:STRING,update_time:STRING," +
-  "raw_json:STRING,loaded_at:STRING";
+  "raw_json:STRING,loaded_at:STRING,endpoint_fp:STRING";
 
 if (argv[0] === "--plugin-healthcheck") {
   const checks = [];
@@ -198,6 +202,18 @@ function runQuery(qargs, G) {
 
   // WHERE 構築。時刻境界は lib が格納形式（loaded=ISO / 業務時刻=slashローカル）へ正規化済み。
   const where = [];
+  // テナント厳格フィルタ（gemba-adc/1.1 §3.9）: endpoint_fp に完全一致。列を持たない旧表（v0.2.0 以前）は
+  // エラーにせず 0 件（厳格・fail-closed）。列 probe（INFORMATION_SCHEMA.COLUMNS）は絞るときだけ行う。
+  // 未指定なら全件（後方互換）。
+  if (opts.endpointFp) {
+    const probeSql = "SELECT column_name FROM `" + `${opts.project}.${opts.dataset}` + "`.INFORMATION_SCHEMA.COLUMNS " +
+      `WHERE table_name = ${q(opts.table)} AND column_name = 'endpoint_fp';`;
+    const pr = runBqJson(probeSql, opts.location, env, 1, opts.project);
+    let hasCol = false;
+    if (pr.status === 0) { try { hasCol = JSON.parse(pr.stdout || "[]").length > 0; } catch { hasCol = false; } }
+    if (hasCol) where.push(`endpoint_fp = ${q(opts.endpointFp)}`);
+    else where.push("FALSE");   // 列不在＝未タグ扱いで厳格に 0 件
+  }
   const col = opts.timeField === "updated" ? "update_time" : opts.timeField === "registered" ? "regist_time" : "loaded_at";
   const bounds = G.timeBounds(opts, col === "loaded_at" ? "iso" : "slash", queryError, dest);
   if (bounds?.gte) where.push(`${col} >= ${q(bounds.gte)}`);
@@ -295,7 +311,7 @@ function bqErrMsg(r) { return (r.stderr || r.stdout || "bq query failed").trim()
 
 // ── 引数 ─────────────────────────────────────────────────────────────
 let project = "", dataset = "", table = "", location = "US", keyFile = "";
-let dryRun = false;
+let dryRun = false, endpointFpFlag = "";
 for (let i = 0; i < argv.length; i++) {
   switch (argv[i]) {
     case "--project":  project = argv[++i] ?? ""; break;
@@ -304,6 +320,9 @@ for (let i = 0; i < argv.length; i++) {
     case "--location": location = argv[++i] ?? "US"; break;
     case "--key-file": keyFile = argv[++i] ?? ""; break;
     case "--dry-run":  dryRun = true; break;
+    // 配信元テナント指紋のフォールバック刻印値（gemba-adc/1.1）。レコードが provenance を持たない
+    // ときの保険。通常はレコードの provenance.endpointFingerprint を優先。
+    case "--endpoint-fp": endpointFpFlag = (argv[++i] ?? "").trim(); break;
     default: console.error(`unknown option: ${argv[i]}`); process.exit(2);
   }
 }
@@ -410,6 +429,9 @@ function bqEnv(kf) {
       update_time: v.updateTime ?? null,
       raw_json: JSON.stringify(r),
       loaded_at: now,
+      // テナント指紋: レコードの provenance（マニフェスト由来・SSOT）を最優先。無ければ load フラグで
+      // 補完。どちらも無ければ NULL（＝厳格 query で除外・gemba-adc/1.1 §3.9）。
+      endpoint_fp: r.provenance?.endpointFingerprint || endpointFpFlag || null,
     };
   });
 
@@ -444,8 +466,12 @@ function bqEnv(kf) {
   fs.writeFileSync(tmp, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
   const cleanup = () => { try { fs.unlinkSync(tmp); } catch { /* noop */ } };
 
+  // --schema_update_option=ALLOW_FIELD_ADDITION: v0.2.0 以前に作られた既存表（endpoint_fp 列なし）へ
+  // load するとき、スキーマに増えた endpoint_fp を NULLABLE 列として自動追補する（gemba-adc/1.1 の
+  // 後方互換移行。既存行の endpoint_fp は NULL＝未タグ）。新規表はこの schema で作成される。
   const w = spawnSyncSpec("bq", ["--quiet", "--headless", `--location=${location}`, `--project_id=${project}`,
     "load", "--source_format=NEWLINE_DELIMITED_JSON", "--replace=false",
+    "--schema_update_option=ALLOW_FIELD_ADDITION",
     "--schema", BQ_SCHEMA, tableRef, tmp], { encoding: "utf8", env, maxBuffer: 256 * 1024 * 1024 });
   if (w.status !== 0) {
     console.error((w.stderr || w.stdout || "bq load failed").trim());

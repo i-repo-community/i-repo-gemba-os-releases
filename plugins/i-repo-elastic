@@ -24,7 +24,7 @@
 "use strict";
 
 const PLUGIN = "i-repo-elastic";
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 
 const argv = process.argv.slice(2);
 
@@ -96,10 +96,13 @@ if (argv[0] === "--plugin-schema") {
     subcommands: [
       { name: "query", mode: "read", input: ["none"], output: ["ndjson"],
         description: "着地済みレコードを正準封筒形で読み出す（ページ付き・書込ゼロ）" },
+      // gemba-adc/1.2: 構造化集計（ES aggs へ写像）。生 DSL を渡さず group_by/measure で集計。
+      { name: "aggregate", mode: "read", input: ["none"], output: ["ndjson"],
+        description: "次元(group_by)＋指標(measure)で集計する（読み取り専用・aggregate-row + query-end）" },
     ],
-    // ── ADC-1（gemba-adc/1.0）着地スキーマ宣言。ネスト保持・camelCase・動的マッピング無効 ──
+    // ── ADC-1（gemba-adc/1.x）着地スキーマ宣言。ネスト保持・camelCase・動的マッピング無効 ──
     dataset: [{
-      datasetApi: ["1"], contract: "gemba-adc/1.1", store: "elasticsearch",
+      datasetApi: ["1"], contract: "gemba-adc/1.2", store: "elasticsearch",
       // locator は query が必要とする接続フラグを**全て**宣言する（認証フラグ含む。
       // 漏らすと access.query 経路で認証が脱落し 401 へ退行する — レビューで検出済み）。
       locator: {
@@ -139,6 +142,22 @@ if (process.env.IREPO_PLUGIN_API && process.env.IREPO_PLUGIN_API !== "1") {
   process.exit(11);
 }
 
+// 構造化集計 aggregate（gemba-adc/1.2）で参照する正準名→ES フィールド/属性の宣言源
+// （--plugin-schema の dataset.fields と一致）。terms 集計は keyword サブフィールドで行う。
+// aggregate の次元/指標はここに在るフィールドのみ参照可（未宣言＝E_ARGS＝越境穴を宣言駆動で封鎖）。
+// dispatch より前に初期化する（TDZ 回避）。
+const AGG_FIELD = {
+  idempotencyKey: { term: "idempotencyKey.keyword" },
+  itemId: { term: "itemId.keyword" },
+  revNo: { term: "revNo.keyword" },
+  name: { term: "values.name.keyword", pii: true },
+  deleted: { term: "deleted" }, // boolean。terms/composite は真偽値キーをそのまま返す
+  registTime: { term: "values.registTime.keyword", datetime: true, timezone: "local" },
+  updateTime: { term: "values.updateTime.keyword", datetime: true, timezone: "local" },
+  loadedAt: { term: "_loadedAt.keyword", datetime: true, timezone: "utc" },
+  endpointFp: { term: "_endpointFp.keyword" },
+};
+
 // ── query サブコマンド（ADC-1 / gemba-read/1.0・読み取り専用） ─────────
 // 着地済みレコードを「正準封筒形」で読み出す。書込・新規作成・スキーマ変更はしない。
 // 成功は末尾 query-end トレーラの存在で判定（契約 §3.4）。0件でも query-end を出す。
@@ -157,6 +176,22 @@ if (argv[0] === "query") {
   // runQuery は非同期（fetch）。同期復帰で write 経路へ落ちないよう、ここで実行を打ち切る。
   // CommonJS モジュールスコープの top-level return は合法（exit は runQuery 内の IIFE で起きる）。
   runQuery(argv.slice(1), G);
+  return;
+}
+
+// ── aggregate サブコマンド（gemba-adc/1.2・構造化集計・読み取り専用） ─────
+// 生 DSL を渡さず group_by/measure で集計（audience:human 境界を保つ）。ES aggs へ写像。
+if (argv[0] === "aggregate") {
+  let G;
+  try { G = require("./lib/gemba-read.js"); }
+  catch {
+    console.error(JSON.stringify({ schemaVersion: "1.0", recordType: "error", contract: "gemba-read/1.0",
+      plugin: PLUGIN, code: "E_INTERNAL",
+      message: "gemba-read ライブラリが見つかりません（lib/gemba-read.js）。plugins/install.sh を再実行してください",
+      retryable: false }));
+    process.exit(1);
+  }
+  runAggregate(argv.slice(1), G);
   return;
 }
 
@@ -389,6 +424,119 @@ function runQuery(qargs, G) {
     };
     if (timeFilter) end.timeFilter = timeFilter;
     queryEnd(end);
+    process.exit(0);
+  })().catch((e) => { queryError("E_INTERNAL", scrub(e.message), null, 1, dest); });
+}
+
+// ── aggregate（gemba-adc/1.2・構造化集計）─ ES aggs へ写像 ────────────────
+// group_by → composite の sources（field=terms／date_bucket=keyword を substring する terms script。
+// ES の時刻は keyword 型で date 型でないため date_histogram の native tz 変換は使えず、sqlite と同じ
+// 壁時計 prefix セマンティクス・§3.10）。measure → doc_count / cardinality / sum / avg。
+// テナント絞り（_endpointFp 厳格）・未宣言/PII 次元ゲートは query/sqlite と同一の砦。
+function runAggregate(aargs, G) {
+  const { queryEnd, emitAggRow, queryError } = G.createReadKit(PLUGIN);
+  const opts = G.parseAggregateArgs(aargs, {
+    "--url": "url", "--index": "index", "--api-key": "apiKey", "--user": "user", "--password": "password",
+  }, queryError);
+  if (!aargs.includes("--api-key") && process.env.IREPO_ELASTIC_API_KEY) opts.apiKey = process.env.IREPO_ELASTIC_API_KEY;
+  if (!aargs.includes("--password") && process.env.IREPO_ELASTIC_PASSWORD) opts.password = process.env.IREPO_ELASTIC_PASSWORD;
+  if (!opts.url) queryError("E_ARGS", "--url is required", "集計対象の Elasticsearch URL", 2);
+  if (!opts.index) opts.index = "irepo-reports";
+
+  const qurl = opts.url.replace(/\/+$/, "");
+  const maskUserinfo = (u) => u.replace(/(\/\/)[^/@]*@/, "$1****@");
+  const dest = `elasticsearch:${opts.index}@${maskUserinfo(qurl)}`;
+  const scrub = (s) => String(s).replace(/(\/\/)[^/@\s]*@/g, "$1****@");
+  const authHeaders = () => {
+    const h = { "Content-Type": "application/json" };
+    if (opts.apiKey) h["Authorization"] = `ApiKey ${opts.apiKey}`;
+    else if (opts.user) h["Authorization"] = "Basic " + Buffer.from(`${opts.user}:${opts.password}`).toString("base64");
+    return h;
+  };
+
+  // 次元 → composite source（未宣言/PII ゲートは spawn 前の砦と多層）。
+  const sources = [], dimKeys = [];
+  for (const g of opts.groupBy) {
+    const meta = AGG_FIELD[g.field];
+    if (!meta) queryError("E_ARGS", `未宣言のフィールドは次元にできません: ${g.field}`, "schema.fields の正準名のみ", 2, dest);
+    if (opts.noPiiDimensions && meta.pii) queryError("E_ARGS", `PII 宣言フィールドは次元(group_by)に使えません（テナント分離セッション）: ${g.field}`, "集計でも値集合が露出するため", 2, dest);
+    if (g.kind === "field") {
+      dimKeys.push(g.field);
+      sources.push({ [g.field]: { terms: { field: meta.term } } });
+    } else {
+      if (!meta.datetime) queryError("E_ARGS", `date_bucket は datetime フィールドのみ: ${g.field}`, null, 2, dest);
+      const tz = G.resolveBucketTz(g.tz, meta.timezone, queryError, dest);
+      if (meta.timezone === "utc" && tz !== "UTC") queryError("E_UNSUPPORTED", `UTC 格納フィールド(${g.field})の非-UTC(${tz})バケットは未対応（MVP）`, "tz=UTC にするか局所時刻フィールドを使う", 2, dest);
+      const len = G.bucketSubstrLen(g.granularity);
+      const key = `${g.field}_${g.granularity}`;
+      dimKeys.push(key);
+      // 固定 script（whitelist フィールド・ユーザー入力なし）で keyword を prefix 切り出し。
+      const src = `def v=doc[${JSON.stringify(meta.term)}]; if(v.size()==0) return null; def s=v.value; return s.length() >= ${len} ? s.substring(0, ${len}) : s;`;
+      sources.push({ [key]: { terms: { script: { source: src } } } });
+    }
+  }
+
+  // 指標 → sub-agg（count は doc_count・他は cardinality/sum/avg）。
+  const subAggs = {}, measKeys = [];
+  for (const m of opts.measures) {
+    measKeys.push(m.alias);
+    if (m.op === "count") continue;
+    const meta = AGG_FIELD[m.field];
+    if (!meta) queryError("E_ARGS", `未宣言のフィールドは指標にできません: ${m.field}`, "schema.fields の正準名のみ", 2, dest);
+    subAggs[m.alias] = m.op === "count_distinct" ? { cardinality: { field: meta.term } }
+      : m.op === "sum" ? { sum: { field: meta.term } } : { avg: { field: meta.term } };
+  }
+  // 出力キー一意性（同名 dimension/alias の畳み込み事故防止・sqlite と同じ）。
+  const allKeys = [...dimKeys, ...measKeys];
+  const dup = allKeys.find((k, i) => allKeys.indexOf(k) !== i);
+  if (dup) queryError("E_ARGS", `出力キーが重複しています: ${dup}`, "group_by 次元と measure alias は一意にする（measure に別名 as を付ける）", 2, dest);
+
+  (async () => {
+    const filter = [];
+    const bounds = G.timeBounds(opts, opts.timeField === "loaded" ? "iso" : "slash", queryError, dest);
+    const tkw = opts.timeField === "updated" ? "values.updateTime.keyword" : opts.timeField === "registered" ? "values.registTime.keyword" : "_loadedAt.keyword";
+    if (bounds) filter.push({ range: { [tkw]: bounds } });
+    if (opts.deleted != null) filter.push({ term: { deleted: opts.deleted } });
+    if (opts.ids && opts.ids.length) filter.push({ terms: { _id: opts.ids } });
+    if (opts.itemIds.length) filter.push({ terms: { "itemId.keyword": opts.itemIds } });
+    // テナント厳格フィルタ（§3.9）: 未タグは term が当たらず自動除外。
+    if (opts.endpointFp) filter.push({ term: { "_endpointFp.keyword": opts.endpointFp } });
+    const query = filter.length ? { bool: { filter } } : { match_all: {} };
+
+    const grp = { composite: { size: opts.limit, sources } };
+    if (Object.keys(subAggs).length) grp.aggs = subAggs;
+    const body = { size: 0, query, aggs: { grp } };
+
+    let res, text;
+    try {
+      res = await fetch(`${qurl}/${encodeURIComponent(opts.index)}/_search`,
+        { method: "POST", headers: authHeaders(), body: JSON.stringify(body) });
+      text = await res.text();
+    } catch (e) { queryError("E_CONNECT", `cannot reach Elasticsearch: ${scrub(e.message)}`, "--url を確認。ES が起動しているか確認", 1, dest); }
+    let json = null; try { json = JSON.parse(text); } catch { /* 非JSON */ }
+    if (res.status === 404 || json?.error?.type === "index_not_found_exception") queryError("E_NOT_FOUND", `index not found: ${opts.index}`, "配信が一度も成功していない可能性があります", 1, dest);
+    if (res.status === 401 || res.status === 403) queryError("E_CONNECT", `authorization failed: HTTP ${res.status}`, "--api-key / --user / --password を確認", 1, dest);
+    if (!res.ok || !json?.aggregations?.grp) queryError("E_INTERNAL", `aggregate _search failed: HTTP ${res.status}`, scrub(json?.error?.reason || "").slice(0, 160) || null, 1, dest);
+
+    const buckets = json.aggregations.grp.buckets || [];
+    // composite は key 順の1ページ。フルページ＋after_key ありなら「まだ続く」＝ truncated（§limit 決定性）。
+    const truncated = buckets.length >= opts.limit && !!json.aggregations.grp.after_key;
+    let rows = buckets.map((b) => {
+      const dimensions = {}, measures = {};
+      for (const k of dimKeys) dimensions[k] = b.key[k] ?? null; // NULL 群は null
+      for (const m of opts.measures) measures[m.alias] = m.op === "count" ? b.doc_count : Number(b[m.alias]?.value ?? 0);
+      return { dimensions, measures };
+    });
+    // order_by: composite は key 順のため client 側で並べ替える（非-truncated なら正確・§limit 決定性）。
+    if (opts.orderBy && opts.orderBy.by) {
+      const by = opts.orderBy.by;
+      if (![...measKeys, ...dimKeys].includes(by)) queryError("E_ARGS", `--order-by の対象が不明: ${by}`, "measure alias か group_by 次元名", 2, dest);
+      const val = (r) => (measKeys.includes(by) ? r.measures[by] : r.dimensions[by]);
+      const sign = opts.orderBy.dir === "asc" ? 1 : -1;
+      rows.sort((a, b2) => { const x = val(a), y = val(b2); return (x < y ? -1 : x > y ? 1 : 0) * sign; });
+    }
+    for (const r of rows) emitAggRow(r.dimensions, r.measures);
+    queryEnd({ count: rows.length, complete: !truncated, truncated, nextCursor: null, dest, aggregate: true, groupBy: dimKeys, measures: measKeys });
     process.exit(0);
   })().catch((e) => { queryError("E_INTERNAL", scrub(e.message), null, 1, dest); });
 }

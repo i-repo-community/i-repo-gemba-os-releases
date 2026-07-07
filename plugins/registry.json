@@ -33,7 +33,7 @@
       "name": "bigquery",
       "file": "i-repo-bigquery",
       "displayName": "i-repo-bigquery",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "description": "Write NDJSON records to Google BigQuery (bq CLI経由・Cloud DWH Ready)",
       "platforms": [
         "macos",
@@ -54,7 +54,7 @@
         {
           "path": "i-repo-bigquery",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-bigquery",
-          "sha256": "4bf7811bfbcf3115f78f2f8cd937c0860c52d049ffaad93c7a39e46e00ca20e8"
+          "sha256": "d9304d31343e28390a4848bf2d57495f27a0b1bc0680e74d08ede877714adc74"
         }
       ]
     },
@@ -62,7 +62,7 @@
       "name": "elastic",
       "file": "i-repo-elastic",
       "displayName": "i-repo-elastic",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "description": "Index NDJSON records into Elasticsearch (日本語全文検索・中間一致・ファセット集計の写し)",
       "platforms": [
         "macos",
@@ -83,7 +83,7 @@
         {
           "path": "i-repo-elastic",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-elastic",
-          "sha256": "8d85611d505acbef03a8ee68970640e734f47231dc428c1b5181d9b17760ff30"
+          "sha256": "54bd3d676f3f7ada806684cb6c88f08ecaf1ad1f839761575feb19224d12479d"
         }
       ]
     },
@@ -91,7 +91,7 @@
       "name": "mongo",
       "file": "i-repo-mongo",
       "displayName": "i-repo-mongo",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "description": "Upsert NDJSON records into MongoDB (帳票IDキーでネスト構造をドキュメント保持)",
       "platforms": [
         "macos",
@@ -111,7 +111,7 @@
         {
           "path": "i-repo-mongo",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-mongo",
-          "sha256": "00bbe57fd756ac01d3ab27e34a37dbedb5bf00434ef9095138ec7884534e196c"
+          "sha256": "766f91ff564e655add26fc0652d8fe2b21b8e1a8b42c7686a0ac18706221f6bf"
         }
       ]
     },
@@ -119,7 +119,7 @@
       "name": "parquet",
       "file": "i-repo-parquet",
       "displayName": "i-repo-parquet",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "description": "Write NDJSON records to Parquet / Apache Iceberg (DuckDB経由・Lakehouse Ready)",
       "platforms": [
         "macos",
@@ -140,7 +140,7 @@
         {
           "path": "i-repo-parquet",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-parquet",
-          "sha256": "d6196cd065a95874881e7ec4dfdedfbc137b4352d3ddf66772a0e942bcb76f23"
+          "sha256": "f8d9e386955d085021b87ae7f02b14797ef318179193d936d915847e2d95f9d0"
         }
       ]
     },
@@ -175,7 +175,7 @@
       "name": "sqlite",
       "file": "i-repo-sqlite",
       "displayName": "i-repo-sqlite",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "description": "Accumulate NDJSON records into a local SQLite database (UPSERT by idempotencyKey)",
       "platforms": [
         "macos",
@@ -195,7 +195,7 @@
         {
           "path": "i-repo-sqlite",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-sqlite",
-          "sha256": "7318a9e962bcdddf53a61d97c5011fb905539992d450980eaaaf87f50fa84bdd"
+          "sha256": "f1341f188f4f81f9fd2860dd4d33b9273ec394fef02b5b5a33933b7ee71e3b1d"
         }
       ]
     }
@@ -204,7 +204,7 @@
     {
       "path": "lib/gemba-read.js",
       "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/lib/gemba-read.js",
-      "sha256": "80fd8fb23e625fcc4b9febca96cb357ca7883eff6332776c0811b1aa613e7cb8"
+      "sha256": "afa9851c9249a3e93f498fbc830dcae5100f27129de020f887513fc6839e416c"
     },
     {
       "path": "lib/spawn.js",

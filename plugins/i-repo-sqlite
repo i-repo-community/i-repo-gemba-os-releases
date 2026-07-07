@@ -24,7 +24,7 @@
 "use strict";
 
 const PLUGIN = "i-repo-sqlite";
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 
 // ── 予約フラグ: プラグイン自身の引数より先に判定 ──────────────────────
 const argv = process.argv.slice(2);
@@ -36,6 +36,24 @@ function hasColumn(db, table, col) {
   try { return db.prepare(`PRAGMA table_info("${table}")`).all().some((c) => c.name === col); }
   catch { return false; }
 }
+
+// ── 構造化集計 aggregate（gemba-adc/1.2）で参照する正準名→列/属性の唯一の宣言源
+// （--plugin-schema の dataset.fields と一致）。aggregate の次元/指標はここに在るフィールドのみ
+// 参照可（未宣言＝E_ARGS＝越境穴を宣言駆動で封鎖）。dispatch より前に初期化する（TDZ 回避）。
+const FIELD_META = {
+  idempotencyKey: { col: "idempotency_key" },
+  recordType: { col: "record_type" },
+  itemId: { col: "item_id" },
+  revNo: { col: "rev_no" },
+  name: { col: "name", pii: true },
+  deleted: { col: "deleted" },
+  registTime: { col: "regist_time", datetime: true, timezone: "local" },
+  updateTime: { col: "update_time", datetime: true, timezone: "local" },
+  loadedAt: { col: "loaded_at", datetime: true, timezone: "utc" },
+  endpointFp: { col: "endpoint_fp" },
+};
+const dimVal = (v) => (typeof v === "bigint" ? Number(v) : v);          // 次元値: string|number|boolean|null
+const measVal = (v) => (v == null ? 0 : Number(v));                     // 指標値: 数値（null は 0）
 
 if (argv[0] === "--plugin-schema") {
   process.stdout.write(JSON.stringify({
@@ -79,10 +97,13 @@ if (argv[0] === "--plugin-schema") {
       { name: "--endpoint-fp", type: "string", subcommand: "query", filter: true, label: "テナント指紋（endpointFp）",
         description: "配信元 i-Reporter の endpointFp に厳格一致で絞る（未タグ=旧配信は除外・gemba-adc/1.1 §3.9）" },
     ],
-    // ── ADC-1（gemba-adc/1.0）読み返し契約の宣言 ──────────────────────
+    // ── ADC-1（gemba-adc/1.x）読み返し契約の宣言 ──────────────────────
     subcommands: [
       { name: "query", mode: "read", input: ["none"], output: ["ndjson"],
         description: "着地済みレコードを正準封筒形で読み出す（ページ付き・書込ゼロ）" },
+      // gemba-adc/1.2: 構造化集計。生 SQL を渡さず group_by/measure で集計（エージェント面に公開可）。
+      { name: "aggregate", mode: "read", input: ["none"], output: ["ndjson"],
+        description: "次元(group_by)＋指標(measure)で集計する（読み取り専用・aggregate-row + query-end）" },
     ],
     // 能力タグ（開いた語彙・string[]）。CLI verify(describe-shape) は capabilities を string[] と検査する。
     // 各タグの詳細（dialect/audience 等）は capabilityDetails で宣言する（ホストはそちらを読む）。
@@ -93,7 +114,7 @@ if (argv[0] === "--plugin-schema") {
       "native-query": { dialect: "sql-select", input: "sql", readOnly: "enforced", audience: ["human"] },
     },
     dataset: [{
-      datasetApi: ["1"], contract: "gemba-adc/1.1", store: "sqlite",
+      datasetApi: ["1"], contract: "gemba-adc/1.2", store: "sqlite",
       locator: { db: { param: "--db" }, table: { param: "--table", default: "reports" } },
       naming: "snake_case",
       keys: { primary: "idempotency_key", upsert: true, dedupe: null },
@@ -150,6 +171,22 @@ if (argv[0] === "query") {
   }
   runQuery(argv.slice(1), G);
   return; // native は worker 非同期完了なので、ここで配信パス（下記）への fall-through を止める
+}
+
+// ── aggregate サブコマンド（gemba-adc/1.2・構造化集計・読み取り専用） ─────
+// エージェント面に生 SQL を渡さず、次元(group_by)＋指標(measure)で集計する（audience:human 境界を保つ）。
+if (argv[0] === "aggregate") {
+  let G;
+  try { G = require("./lib/gemba-read.js"); }
+  catch {
+    console.error(JSON.stringify({ schemaVersion: "1.0", recordType: "error", contract: "gemba-read/1.0",
+      plugin: PLUGIN, code: "E_INTERNAL",
+      message: "gemba-read ライブラリが見つかりません（lib/gemba-read.js）。plugins/install.sh を再実行してください",
+      retryable: false }));
+    process.exit(1);
+  }
+  runAggregate(argv.slice(1), G);
+  return;
 }
 
 function runQuery(qargs, G) {
@@ -330,6 +367,127 @@ function runNativeQuery(dbp, rawSql, opts, kit, dest) {
   let i = 0;
   for (const row of rows) { emitRow(`native:${i}`, null, row, true); i++; } // 任意形は raw で出す
   queryEnd({ count: rows.length, complete: !truncated, truncated, nextCursor: null, dest, dedupeApplied: false, native: true });
+  process.exit(0);
+}
+
+function runAggregate(aargs, G) {
+  const { queryEnd, emitAggRow, queryError } = G.createReadKit(PLUGIN);
+  const opts = G.parseAggregateArgs(aargs, { "--db": "db", "--table": "table" }, queryError);
+  if (!opts.db) queryError("E_ARGS", "--db <path> is required", "集計対象の SQLite DB", 2);
+  if (!opts.table) opts.table = "reports";
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(opts.table)) queryError("E_ARGS", `invalid table name: ${opts.table}`, null, 2);
+
+  let dbp = opts.db;
+  if (dbp.startsWith("~/")) dbp = resolve(homedir(), dbp.slice(2));
+  dbp = resolve(dbp);
+  const dest = `sqlite:${dbp}#${opts.table}`;
+
+  const fs = require("node:fs");
+  if (!fs.existsSync(dbp)) queryError("E_NOT_FOUND", `database not found: ${dbp}`, "配信が一度も成功していない可能性があります", 1, dest);
+
+  const { DatabaseSync } = require("node:sqlite");
+  let db;
+  try { db = new DatabaseSync(dbp, { readOnly: true }); }
+  catch (e) { queryError("E_CONNECT", `cannot open read-only: ${e.message}`, "WAL の場合は配信中でないか確認", 1, dest); }
+
+  try {
+    const t = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(opts.table);
+    if (!t) { db.close(); queryError("E_NOT_FOUND", `table not found: ${opts.table}`, null, 1, dest); }
+  } catch (e) { try { db.close(); } catch {} queryError("E_INTERNAL", e.message, null, 1, dest); }
+
+  // ── 次元（group_by）→ SELECT 式。未宣言フィールドは拒否・scoped では PII 次元を拒否（多層）──
+  const dimSelects = [], dimKeys = [], groupExprs = [];
+  for (const g of opts.groupBy) {
+    const meta = FIELD_META[g.field];
+    if (!meta) { db.close(); queryError("E_ARGS", `未宣言のフィールドは次元にできません: ${g.field}`, "schema.fields の正準名のみ", 2, dest); }
+    if (opts.noPiiDimensions && meta.pii) { db.close(); queryError("E_ARGS", `PII 宣言フィールドは次元(group_by)に使えません（テナント分離セッション）: ${g.field}`, "集計でも値集合が露出するため", 2, dest); }
+    if (g.kind === "field") {
+      dimKeys.push(g.field);
+      dimSelects.push(`"${meta.col}" AS "${g.field}"`);
+      groupExprs.push(`"${meta.col}"`);
+    } else { // date_bucket
+      if (!meta.datetime) { db.close(); queryError("E_ARGS", `date_bucket は datetime フィールドのみ: ${g.field}`, null, 2, dest); }
+      const tz = G.resolveBucketTz(g.tz, meta.timezone, queryError, dest);
+      // MVP は「変換なしで扱える組合せ」のみ: 局所壁時計(local)は tz を解釈ゾーンとみなし substr、
+      // UTC 格納は UTC バケットのみ substr。UTC×非-UTC バケットは DST 変換が要り zero-dep SQL で不可＝未対応。
+      if (meta.timezone === "utc" && tz !== "UTC") {
+        db.close();
+        queryError("E_UNSUPPORTED", `UTC 格納フィールド(${g.field})の非-UTC(${tz})バケットは未対応（MVP）`, "tz=UTC にするか局所時刻フィールドを使う", 2, dest);
+      }
+      const len = G.bucketSubstrLen(g.granularity);
+      const key = `${g.field}_${g.granularity}`;
+      dimKeys.push(key);
+      dimSelects.push(`substr("${meta.col}", 1, ${len}) AS "${key}"`);
+      groupExprs.push(`substr("${meta.col}", 1, ${len})`);
+    }
+  }
+
+  // ── 指標（measure）→ SELECT 式（count/count_distinct/sum/avg・全て数値）──
+  const measSelects = [], measKeys = [];
+  for (const m of opts.measures) {
+    let expr;
+    if (m.op === "count") expr = "COUNT(*)";
+    else {
+      const meta = FIELD_META[m.field];
+      if (!meta) { db.close(); queryError("E_ARGS", `未宣言のフィールドは指標にできません: ${m.field}`, "schema.fields の正準名のみ", 2, dest); }
+      const c = `"${meta.col}"`;
+      expr = m.op === "count_distinct" ? `COUNT(DISTINCT ${c})`
+        : m.op === "sum" ? `SUM(CAST(${c} AS REAL))`
+        : `AVG(CAST(${c} AS REAL))`; // avg
+    }
+    measSelects.push(`${expr} AS "${m.alias}"`);
+    measKeys.push(m.alias);
+  }
+
+  // 出力キー（次元＋指標 alias）は一意でなければならない。衝突すると `AS "x" … AS "x"` となり
+  // node:sqlite の .all() が同名列を1プロパティに畳んで次元値が指標値で上書きされる（出力破壊・P2）。
+  const allKeys = [...dimKeys, ...measKeys];
+  const dupKey = allKeys.find((k, i) => allKeys.indexOf(k) !== i);
+  if (dupKey) { db.close(); queryError("E_ARGS", `出力キーが重複しています: ${dupKey}`, "group_by 次元と measure alias は一意にする（measure に別名 as を付ける）", 2, dest); }
+
+  // ── WHERE（query と同一のフィルタ＋テナント厳格絞り §3.9）──
+  const where = [], bind = [];
+  if (opts.endpointFp) {
+    if (hasColumn(db, opts.table, "endpoint_fp")) { where.push("endpoint_fp = ?"); bind.push(opts.endpointFp); }
+    else where.push("0 = 1");
+  }
+  const tcol = opts.timeField === "updated" ? "update_time" : opts.timeField === "registered" ? "regist_time" : "loaded_at";
+  const bounds = G.timeBounds(opts, tcol === "loaded_at" ? "iso" : "slash", queryError, dest);
+  if (bounds?.gte) { where.push(`${tcol} >= ?`); bind.push(bounds.gte); }
+  if (bounds?.lt) { where.push(`${tcol} < ?`); bind.push(bounds.lt); }
+  if (opts.deleted != null) { where.push("deleted = ?"); bind.push(opts.deleted ? 1 : 0); }
+  if (opts.ids && opts.ids.length) { where.push(`idempotency_key IN (${opts.ids.map(() => "?").join(",")})`); bind.push(...opts.ids); }
+  if (opts.itemIds.length) { where.push(`item_id IN (${opts.itemIds.map(() => "?").join(",")})`); bind.push(...opts.itemIds); }
+  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+  // ── ORDER BY（top-N の決定性）。by は measure alias か dimension key のみ ──
+  let orderSql;
+  if (opts.orderBy && opts.orderBy.by) {
+    if (![...measKeys, ...dimKeys].includes(opts.orderBy.by)) {
+      db.close(); queryError("E_ARGS", `--order-by の対象が不明: ${opts.orderBy.by}`, "measure alias か group_by 次元名", 2, dest);
+    }
+    orderSql = `ORDER BY "${opts.orderBy.by}" ${opts.orderBy.dir === "asc" ? "ASC" : "DESC"}`;
+  } else {
+    orderSql = `ORDER BY ${dimKeys.map((k) => `"${k}"`).join(", ")} ASC`; // 既定は次元昇順（安定・再現的）
+  }
+
+  // limit+1 で取得し超過を truncated 判定（切り捨て群は order で決まる＝§limit 決定性）。
+  const sql = `SELECT ${[...dimSelects, ...measSelects].join(", ")} FROM "${opts.table}" ${whereSql} GROUP BY ${groupExprs.join(", ")} ${orderSql} LIMIT ?`;
+  let rows;
+  try { rows = db.prepare(sql).all(...bind, opts.limit + 1); }
+  catch (e) { db.close(); queryError("E_INTERNAL", e.message, null, 1, dest); }
+  db.close();
+
+  const truncated = rows.length > opts.limit;
+  if (truncated) rows = rows.slice(0, opts.limit);
+  for (const r of rows) {
+    const dimensions = {}, measures = {};
+    for (const k of dimKeys) dimensions[k] = dimVal(r[k]);
+    for (const k of measKeys) measures[k] = measVal(r[k]);
+    emitAggRow(dimensions, measures);
+  }
+  queryEnd({ count: rows.length, complete: !truncated, truncated, nextCursor: null, dest,
+    aggregate: true, groupBy: dimKeys, measures: measKeys });
   process.exit(0);
 }
 
