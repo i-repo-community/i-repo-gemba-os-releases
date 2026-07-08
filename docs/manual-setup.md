@@ -65,4 +65,4 @@ nav_order: 1
 
 > プラグインは「送り先の種類」ごとの部品です。使う送り先のプラグインだけ入っていれば動きます（[プラグイン](screen-plugins.html)画面で状態を確認できます）。
 
-> 開発者向け（ソースを取得している場合）: プラグインは `plugins/install.ps1`（Windows）/ `plugins/install.sh`（macOS・Linux）でも導入できます。配布アプリ単体には install スクリプトは含まれないため、通常は上記のボタン導入を使ってください。
+> 開発者向け（ソースを取得している場合）: プラグインの正本は npm 依存 `i-repo`。`npm install` 後、`node_modules/i-repo/plugins/install.ps1`（Windows）/ `node_modules/i-repo/plugins/install.sh`（macOS・Linux）でも導入できます。配布アプリ単体には install スクリプトは含まれないため、通常は上記のボタン導入を使ってください。
