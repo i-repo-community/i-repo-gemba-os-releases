@@ -30,13 +30,31 @@
 "use strict";
 
 const PLUGIN = "i-repo-bigquery";
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const { spawnSyncSpec } = require("./lib/spawn.js");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
 const argv = process.argv.slice(2);
+
+// ── 構造化集計 aggregate（gemba-adc/1.2）で参照する正準名→列/属性の唯一の宣言源
+// （--plugin-schema の dataset.fields と一致）。aggregate の次元/指標はここに在るフィールドのみ
+// 参照可（未宣言＝E_ARGS＝越境穴を宣言駆動で封鎖）。dispatch より前に初期化する（TDZ 回避）。
+const FIELD_META = {
+  idempotencyKey: { col: "idempotency_key" },
+  recordType: { col: "record_type" },
+  itemId: { col: "item_id" },
+  revNo: { col: "rev_no" },
+  name: { col: "name", pii: true },
+  deleted: { col: "deleted" },
+  registTime: { col: "regist_time", datetime: true, timezone: "local" },
+  updateTime: { col: "update_time", datetime: true, timezone: "local" },
+  loadedAt: { col: "loaded_at", datetime: true, timezone: "utc" },
+  endpointFp: { col: "endpoint_fp" },
+};
+const dimVal = (v) => (typeof v === "bigint" ? Number(v) : v);          // 次元値: string|number|boolean|null
+const measVal = (v) => (v == null ? 0 : Number(v));                     // 指標値: 数値（null は 0・bq JSON は文字列で来ることがある）
 
 // ── 予約フラグ ───────────────────────────────────────────────────────
 if (argv[0] === "--plugin-schema") {
@@ -56,6 +74,9 @@ if (argv[0] === "--plugin-schema") {
     subcommands: [
       { name: "query", mode: "read", input: ["none"], output: ["ndjson"],
         description: "着地済みレコードを正準封筒形で読み出す（ページ付き・書込ゼロ）" },
+      // gemba-adc/1.2: 構造化集計。生 SQL を渡さず group_by/measure で集計する（エージェント面に公開可）。
+      { name: "aggregate", mode: "read", input: ["none"], output: ["ndjson"],
+        description: "次元(group_by)＋指標(measure)で集計する（読み取り専用・aggregate-row + query-end）" },
     ],
     params: [
       { name: "--project", type: "string",
@@ -96,7 +117,7 @@ if (argv[0] === "--plugin-schema") {
     ],
     // ── ADC-1（gemba-adc/1.0）着地スキーマ宣言 ──────────────────────────
     dataset: [
-      { datasetApi: ["1"], contract: "gemba-adc/1.1", store: "bigquery",
+      { datasetApi: ["1"], contract: "gemba-adc/1.2", store: "bigquery",
         // locator は query が必要とする接続フラグを**全て**宣言する（access.query の正本）。
         // 漏らすと読み返しがその引数なしで実行され失敗する（parquet の --warehouse 欠落の教訓）。
         locator: {
@@ -173,6 +194,22 @@ if (argv[0] === "query") {
     process.exit(1);
   }
   runQuery(argv.slice(1), G);   // 内部で process.exit。以降へは進まない。
+}
+
+// ── aggregate サブコマンド（gemba-adc/1.2・構造化集計・読み取り専用） ─────
+// エージェント面に生 SQL を渡さず、次元(group_by)＋指標(measure)で集計する（audience:human 境界を保つ）。
+if (argv[0] === "aggregate") {
+  let G;
+  try { G = require("./lib/gemba-read.js"); }
+  catch {
+    console.error(JSON.stringify({ schemaVersion: "1.0", recordType: "error", contract: "gemba-read/1.0",
+      plugin: PLUGIN, code: "E_INTERNAL",
+      message: "gemba-read ライブラリが見つかりません（lib/gemba-read.js）。plugins/install.sh を再実行してください",
+      retryable: false }));
+    process.exit(1);
+  }
+  runAggregate(argv.slice(1), G);
+  return;
 }
 
 function runQuery(qargs, G) {
@@ -281,6 +318,139 @@ function runQuery(qargs, G) {
   };
   if (timeFilter) end.timeFilter = timeFilter;
   queryEnd(end);
+  process.exit(0);
+}
+
+function runAggregate(aargs, G) {
+  const { queryEnd, emitAggRow, queryError } = G.createReadKit(PLUGIN);
+  const opts = G.parseAggregateArgs(aargs, {
+    "--project": "project", "--dataset": "dataset", "--table": "table",
+    "--location": "location", "--key-file": "keyFile",
+  }, queryError);
+  if (!opts.location) opts.location = "US";
+
+  if (!opts.project || !opts.dataset || !opts.table) {
+    queryError("E_ARGS", "BigQuery requires --project, --dataset and --table", "集計対象テーブルの指定", 2);
+  }
+  validateIdent(opts.project, "--project", queryError, true);
+  validateIdent(opts.dataset, "--dataset", queryError);
+  validateIdent(opts.table, "--table", queryError);
+
+  const dest = `bigquery:${opts.project}.${opts.dataset}.${opts.table}`;
+  const fqtn = "`" + `${opts.project}.${opts.dataset}.${opts.table}` + "`";
+  const env = bqEnv(opts.keyFile);
+
+  // bq 不在は推測せず E_CONNECT。
+  if (spawnSyncSpec("bq", ["version"], { encoding: "utf8", env }).status !== 0) {
+    queryError("E_CONNECT", "bq CLI not found", "Google Cloud SDK（bq）をインストールし認証してください", 1, dest);
+  }
+
+  // ── 次元（group_by）→ SELECT 式。未宣言フィールドは拒否・scoped では PII 次元を拒否（多層）──
+  const dimSelects = [], dimKeys = [], groupExprs = [];
+  for (const g of opts.groupBy) {
+    const meta = FIELD_META[g.field];
+    if (!meta) queryError("E_ARGS", `未宣言のフィールドは次元にできません: ${g.field}`, "schema.fields の正準名のみ", 2, dest);
+    if (opts.noPiiDimensions && meta.pii) queryError("E_ARGS", `PII 宣言フィールドは次元(group_by)に使えません（テナント分離セッション）: ${g.field}`, "集計でも値集合が露出するため", 2, dest);
+    if (g.kind === "field") {
+      dimKeys.push(g.field);
+      dimSelects.push(`${meta.col} AS \`${g.field}\``);
+      groupExprs.push(meta.col);
+    } else { // date_bucket
+      if (!meta.datetime) queryError("E_ARGS", `date_bucket は datetime フィールドのみ: ${g.field}`, null, 2, dest);
+      const tz = G.resolveBucketTz(g.tz, meta.timezone, queryError, dest);
+      // MVP は「変換なしで扱える組合せ」のみ（sqlite/parquet と同じ制約）: 局所壁時計(local)は tz を
+      // 解釈ゾーンとみなし substr、UTC 格納は UTC バケットのみ substr。UTC×非-UTC は DST 変換が要り
+      // SQL 内では不可＝未対応。
+      if (meta.timezone === "utc" && tz !== "UTC") {
+        queryError("E_UNSUPPORTED", `UTC 格納フィールド(${g.field})の非-UTC(${tz})バケットは未対応（MVP）`, "tz=UTC にするか局所時刻フィールドを使う", 2, dest);
+      }
+      const len = G.bucketSubstrLen(g.granularity);
+      const key = `${g.field}_${g.granularity}`;
+      dimKeys.push(key);
+      dimSelects.push(`SUBSTR(${meta.col}, 1, ${len}) AS \`${key}\``);
+      groupExprs.push(`SUBSTR(${meta.col}, 1, ${len})`);
+    }
+  }
+
+  // ── 指標（measure）→ SELECT 式（count/count_distinct/sum/avg・全て数値）──
+  // CAST は BigQuery Standard SQL に合わせ FLOAT64（sqlite/parquet の REAL/DOUBLE と異なる方言）。
+  const measSelects = [], measKeys = [];
+  for (const m of opts.measures) {
+    let expr;
+    if (m.op === "count") expr = "COUNT(*)";
+    else {
+      const meta = FIELD_META[m.field];
+      if (!meta) queryError("E_ARGS", `未宣言のフィールドは指標にできません: ${m.field}`, "schema.fields の正準名のみ", 2, dest);
+      const c = meta.col;
+      expr = m.op === "count_distinct" ? `COUNT(DISTINCT ${c})`
+        // SAFE_CAST: 非数値は実行時エラーでなく NULL（SUM/AVG が無視）＝非数値混入でクエリ全体が
+        // 失敗するのを防ぐ（BigQuery の CAST はハードエラー）。NULL 無視は SQL の AVG と整合。
+        : m.op === "sum" ? `SUM(SAFE_CAST(${c} AS FLOAT64))`
+        : `AVG(SAFE_CAST(${c} AS FLOAT64))`; // avg
+    }
+    measSelects.push(`${expr} AS \`${m.alias}\``);
+    measKeys.push(m.alias);
+  }
+
+  // 出力キー（次元＋指標 alias）は一意でなければならない（衝突すると同名列が畳まれ値が破壊される）。
+  const allKeys = [...dimKeys, ...measKeys];
+  const dupKey = allKeys.find((k, i) => allKeys.indexOf(k) !== i);
+  if (dupKey) queryError("E_ARGS", `出力キーが重複しています: ${dupKey}`, "group_by 次元と measure alias は一意にする（measure に別名 as を付ける）", 2, dest);
+
+  // ── WHERE（query と同一のフィルタ＋テナント厳格絞り §3.9）。値は q()（バックスラッシュ escape）で埋め込む ──
+  const where = [];
+  if (opts.endpointFp) {
+    const probeSql = "SELECT column_name FROM `" + `${opts.project}.${opts.dataset}` + "`.INFORMATION_SCHEMA.COLUMNS " +
+      `WHERE table_name = ${q(opts.table)} AND column_name = 'endpoint_fp';`;
+    const pr = runBqJson(probeSql, opts.location, env, 1, opts.project);
+    let hasCol = false;
+    if (pr.status === 0) { try { hasCol = JSON.parse(pr.stdout || "[]").length > 0; } catch { hasCol = false; } }
+    if (hasCol) where.push(`endpoint_fp = ${q(opts.endpointFp)}`);
+    else where.push("FALSE");   // 列不在＝未タグ扱いで厳格に 0 件
+  }
+  const tcol = opts.timeField === "updated" ? "update_time" : opts.timeField === "registered" ? "regist_time" : "loaded_at";
+  const bounds = G.timeBounds(opts, tcol === "loaded_at" ? "iso" : "slash", queryError, dest);
+  if (bounds?.gte) where.push(`${tcol} >= ${q(bounds.gte)}`);
+  if (bounds?.lt) where.push(`${tcol} < ${q(bounds.lt)}`);
+  if (opts.deleted != null) where.push(`deleted = ${opts.deleted ? "true" : "false"}`);
+  if (opts.ids && opts.ids.length) where.push(`idempotency_key IN (${opts.ids.map((s) => q(s)).join(",")})`);
+  if (opts.itemIds.length) where.push(`item_id IN (${opts.itemIds.map((s) => q(s)).join(",")})`);
+  const whereSql = where.length ? ` WHERE ${where.join(" AND ")}` : "";
+
+  // ── ORDER BY（top-N の決定性）。by は measure alias か dimension key のみ ──
+  let orderSql;
+  if (opts.orderBy && opts.orderBy.by) {
+    if (![...measKeys, ...dimKeys].includes(opts.orderBy.by)) {
+      queryError("E_ARGS", `--order-by の対象が不明: ${opts.orderBy.by}`, "measure alias か group_by 次元名", 2, dest);
+    }
+    orderSql = `ORDER BY \`${opts.orderBy.by}\` ${opts.orderBy.dir === "asc" ? "ASC" : "DESC"}`;
+  } else {
+    orderSql = `ORDER BY ${dimKeys.map((k) => `\`${k}\``).join(", ")} ASC`; // 既定は次元昇順（安定・再現的）
+  }
+
+  // append 重複を集計前に dedup（冪等キー単位で loaded_at 最新の1行へ畳む・§query と同方針）。
+  // limit+1 で取得し超過を truncated 判定（切り捨て群は order で決まる＝§limit 決定性）。
+  const dedupQual = " QUALIFY row_number() OVER (PARTITION BY idempotency_key ORDER BY loaded_at DESC) = 1";
+  const inner = `SELECT * FROM ${fqtn}${whereSql}${dedupQual}`;
+  const sql = `SELECT ${[...dimSelects, ...measSelects].join(", ")} FROM (${inner}) AS t ` +
+    `GROUP BY ${groupExprs.join(", ")} ${orderSql} LIMIT ${opts.limit + 1};`;
+
+  const r = runBqJson(sql, opts.location, env, opts.limit + 1, opts.project);
+  if (r.status !== 0) queryError(classifyErr(r), bqErrMsg(r), null, 1, dest);
+  let rows;
+  try { rows = JSON.parse(r.stdout || "[]"); }
+  catch (e) { queryError("E_INTERNAL", `cannot parse bq output: ${e.message}`, null, 1, dest); }
+
+  const truncated = rows.length > opts.limit;
+  if (truncated) rows = rows.slice(0, opts.limit);
+  for (const row of rows) {
+    const dimensions = {}, measures = {};
+    for (const k of dimKeys) dimensions[k] = dimVal(row[k]);
+    for (const k of measKeys) measures[k] = measVal(row[k]);
+    emitAggRow(dimensions, measures);
+  }
+  queryEnd({ count: rows.length, complete: !truncated, truncated, nextCursor: null, dest,
+    aggregate: true, groupBy: dimKeys, measures: measKeys, dedupeApplied: true });
   process.exit(0);
 }
 

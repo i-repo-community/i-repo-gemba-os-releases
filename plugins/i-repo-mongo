@@ -26,7 +26,7 @@
 "use strict";
 
 const PLUGIN = "i-repo-mongo";
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const { spawnSync } = require("node:child_process");
 const { spawnSyncSpec } = require("./lib/spawn.js");
 
@@ -129,6 +129,10 @@ if (argv[0] === "--plugin-schema") {
     subcommands: [
       { name: "query", mode: "read", input: ["none"], output: ["ndjson"],
         description: "着地済みレコードを正準封筒形で読み出す（ページ付き・書込ゼロ）" },
+      // gemba-adc/1.2: 構造化集計（aggregation pipeline の $group へ写像）。生 pipeline を渡さず
+      // group_by/measure で集計する（audience:human 境界を保つ。native は capability: native-query 経路で別途）。
+      { name: "aggregate", mode: "read", input: ["none"], output: ["ndjson"],
+        description: "次元(group_by)＋指標(measure)で集計する（読み取り専用・aggregate-row + query-end）" },
     ],
     // 能力タグ（開いた語彙・string[]）。CLI verify(describe-shape) は capabilities を string[] と検査する。
     // 各タグの詳細（dialect/audience 等）は capabilityDetails で宣言する（ホストはそちらを読む）。
@@ -140,13 +144,20 @@ if (argv[0] === "--plugin-schema") {
     },
     // ── ADC-1（gemba-adc/1.0）着地スキーマ宣言。ネスト保持・camelCase ──
     dataset: [{
-      datasetApi: ["1"], contract: "gemba-adc/1.1", store: "mongodb",
+      datasetApi: ["1"], contract: "gemba-adc/1.2", store: "mongodb",
       locator: { uri: { param: "--uri", secret: true }, db: { param: "--db" }, collection: { param: "--collection", default: "reports" } },
       naming: "camelCase",
       keys: { primary: "_id", upsert: true, dedupe: null },
       contents: "cumulative",
       fields: [
         { name: "_id", canonical: "idempotencyKey", source: "idempotencyKey", type: "string", role: "key" },
+        { name: "recordType", canonical: "recordType", source: "recordType", type: "string" },
+        { name: "itemId", canonical: "itemId", source: "itemId", type: "string", role: "report-id" },
+        { name: "revNo", canonical: "revNo", source: "revNo", type: "string", role: "revision" },
+        { name: "values.name", canonical: "name", source: "values.name", type: "string", pii: "possible" },
+        { name: "deleted", canonical: "deleted", source: "deleted", type: "boolean" },
+        { name: "values.registTime", canonical: "registTime", source: "values.registTime", type: "datetime", format: "local-datetime-slash", timezone: "local" },
+        { name: "values.updateTime", canonical: "updateTime", source: "values.updateTime", type: "datetime", format: "local-datetime-slash", timezone: "local" },
         { name: "_loadedAt", canonical: "loadedAt", type: "datetime", format: "iso8601", timezone: "utc", role: "lineage" },
         { name: "_endpointFp", canonical: "endpointFp", source: "provenance.endpointFingerprint", type: "string", role: "tenant", description: "配信元 i-Reporter エンドポイントの正準指紋（テナント同一性・gemba-adc/1.1）。旧配信ドキュメントには存在しない" },
         { name: "*", canonical: "raw", source: ".", type: "object", schemaRef: "envelope/1.0", pii: "likely" },
@@ -175,6 +186,24 @@ if (process.env.IREPO_PLUGIN_API && process.env.IREPO_PLUGIN_API !== "1") {
   process.exit(11);
 }
 
+// ── 構造化集計 aggregate（gemba-adc/1.2）で参照する正準名→ドキュメントパス/属性の唯一の宣言源
+// （--plugin-schema の dataset.fields と一致）。aggregate の次元/指標はここに在るフィールドのみ
+// 参照可（未宣言＝E_ARGS＝越境穴を宣言駆動で封鎖）。dispatch より前に初期化する（TDZ 回避・sqlite/elastic と同方針）。
+const FIELD_META = {
+  idempotencyKey: { path: "_id" },
+  recordType: { path: "recordType" },
+  itemId: { path: "itemId" },
+  revNo: { path: "revNo" },
+  name: { path: "values.name", pii: true },
+  deleted: { path: "deleted" },
+  registTime: { path: "values.registTime", datetime: true, timezone: "local" },
+  updateTime: { path: "values.updateTime", datetime: true, timezone: "local" },
+  loadedAt: { path: "_loadedAt", datetime: true, timezone: "utc" },
+  endpointFp: { path: "_endpointFp" },
+};
+const dimVal = (v) => (typeof v === "bigint" ? Number(v) : v);          // 次元値: string|number|boolean|null
+const measVal = (v) => (v == null ? 0 : Number(v));                     // 指標値: 数値（null は 0）
+
 // ── query サブコマンド（ADC-1 / gemba-read/1.0・読み取り専用） ─────────
 // 共通部（envelope/時刻3形式/カーソル/フラグ解析）は lib/gemba-read.js（正本: plugins/lib/）。
 // ここにはストア固有部（mongosh 実行・フィルタ構築・record 復元・dest）だけを置く。
@@ -189,6 +218,22 @@ if (argv[0] === "query") {
     process.exit(1);
   }
   runQuery(argv.slice(1), G);   // 内部で process.exit。以降へは進まない。
+}
+
+// ── aggregate サブコマンド（gemba-adc/1.2・構造化集計・読み取り専用） ─────
+// エージェント面に生 aggregation pipeline を渡さず、次元(group_by)＋指標(measure)で集計する
+// （audience:human 境界を保つ。生方言は capability: native-query（query --native）で別途素通し可）。
+if (argv[0] === "aggregate") {
+  let G;
+  try { G = require("./lib/gemba-read.js"); }
+  catch {
+    console.error(JSON.stringify({ schemaVersion: "1.0", recordType: "error", contract: "gemba-read/1.0",
+      plugin: PLUGIN, code: "E_INTERNAL",
+      message: "gemba-read ライブラリが見つかりません（lib/gemba-read.js）。plugins/install.sh を再実行してください",
+      retryable: false }));
+    process.exit(1);
+  }
+  runAggregate(argv.slice(1), G);   // 内部で process.exit。以降へは進まない。
 }
 
 // dest 記述子: ホストは --uri から userinfo を除去して採る（§4.4）。生資格情報を出さない。
@@ -344,6 +389,160 @@ function runQuery(qargs, G) {
   };
   if (timeFilter) end.timeFilter = timeFilter;
   queryEnd(end);
+  process.exit(0);
+}
+
+// ── aggregate（gemba-adc/1.2・構造化集計）─ aggregation pipeline の $group へ写像 ──────
+// group_by → $group._id の各キー（field=直参照／date_bucket=substrBytes による壁時計 prefix。
+// sqlite/elastic と同じセマンティクス・変換はしない）。measure → $sum(1) / $addToSet+$size /
+// $sum($convert) / $avg($convert)。フィルタ（$match）・未宣言/PII 次元ゲート・テナント厳格絞りは
+// query と同一の砦。order_by は取得後に client 側で sort（pipeline 内では並びを固定しない）。
+function runAggregate(aargs, G) {
+  const { queryEnd, emitAggRow, queryError } = G.createReadKit(PLUGIN);
+  const opts = G.parseAggregateArgs(aargs, { "--uri": "uri", "--db": "db", "--collection": "collection" }, queryError);
+  if (!opts.collection) opts.collection = "reports";
+
+  // dest はエラー時にも添えるため、引数検証より先に（生資格情報を含めずに）組む（query と同方針）。
+  const host = uriHost(opts.uri);
+  const dest = host
+    ? `mongodb:${host}/${opts.db}.${opts.collection}`
+    : `mongodb:${opts.db}.${opts.collection}`;
+
+  if (!opts.uri) queryError("E_ARGS", "--uri <connection-string> is required", "集計対象の MongoDB 接続文字列", 2, dest);
+  if (!opts.db) queryError("E_ARGS", "--db <name> is required", "集計対象のデータベース", 2, dest);
+
+  // ── $match（フィルタ構築は query と同一・§3.5/§3.9）──
+  const timeField = opts.timeField === "updated" ? "values.updateTime"
+    : opts.timeField === "registered" ? "values.registTime" : "_loadedAt";
+  const filter = {};
+  const bounds = G.timeBounds(opts, timeField === "_loadedAt" ? "iso" : "slash", queryError, dest);
+  if (bounds) {
+    const range = {};
+    if (bounds.gte != null) range.$gte = bounds.gte;
+    if (bounds.lt != null) range.$lt = bounds.lt;   // 半開区間 [since, until)
+    filter[timeField] = range;
+  }
+  if (opts.deleted != null) filter.deleted = opts.deleted;
+  if (opts.ids && opts.ids.length) filter._id = { $in: opts.ids };
+  if (opts.itemIds.length) filter.itemId = { $in: opts.itemIds };
+  // テナント厳格フィルタ（gemba-adc/1.1 §3.9）: _endpointFp に完全一致。フィールドを持たない
+  // 旧ドキュメント（未タグ）は等値に当たらず自動除外＝厳格（fail-closed）。未指定なら絞らない。
+  if (opts.endpointFp) filter._endpointFp = opts.endpointFp;
+
+  // ── 次元（group_by）→ $group._id の各キー式（未宣言/PII は多層の砦で拒否）──
+  const dimIdExpr = {}, dimKeys = [];
+  for (const g of opts.groupBy) {
+    const meta = FIELD_META[g.field];
+    if (!meta) queryError("E_ARGS", `未宣言のフィールドは次元にできません: ${g.field}`, "schema.fields の正準名のみ", 2, dest);
+    if (opts.noPiiDimensions && meta.pii) queryError("E_ARGS", `PII 宣言フィールドは次元(group_by)に使えません（テナント分離セッション）: ${g.field}`, "集計でも値集合が露出するため", 2, dest);
+    if (g.kind === "field") {
+      dimKeys.push(g.field);
+      dimIdExpr[g.field] = `$${meta.path}`;
+    } else { // date_bucket
+      if (!meta.datetime) queryError("E_ARGS", `date_bucket は datetime フィールドのみ: ${g.field}`, null, 2, dest);
+      const tz = G.resolveBucketTz(g.tz, meta.timezone, queryError, dest);
+      // MVP は「変換なしで扱える組合せ」のみ: 局所壁時計(local)は tz を解釈ゾーンとみなし substr、
+      // UTC 格納は UTC バケットのみ substr。UTC×非-UTC バケットは DST 変換が要り zero-dep で不可＝未対応。
+      if (meta.timezone === "utc" && tz !== "UTC") {
+        queryError("E_UNSUPPORTED", `UTC 格納フィールド(${g.field})の非-UTC(${tz})バケットは未対応（MVP）`, "tz=UTC にするか局所時刻フィールドを使う", 2, dest);
+      }
+      const len = G.bucketSubstrLen(g.granularity);
+      const key = `${g.field}_${g.granularity}`;
+      dimKeys.push(key);
+      const path = `$${meta.path}`;
+      // $substrBytes は欠損/null でも例外を投げず ""（空文字）を返してしまう（動作確認済み）ため、
+      // $type で明示判定して null にする（sqlite の substr(NULL,...)=NULL と同じ見た目にする）。
+      dimIdExpr[key] = { $cond: [{ $in: [{ $type: path }, ["missing", "null"]] }, null, { $substrBytes: [path, 0, len] }] };
+    }
+  }
+
+  // ── 指標（measure）→ $group の集約式（count/count_distinct/sum/avg・全て数値）──
+  const groupMeasures = {}, measKeys = [], distinctAliases = [];
+  for (const m of opts.measures) {
+    measKeys.push(m.alias);
+    if (m.op === "count") { groupMeasures[m.alias] = { $sum: 1 }; continue; }
+    const meta = FIELD_META[m.field];
+    if (!meta) queryError("E_ARGS", `未宣言のフィールドは指標にできません: ${m.field}`, "schema.fields の正準名のみ", 2, dest);
+    const path = `$${meta.path}`;
+    if (m.op === "count_distinct") {
+      // $group では集合を作るだけ（$size は後段 $addFields）。
+      groupMeasures[m.alias] = { $addToSet: path };
+      distinctAliases.push(m.alias);
+    } else if (m.op === "sum") {
+      // $convert(onError/onNull:0) は sqlite の CAST(x AS REAL)（非数値→0）と同じ寛容さで数値化する。
+      groupMeasures[m.alias] = { $sum: { $convert: { input: path, to: "double", onError: 0, onNull: 0 } } };
+    } else { // avg
+      // onNull:null で NULL/欠損を平均の分母から除外する（SQL の AVG(CAST(...)) は NULL を無視する。
+      // onNull:0 だと 0 として算入され値がずれる）。非数値は onError:0＝sqlite の CAST(非数値)=0 に合わせる。
+      groupMeasures[m.alias] = { $avg: { $convert: { input: path, to: "double", onError: 0, onNull: null } } };
+    }
+  }
+
+  // 出力キー（次元＋指標 alias）は一意でなければならない。衝突すると同名フィールドの後勝ちで次元/指標が
+  // 上書きされる（sqlite の `AS "x" … AS "x"` 事故と同種・P2）。"_id" は $group の予約名と衝突するため別途拒否。
+  const allKeys = [...dimKeys, ...measKeys];
+  const dupKey = allKeys.find((k, i) => allKeys.indexOf(k) !== i);
+  if (dupKey) queryError("E_ARGS", `出力キーが重複しています: ${dupKey}`, "group_by 次元と measure alias は一意にする（measure に別名 as を付ける）", 2, dest);
+  if (allKeys.includes("_id")) queryError("E_ARGS", `出力キーに "_id" は使えません（$group の予約名と衝突します）`, "measure に別名 alias を付ける", 2, dest);
+
+  // order_by（measure alias か次元キー）を先に検証し、pipeline 内 $sort→$limit で **真の top-N** を取る
+  // （$limit を先にすると任意のグループが選ばれ整列が部分集合に閉じる＝top-N が壊れるため）。
+  // 未指定なら次元昇順で安定・再現的（sqlite の既定 ORDER BY に合わせる）。
+  const sortStage = {};
+  if (opts.orderBy && opts.orderBy.by) {
+    const by = opts.orderBy.by;
+    if (![...measKeys, ...dimKeys].includes(by)) queryError("E_ARGS", `--order-by の対象が不明: ${by}`, "measure alias か group_by 次元名", 2, dest);
+    sortStage[measKeys.includes(by) ? `measures.${by}` : `dimensions.${by}`] = opts.orderBy.dir === "asc" ? 1 : -1;
+  } else {
+    for (const k of dimKeys) sortStage[`dimensions.${k}`] = 1;
+  }
+
+  // ── pipeline 組み立て。$sort の後に $limit(opts.limit+1) で超過分を検出→切り捨て（§limit 決定性）。──
+  const pipeline = [{ $match: filter }, { $group: { _id: dimIdExpr, ...groupMeasures } }];
+  if (distinctAliases.length) {
+    const addFields = {};
+    for (const a of distinctAliases) addFields[a] = { $size: `$${a}` };
+    pipeline.push({ $addFields: addFields });
+  }
+  const projDims = {}, projMeas = {};
+  for (const k of dimKeys) projDims[k] = `$_id.${k}`;
+  for (const k of measKeys) projMeas[k] = `$${k}`;
+  pipeline.push({ $project: { _id: 0, dimensions: projDims, measures: projMeas } });
+  if (Object.keys(sortStage).length) pipeline.push({ $sort: sortStage });
+  pipeline.push({ $limit: opts.limit + 1 });
+
+  // maxTimeMS（server側）＋ client timeout+SIGKILL backstop（既存 native 経路と同水準・§9.6 相当）。
+  const timeoutMs = 10000;
+  const script =
+    `const coll=db.getSiblingDB(${JSON.stringify(opts.db)}).getCollection(${JSON.stringify(opts.collection)});` +
+    `const cur=coll.aggregate(${JSON.stringify(pipeline)},{maxTimeMS:${timeoutMs},allowDiskUse:true});` +
+    `cur.forEach(function(d){ print(JSON.stringify(d)); });`;
+  const r = runMongoshScript(opts.uri, script, { timeout: timeoutMs + 2000, killSignal: "SIGKILL", maxBuffer: 64 * 1024 * 1024 });
+
+  if (r.signal === "SIGKILL" || (r.error && r.error.code === "ETIMEDOUT")) {
+    queryError("E_TIMEOUT", `aggregate exceeded ${timeoutMs}ms`, "より絞り込んだ集計にしてください", 1, dest);
+  }
+  if (r.status !== 0) {
+    const text = (r.stderr || r.stdout || "").trim();
+    if (looksLikeConnError(text)) queryError("E_CONNECT", `mongosh: ${scrub(firstLine(text)) || "connection failed"}`, "--uri を確認。mongod が起動しているか確認", 1, dest);
+    queryError("E_INTERNAL", scrub(firstLine(text)) || "mongosh aggregate failed", null, 1, dest);
+  }
+
+  // print(JSON.stringify(...)) の1行1オブジェクト出力を parseNdjsonLines で解析（mongosh 2.x の
+  // REPL プロンプト前置に耐える・query と同じ経路）。
+  // 並びは pipeline 内 $sort で確定済み（top-N も正確）。ここでは取得と truncated 判定のみ。
+  let rows = parseNdjsonLines(r.stdout);
+  const truncated = rows.length > opts.limit;
+  if (truncated) rows = rows.slice(0, opts.limit);
+
+  for (const row of rows) {
+    const dimensions = {}, measures = {};
+    for (const k of dimKeys) dimensions[k] = dimVal(row.dimensions ? row.dimensions[k] : null);
+    for (const k of measKeys) measures[k] = measVal(row.measures ? row.measures[k] : null);
+    emitAggRow(dimensions, measures);
+  }
+  queryEnd({ count: rows.length, complete: !truncated, truncated, nextCursor: null, dest,
+    aggregate: true, groupBy: dimKeys, measures: measKeys });
   process.exit(0);
 }
 

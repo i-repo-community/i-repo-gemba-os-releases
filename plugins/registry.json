@@ -33,7 +33,7 @@
       "name": "bigquery",
       "file": "i-repo-bigquery",
       "displayName": "i-repo-bigquery",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "description": "Write NDJSON records to Google BigQuery (bq CLI経由・Cloud DWH Ready)",
       "platforms": [
         "macos",
@@ -54,7 +54,7 @@
         {
           "path": "i-repo-bigquery",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-bigquery",
-          "sha256": "d9304d31343e28390a4848bf2d57495f27a0b1bc0680e74d08ede877714adc74"
+          "sha256": "2e6fda55035ba3585e85a7e5968d847043024835f52324a8394665293ff2a043"
         }
       ]
     },
@@ -83,7 +83,7 @@
         {
           "path": "i-repo-elastic",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-elastic",
-          "sha256": "54bd3d676f3f7ada806684cb6c88f08ecaf1ad1f839761575feb19224d12479d"
+          "sha256": "7506add0f3f9a2dbcece1d1107e4c8c7141583d42fa42542211e2758eb434994"
         }
       ]
     },
@@ -91,7 +91,7 @@
       "name": "mongo",
       "file": "i-repo-mongo",
       "displayName": "i-repo-mongo",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "description": "Upsert NDJSON records into MongoDB (帳票IDキーでネスト構造をドキュメント保持)",
       "platforms": [
         "macos",
@@ -111,7 +111,7 @@
         {
           "path": "i-repo-mongo",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-mongo",
-          "sha256": "766f91ff564e655add26fc0652d8fe2b21b8e1a8b42c7686a0ac18706221f6bf"
+          "sha256": "18c56898dfa2e8e653bb1cf87319ed989b11ca05f95fc2780cff45b5a67e3687"
         }
       ]
     },
@@ -119,7 +119,7 @@
       "name": "parquet",
       "file": "i-repo-parquet",
       "displayName": "i-repo-parquet",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "description": "Write NDJSON records to Parquet / Apache Iceberg (DuckDB経由・Lakehouse Ready)",
       "platforms": [
         "macos",
@@ -140,7 +140,7 @@
         {
           "path": "i-repo-parquet",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-parquet",
-          "sha256": "f8d9e386955d085021b87ae7f02b14797ef318179193d936d915847e2d95f9d0"
+          "sha256": "58ae0f83143974916c28536acc55a4411f8b5df69381fcfc8de704b24f29c62d"
         }
       ]
     },

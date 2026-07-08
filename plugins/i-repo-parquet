@@ -34,13 +34,29 @@
 "use strict";
 
 const PLUGIN = "i-repo-parquet";
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const { spawnSyncSpec } = require("./lib/spawn.js");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
 const argv = process.argv.slice(2);
+
+// ── 構造化集計 aggregate（gemba-adc/1.2）で参照する正準名→列/属性の唯一の宣言源
+// （--plugin-schema の dataset.fields と一致）。aggregate の次元/指標はここに在るフィールドのみ
+// 参照可（未宣言＝E_ARGS＝越境穴を宣言駆動で封鎖）。dispatch より前に初期化する（TDZ 回避）。
+const FIELD_META = {
+  idempotencyKey: { col: "idempotency_key" },
+  recordType: { col: "record_type" },
+  itemId: { col: "item_id" },
+  revNo: { col: "rev_no" },
+  name: { col: "name", pii: true },
+  deleted: { col: "deleted" },
+  registTime: { col: "regist_time", datetime: true, timezone: "local" },
+  updateTime: { col: "update_time", datetime: true, timezone: "local" },
+  loadedAt: { col: "loaded_at", datetime: true, timezone: "utc" },
+  endpointFp: { col: "endpoint_fp" },
+};
 
 // ── 予約フラグ ───────────────────────────────────────────────────────
 if (argv[0] === "--plugin-schema") {
@@ -60,6 +76,9 @@ if (argv[0] === "--plugin-schema") {
     subcommands: [
       { name: "query", mode: "read", input: ["none"], output: ["ndjson"],
         description: "着地済みレコードを正準封筒形で読み出す（ページ付き・書込ゼロ）" },
+      // gemba-adc/1.2: 構造化集計。生 SQL を渡さず group_by/measure で集計（エージェント面に公開可）。
+      { name: "aggregate", mode: "read", input: ["none"], output: ["ndjson"],
+        description: "次元(group_by)＋指標(measure)で集計する（読み取り専用・aggregate-row + query-end）" },
     ],
     params: [
       { name: "--out", type: "string",
@@ -110,7 +129,7 @@ if (argv[0] === "--plugin-schema") {
     ],
     // ── ADC-1（gemba-adc/1.0）着地スキーマ宣言。--iceberg-table の有無で2形態 ──
     dataset: [
-      { datasetApi: ["1"], contract: "gemba-adc/1.1", store: "parquet",
+      { datasetApi: ["1"], contract: "gemba-adc/1.2", store: "parquet",
         selector: { param: "--iceberg-table", present: false },
         locator: { out: { param: "--out" } },
         naming: "snake_case",
@@ -118,7 +137,7 @@ if (argv[0] === "--plugin-schema") {
         contents: "latest-batch-only",
         fields: parquetFields(),
         quirks: ["raw-json-embedded", "string-dates", "non-json-sentinel", "overwrite-on-rerun", "detail-optional"] },
-      { datasetApi: ["1"], contract: "gemba-adc/1.1", store: "iceberg",
+      { datasetApi: ["1"], contract: "gemba-adc/1.2", store: "iceberg",
         selector: { param: "--iceberg-table", present: true },
         // locator は query が必要とする接続フラグを**全て**宣言する（access.query の正本になる。
         // 漏らすと読み返しがその引数なしで実行され失敗する — レビューで --warehouse 欠落を検出済み）。
@@ -191,6 +210,21 @@ if (argv[0] === "query") {
     process.exit(1);
   }
   runQuery(argv.slice(1), G);   // 内部で process.exit。以降へは進まない。
+}
+
+// ── aggregate サブコマンド（gemba-adc/1.2・構造化集計・読み取り専用） ─────
+// エージェント面に生 SQL を渡さず、次元(group_by)＋指標(measure)で集計する（audience:human 境界を保つ）。
+if (argv[0] === "aggregate") {
+  let G;
+  try { G = require("./lib/gemba-read.js"); }
+  catch {
+    console.error(JSON.stringify({ schemaVersion: "1.0", recordType: "error", contract: "gemba-read/1.0",
+      plugin: PLUGIN, code: "E_INTERNAL",
+      message: "gemba-read ライブラリが見つかりません（lib/gemba-read.js）。plugins/install.sh を再実行してください",
+      retryable: false }));
+    process.exit(1);
+  }
+  runAggregate(argv.slice(1), G);   // 内部で process.exit。以降へは進まない。
 }
 
 function runQuery(qargs, G) {
@@ -342,6 +376,174 @@ function runQuery(qargs, G) {
   };
   if (timeFilter) end.timeFilter = timeFilter;
   queryEnd(end);
+  process.exit(0);
+}
+
+function runAggregate(aargs, G) {
+  const { queryEnd, emitAggRow, queryError } = G.createReadKit(PLUGIN);
+  const opts = G.parseAggregateArgs(aargs, {
+    "--out": "out", "--iceberg-endpoint": "icebergEndpoint", "--warehouse": "warehouse",
+    "--iceberg-table": "icebergTable", "--s3-endpoint": "s3Endpoint",
+    "--s3-key-id": "s3KeyId", "--s3-secret": "s3Secret", "--s3-region": "s3Region",
+  }, queryError);
+  if (!opts.s3Region) opts.s3Region = "us-east-1";
+
+  // --iceberg-table があれば iceberg、なければ --out で parquet（write/query と同判定）。
+  const icebergMode = !!(opts.icebergEndpoint || opts.warehouse || opts.icebergTable);
+  if (icebergMode) {
+    if (!opts.icebergEndpoint || !opts.warehouse || !opts.icebergTable) {
+      queryError("E_ARGS", "Iceberg mode requires --iceberg-endpoint, --warehouse and --iceberg-table", null, 2);
+    }
+    if (!/^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$/.test(opts.icebergTable)) {
+      queryError("E_ARGS", "--iceberg-table must be namespace.table (e.g. irepo.reports)", null, 2);
+    }
+  } else {
+    if (!opts.out) queryError("E_ARGS", "--out <path> (Parquet) or --iceberg-* (Iceberg) is required", "集計対象の出力先", 2);
+  }
+
+  let outp = opts.out;
+  if (outp.startsWith("~/")) outp = path.join(os.homedir(), outp.slice(2));
+  const dest = icebergMode ? `iceberg:${opts.icebergTable}@${opts.icebergEndpoint}` : `parquet:${outp}`;
+
+  // duckdb 不在は推測せず E_CONNECT。
+  const has = spawnSyncSpec("duckdb", ["--version"], { encoding: "utf8" });
+  if (has.status !== 0) {
+    queryError("E_CONNECT", "duckdb CLI not found", "DuckDB CLI をインストールしてください（brew install duckdb 等）", 1, dest);
+  }
+
+  // parquet モードはファイル不在を CREATE せず E_NOT_FOUND（§3.7）。
+  if (!icebergMode && !fs.existsSync(outp)) {
+    queryError("E_NOT_FOUND", `parquet not found: ${outp}`, "配信が一度も成功していない可能性があります", 1, dest);
+  }
+
+  // ── ソース式と setup（write/query 経路の ATTACH 手順を踏襲） ────────────
+  let setup = "";
+  let srcExpr;
+  if (icebergMode) {
+    const [ns, tbl] = opts.icebergTable.split(".");
+    setup = "INSTALL iceberg; LOAD iceberg; INSTALL httpfs; LOAD httpfs;\n";
+    if (opts.s3KeyId || opts.s3Endpoint) {
+      const ep = opts.s3Endpoint.replace(/^https?:\/\//, "");
+      const ssl = opts.s3Endpoint.startsWith("https://");
+      setup += `CREATE OR REPLACE SECRET obj (TYPE s3, KEY_ID ${q(opts.s3KeyId)}, SECRET ${q(opts.s3Secret)}, ` +
+        `REGION ${q(opts.s3Region)}${opts.s3Endpoint ? `, ENDPOINT ${q(ep)}, URL_STYLE 'path', USE_SSL ${ssl}` : ""});\n`;
+    }
+    setup += `ATTACH ${q(opts.warehouse)} AS ic (TYPE iceberg, ENDPOINT ${q(opts.icebergEndpoint)}, AUTHORIZATION_TYPE 'none');\n`;
+    srcExpr = `ic."${ns}"."${tbl}"`;
+  } else {
+    srcExpr = `read_parquet(${q(outp)})`;
+  }
+
+  // ── 次元（group_by）→ SELECT 式。未宣言フィールドは拒否・scoped では PII 次元を拒否（多層）──
+  const dimSelects = [], dimKeys = [], groupExprs = [];
+  for (const g of opts.groupBy) {
+    const meta = FIELD_META[g.field];
+    if (!meta) queryError("E_ARGS", `未宣言のフィールドは次元にできません: ${g.field}`, "schema.fields の正準名のみ", 2, dest);
+    if (opts.noPiiDimensions && meta.pii) queryError("E_ARGS", `PII 宣言フィールドは次元(group_by)に使えません（テナント分離セッション）: ${g.field}`, "集計でも値集合が露出するため", 2, dest);
+    if (g.kind === "field") {
+      dimKeys.push(g.field);
+      dimSelects.push(`"${meta.col}" AS "${g.field}"`);
+      groupExprs.push(`"${meta.col}"`);
+    } else { // date_bucket
+      if (!meta.datetime) queryError("E_ARGS", `date_bucket は datetime フィールドのみ: ${g.field}`, null, 2, dest);
+      const tz = G.resolveBucketTz(g.tz, meta.timezone, queryError, dest);
+      // MVP は「変換なしで扱える組合せ」のみ: 局所壁時計(local)は tz を解釈ゾーンとみなし substr、
+      // UTC 格納は UTC バケットのみ substr。UTC×非-UTC バケットは DST 変換が要り zero-dep SQL で不可＝未対応。
+      if (meta.timezone === "utc" && tz !== "UTC") {
+        queryError("E_UNSUPPORTED", `UTC 格納フィールド(${g.field})の非-UTC(${tz})バケットは未対応（MVP）`, "tz=UTC にするか局所時刻フィールドを使う", 2, dest);
+      }
+      const len = G.bucketSubstrLen(g.granularity);
+      const key = `${g.field}_${g.granularity}`;
+      dimKeys.push(key);
+      dimSelects.push(`substr("${meta.col}", 1, ${len}) AS "${key}"`);
+      groupExprs.push(`substr("${meta.col}", 1, ${len})`);
+    }
+  }
+
+  // ── 指標（measure）→ SELECT 式（count/count_distinct/sum/avg・全て数値）──
+  const measSelects = [], measKeys = [];
+  for (const m of opts.measures) {
+    let expr;
+    if (m.op === "count") expr = "COUNT(*)";
+    else {
+      const meta = FIELD_META[m.field];
+      if (!meta) queryError("E_ARGS", `未宣言のフィールドは指標にできません: ${m.field}`, "schema.fields の正準名のみ", 2, dest);
+      const c = `"${meta.col}"`;
+      // TRY_CAST: 非数値は実行時エラーでなく NULL（SUM/AVG が無視）＝1行でも非数値混入で集計全体が
+      // E_INTERNAL になるのを防ぐ（duckdb の CAST はハードエラー）。NULL 無視は SQL の AVG と整合。
+      expr = m.op === "count_distinct" ? `COUNT(DISTINCT ${c})`
+        : m.op === "sum" ? `SUM(TRY_CAST(${c} AS DOUBLE))`
+        : `AVG(TRY_CAST(${c} AS DOUBLE))`; // avg
+    }
+    measSelects.push(`${expr} AS "${m.alias}"`);
+    measKeys.push(m.alias);
+  }
+
+  // 出力キー（次元＋指標 alias）は一意でなければならない。衝突すると `AS "x" … AS "x"` となり
+  // 出力が破壊される（次元値が指標値で上書きされる・P2）。
+  const allKeys = [...dimKeys, ...measKeys];
+  const dupKey = allKeys.find((k, i) => allKeys.indexOf(k) !== i);
+  if (dupKey) queryError("E_ARGS", `出力キーが重複しています: ${dupKey}`, "group_by 次元と measure alias は一意にする（measure に別名 as を付ける）", 2, dest);
+
+  // ── WHERE（query と同一のフィルタ＋テナント厳格絞り §3.9）──
+  const where = [];
+  // 列を持たない旧ストア（v0.2.0 以前）はエラーにせず 0 件（厳格・fail-closed）。列 probe は絞るときだけ。
+  if (opts.endpointFp) {
+    const probe = runDuckdbJson(setup +
+      `SELECT column_name FROM (DESCRIBE SELECT * FROM ${srcExpr}) WHERE column_name = ${q("endpoint_fp")};`);
+    let hasCol = false;
+    if (probe.status === 0) { try { hasCol = parseDuckdbJsonArrays(probe.stdout).length > 0; } catch { hasCol = false; } }
+    if (hasCol) where.push(`endpoint_fp = ${q(opts.endpointFp)}`);
+    else where.push("false");   // 列不在＝未タグ扱いで厳格に 0 件
+  }
+  const tcol = opts.timeField === "updated" ? "update_time" : opts.timeField === "registered" ? "regist_time" : "loaded_at";
+  const bounds = G.timeBounds(opts, tcol === "loaded_at" ? "iso" : "slash", queryError, dest);
+  if (bounds?.gte) where.push(`${tcol} >= ${q(bounds.gte)}`);
+  if (bounds?.lt) where.push(`${tcol} < ${q(bounds.lt)}`);   // 半開区間 [since, until)
+  if (opts.deleted != null) where.push(`deleted = ${opts.deleted ? "true" : "false"}`);
+  if (opts.ids && opts.ids.length) where.push(`idempotency_key IN (${opts.ids.map((s) => q(s)).join(",")})`);
+  if (opts.itemIds.length) where.push(`item_id IN (${opts.itemIds.map((s) => q(s)).join(",")})`);
+  const whereSql = where.length ? ` WHERE ${where.join(" AND ")}` : "";
+
+  // ── ORDER BY（top-N の決定性）。by は measure alias か dimension key のみ ──
+  let orderSql;
+  if (opts.orderBy && opts.orderBy.by) {
+    if (![...measKeys, ...dimKeys].includes(opts.orderBy.by)) {
+      queryError("E_ARGS", `--order-by の対象が不明: ${opts.orderBy.by}`, "measure alias か group_by 次元名", 2, dest);
+    }
+    orderSql = `ORDER BY "${opts.orderBy.by}" ${opts.orderBy.dir === "asc" ? "ASC" : "DESC"}`;
+  } else {
+    orderSql = `ORDER BY ${dimKeys.map((k) => `"${k}"`).join(", ")} ASC`; // 既定は次元昇順（安定・再現的）
+  }
+
+  // iceberg/parquet の append 重複を集計前に dedup（冪等キー単位で loaded_at 最新の1行へ畳む）。
+  // parquet モードは元来キー一意（ファイル上書き）だが、同一 SQL 経路にすることで挙動を一本化する。
+  const dedupInner = `SELECT * FROM ${srcExpr}${whereSql} QUALIFY row_number() OVER (PARTITION BY idempotency_key ORDER BY loaded_at DESC) = 1`;
+
+  // limit+1 で取得し超過を truncated 判定（切り捨て群は order で決まる＝§limit 決定性）。
+  const sql = setup +
+    `SELECT ${[...dimSelects, ...measSelects].join(", ")} FROM (${dedupInner}) AS t ` +
+    `GROUP BY ${groupExprs.join(", ")} ${orderSql} LIMIT ${opts.limit + 1};`;
+
+  const r = runDuckdbJson(sql);
+  if (r.status !== 0) {
+    const msg = (r.stderr || r.stdout || "duckdb aggregate failed").trim();
+    queryError("E_INTERNAL", msg, null, 1, dest);
+  }
+  let rows;
+  try { rows = parseDuckdbJsonArrays(r.stdout); }
+  catch (e) { queryError("E_INTERNAL", `cannot parse duckdb output: ${e.message}`, null, 1, dest); }
+
+  const truncated = rows.length > opts.limit;
+  if (truncated) rows = rows.slice(0, opts.limit);
+  for (const row of rows) {
+    const dimensions = {}, measures = {};
+    for (const k of dimKeys) dimensions[k] = row[k] === undefined ? null : row[k];
+    for (const k of measKeys) measures[k] = row[k] == null ? 0 : Number(row[k]);
+    emitAggRow(dimensions, measures);
+  }
+  queryEnd({ count: rows.length, complete: !truncated, truncated, nextCursor: null, dest,
+    aggregate: true, groupBy: dimKeys, measures: measKeys });
   process.exit(0);
 }
 

@@ -115,6 +115,13 @@ if (argv[0] === "--plugin-schema") {
       contents: "cumulative",
       fields: [
         { name: "_id", canonical: "idempotencyKey", source: "idempotencyKey", type: "string", role: "key" },
+        { name: "recordType", canonical: "recordType", source: "recordType", type: "string" },
+        { name: "itemId", canonical: "itemId", source: "itemId", type: "string", role: "report-id" },
+        { name: "revNo", canonical: "revNo", source: "revNo", type: "string", role: "revision" },
+        { name: "values.name", canonical: "name", source: "values.name", type: "string", pii: "possible" },
+        { name: "deleted", canonical: "deleted", source: "deleted", type: "boolean" },
+        { name: "values.registTime", canonical: "registTime", source: "values.registTime", type: "datetime", format: "local-datetime-slash", timezone: "local" },
+        { name: "values.updateTime", canonical: "updateTime", source: "values.updateTime", type: "datetime", format: "local-datetime-slash", timezone: "local" },
         { name: "_loadedAt", canonical: "loadedAt", type: "datetime", format: "iso8601", timezone: "utc", role: "lineage" },
         { name: "_endpointFp", canonical: "endpointFp", source: "provenance.endpointFingerprint", type: "string", role: "tenant", description: "配信元 i-Reporter エンドポイントの正準指紋（テナント同一性・gemba-adc/1.1）。旧配信ドキュメントには存在しない" },
         { name: "*", canonical: "raw", source: ".", type: "object", schemaRef: "envelope/1.0", pii: "likely" },
