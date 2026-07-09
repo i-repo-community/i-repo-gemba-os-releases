@@ -34,6 +34,8 @@ nav_order: 12
 - **Claude**（Claude Code CLI）: 既定。`claude auth login` でサインインして使います。
 - **Codex**（OpenAI Codex CLI）: `codex login` でサインインして使います。**試験的対応**です（下記の注意を参照）。
 
+Claude Code が Bedrock / Vertex / Foundry などのクラウドプロバイダや Anthropic API を使うよう設定されている場合、現場 AI チャットの Claude はそのプロバイダをそのまま自動的に使います。認識状況は準備状況パネルに表示され、認証はそのクラウド側（AWS / GCP / Azure）で行われます（`claude auth login` ではありません）。詳しくは [AI 連携の詳細](manual-ai.html) を参照してください。
+
 切り替えると会話は新しく始まります（それまでのやりとりは引き継ぎません）。
 
 > **Codex を使うときの注意（試験的）**
