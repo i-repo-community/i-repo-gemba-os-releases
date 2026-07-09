@@ -1,0 +1,97 @@
+<!-- 一時的なソフト目隠し（アプリ一般公開までの間だけ）。
+     公開時はこのファイルと、これを include している head_custom.html / landing.html の1行、
+     ならびに robots.txt を消せば完全に撤去できる。
+     注意: これは真の保護ではない（GitHub Pages は本質的に公開・JS 無効やソース閲覧で中身は見える）。
+     クローラ抑止（noindex）＋カジュアルな来訪者の目隠しが目的。 -->
+<meta name="robots" content="noindex, nofollow">
+<style>
+  /* 描画前に本文を隠す（<head> で html.gated が付くのでフラッシュしない）。オーバーレイだけは見せる。 */
+  html.gated body { visibility: hidden; }
+  html.gated #gate-overlay { visibility: visible; }
+  #gate-overlay {
+    position: fixed; inset: 0; z-index: 99999;
+    display: flex; align-items: center; justify-content: center;
+    background: #f3efe6;
+    background-image:
+      linear-gradient(#ece7da 1px, transparent 1px),
+      linear-gradient(90deg, #ece7da 1px, transparent 1px);
+    background-size: 46px 46px; background-position: -1px -1px;
+    font-family: "Helvetica Neue", Helvetica, Arial, "Hiragino Kaku Gothic ProN", "Yu Gothic UI", Meiryo, system-ui, sans-serif;
+    color: #141210;
+  }
+  #gate-overlay .gate-card {
+    background: #fff; border: 3px solid #141210; box-shadow: 6px 6px 0 #141210;
+    padding: 28px 26px; width: min(90vw, 360px);
+  }
+  #gate-overlay h1 {
+    margin: 0 0 4px; font-size: 18px; font-weight: 900; letter-spacing: -.01em;
+  }
+  #gate-overlay p { margin: 0 0 16px; font-size: 13px; line-height: 1.6; color: #55504a; }
+  #gate-overlay .gate-row { display: flex; gap: 8px; }
+  #gate-overlay input {
+    flex: 1; min-width: 0; font: inherit; font-size: 16px; padding: 9px 11px;
+    border: 2px solid #141210; background: #f3efe6; color: #141210;
+  }
+  #gate-overlay input:focus { outline: none; background: #fff; }
+  #gate-overlay button {
+    font: inherit; font-weight: 800; font-size: 14px; padding: 9px 16px; cursor: pointer;
+    border: 2px solid #141210; background: #ff5a1f; color: #140a04; box-shadow: 3px 3px 0 #141210;
+  }
+  #gate-overlay button:active { transform: translate(2px, 2px); box-shadow: 1px 1px 0 #141210; }
+  #gate-overlay .gate-err { margin-top: 10px; font-size: 12px; font-weight: 700; color: #c02626; min-height: 1em; }
+  #gate-overlay.shake .gate-card { animation: gate-shake .35s; }
+  @keyframes gate-shake {
+    0%,100% { transform: translateX(0); }
+    20% { transform: translateX(-7px); } 40% { transform: translateX(7px); }
+    60% { transform: translateX(-5px); } 80% { transform: translateX(5px); }
+  }
+</style>
+<script>
+(function () {
+  var KEY = "irepoGate", PASS = "1234";
+  // このタブ・セッションで解除済みなら何もしない。
+  try { if (sessionStorage.getItem(KEY) === "1") return; } catch (e) { /* storage 不可でもゲートは出す */ }
+
+  // 描画前に本文を隠す（オーバーレイ生成前でも一瞬たりとも中身を見せない）。
+  document.documentElement.classList.add("gated");
+
+  function unlock() {
+    try { sessionStorage.setItem(KEY, "1"); } catch (e) {}
+    document.documentElement.classList.remove("gated");
+    var ov = document.getElementById("gate-overlay");
+    if (ov) ov.remove();
+  }
+
+  function build() {
+    if (document.getElementById("gate-overlay")) return;
+    var ov = document.createElement("div");
+    ov.id = "gate-overlay";
+    ov.innerHTML =
+      '<div class="gate-card" role="dialog" aria-modal="true" aria-label="パスワード入力">' +
+        '<h1>非公開ページ</h1>' +
+        '<p>このページはまだ一般公開していません。パスワードを入力してください。</p>' +
+        '<div class="gate-row">' +
+          '<input id="gate-input" type="password" inputmode="numeric" autocomplete="off" aria-label="パスワード" />' +
+          '<button id="gate-submit" type="button">開く</button>' +
+        '</div>' +
+        '<div class="gate-err" id="gate-err" aria-live="polite"></div>' +
+      '</div>';
+    document.body.appendChild(ov);
+
+    var input = document.getElementById("gate-input");
+    var err = document.getElementById("gate-err");
+    function attempt() {
+      if (input.value === PASS) { unlock(); return; }
+      err.textContent = "パスワードが違います。";
+      ov.classList.remove("shake"); void ov.offsetWidth; ov.classList.add("shake");
+      input.value = ""; input.focus();
+    }
+    document.getElementById("gate-submit").addEventListener("click", attempt);
+    input.addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); attempt(); } });
+    input.focus();
+  }
+
+  if (document.body) build();
+  else document.addEventListener("DOMContentLoaded", build);
+})();
+</script>
