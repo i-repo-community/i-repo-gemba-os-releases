@@ -198,6 +198,33 @@
           "sha256": "f1341f188f4f81f9fd2860dd4d33b9273ec394fef02b5b5a33933b7ee71e3b1d"
         }
       ]
+    },
+    {
+      "name": "upload",
+      "file": "i-repo-upload",
+      "displayName": "i-repo-upload",
+      "version": "0.1.0",
+      "description": "帳票 bundle の documents/ の中身だけを送り先直下へ実名のまま flat 配置（manifests/receipts 等の裏方ファイルはゼロ）。同名は in-place 置換＝版機構を持つストア（Box/SharePoint/Drive 同期・S3/Blob バージョニング）では新バージョンとして積まれる。人が開くファイル共有向けの egress-only 配信",
+      "platforms": [
+        "macos",
+        "linux",
+        "windows"
+      ],
+      "roles": [
+        "sink"
+      ],
+      "category": "file-share",
+      "supportsQuery": false,
+      "minPluginApi": "1",
+      "publisher": "official",
+      "signature": null,
+      "files": [
+        {
+          "path": "i-repo-upload",
+          "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-upload",
+          "sha256": "554c7d095c5b75fd6cbcf84ebed203932f0028b61f4a3bbe54bdde92ffc73e28"
+        }
+      ]
     }
   ],
   "shared": [

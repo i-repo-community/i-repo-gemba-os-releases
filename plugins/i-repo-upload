@@ -1,0 +1,968 @@
+#!/usr/bin/env node
+/**
+ * i-repo-upload — placement（配置）plugin: archive bundle の documents/ の中身
+ * **だけ**を送り先 <--to>/<--prefix> 直下へ**実名のまま flat** に置く egress-only sink。
+ *
+ * 目的（GEMBA OS 要望 #239）: 送り先が「人が使うファイル共有ストア」（Box / Dropbox /
+ * Google Drive / SharePoint — 同期クライアントの local マウント経由で着地）のとき、
+ * 帳票の実体（PDF/写真/Excel）だけを人がそのまま開ける形で置く。archive push-* と違い、
+ * 送り先に manifests/・receipts/・batchDir(UUID)・documents/ ネストといった
+ * 裏方ファイル/フォルダを**一切作らない**。
+ *
+ * 【in-place 置換契約 — 変更しないこと】
+ * 同名衝突は常に in-place 置換（last-write-wins・ファイル名は常に実名）。全 backend で
+ * 「同一キー/同一パスへの直接 PUT/上書き」だけを使い（aws s3 cp / gcloud storage rsync /
+ * az upload --overwrite / fs.copyFile はいずれもこの経路）、**delete→put や 一時名→rename は
+ * 実装しない・今後も入れない**。版機構を持つストア（Box/SharePoint/Drive の同期フォルダ・
+ * S3 バージョニング・Blob versioning）では置換が新バージョンとして積まれ旧版はストア側に
+ * 残る — delete や rename を挟むと版連鎖・ファイル同一性が壊れるため。
+ *
+ * 成功判定は receipt `verified:true` のみ（SCHEMA.md §6・stdout NDJSON）。送り先には
+ * 受領情報を残さない（履歴・冪等は GEMBA OS 台帳 exported_reports が正）。
+ *
+ * 注意（deliver 連携）: 実配置ベース URI は新設キー **`placedPrefix`** で返す。`s3Prefix` /
+ * `gcsPrefix` / `azurePrefix` / `localPrefix`（deliver locator.ts の LANDED_PREFIX_KEYS）は
+ * **名乗らない** — deliver の enrichLocator は `landedPrefix + "/documents/<name>"` という
+ * bundle レイアウト前提の URI を組むため、flat 配置がこれらを名乗ると誤 URI になる。
+ * enrichLocator の locator source には archive push-* を使うこと。
+ *
+ * ZERO DEPENDENCIES: node 内蔵 + ./lib/spawn.js（同梱の spawn 正本）のみ。単一ファイル・CJS。
+ *   install: ~/.i-repo/plugins/ へ本体と lib/ をコピー && chmod +x
+ *   Windows: i-repo-upload.cmd シムも同じ場所へ
+ *
+ * Usage:
+ *   i-repo upload push-s3    <archive-dir> --to s3://bucket/prefix [options]
+ *   i-repo upload push-gcs   <archive-dir> --to gs://bucket/prefix [options]
+ *   i-repo upload push-azure <archive-dir> --to https://<acct>.blob.core.windows.net/<container>/<p> [options]
+ *   i-repo upload push-local <archive-dir> --to <folder|network-share> [options]
+ * pull / query / aggregate は実装も宣言もしない（送り先の目録・取り戻しは捨てる設計）。
+ */
+"use strict";
+
+const fs = require("node:fs");
+const fsp = require("node:fs/promises");
+const { createHash } = require("node:crypto");
+const { spawn } = require("node:child_process");
+const { homedir } = require("node:os");
+const { basename, join, resolve, relative, isAbsolute, sep } = require("node:path");
+// 子プロセスの spec 構築は全プラグイン共通の正本 lib/spawn.js に一本化する
+// （Windows .cmd シム対応・cmd.exe メタ文字拒否）。spawn 自体はここで非同期に行う。
+const { spawnSpec } = require("./lib/spawn.js");
+
+const PLUGIN = "i-repo-upload";
+const VERSION = "0.1.0";
+const PLUGIN_API = "1";
+
+const PLACE_SUBS = ["push-s3", "push-gcs", "push-azure", "push-local"];
+
+// ── 予約フラグ: --plugin-schema は API 検査より先に応答する（docs/PLUGINS.md）──
+const arg0 = process.argv[2];
+if (arg0 === "--plugin-schema") {
+  console.log(JSON.stringify({
+    pluginApi: [PLUGIN_API], schemaVersions: ["1.0"], recordTypes: [],
+    name: PLUGIN, version: VERSION,
+    description: "帳票 bundle の documents/ の中身だけを送り先直下へ実名のまま flat 配置（manifests/receipts 等の裏方ファイルはゼロ）。同名は in-place 置換＝版機構を持つストア（Box/SharePoint/Drive 同期・S3/Blob バージョニング）では新バージョンとして積まれる。人が開くファイル共有向けの egress-only 配信",
+    phases: ["write", "verify"],
+    platforms: ["macos", "linux", "windows"],
+    // sink のみ。keep は付けない（「読み返せる保管」の含意を避ける — 送り先に目録を
+    // 置かないので、この plugin 経由の取り戻し・query は提供しない）。
+    roles: ["sink"],
+    // 表示カテゴリ（GUI が配信先を種別グループ表示するために読む）。
+    category: "file-share",
+    subcommands: [
+      { name: "push-s3", input: ["dir"],
+        description: "bundle の帳票実体を S3 の <to>/<prefix> 直下へ実名 flat 配置（要 aws CLI）" },
+      { name: "push-gcs", input: ["dir"],
+        description: "bundle の帳票実体を Google Cloud Storage の <to>/<prefix> 直下へ実名 flat 配置（要 gcloud CLI）" },
+      { name: "push-azure", input: ["dir"],
+        description: "bundle の帳票実体を Azure Blob の <to>/<prefix> 直下へ実名 flat 配置（要 az CLI）" },
+      { name: "push-local", input: ["dir"],
+        description: "bundle の帳票実体をフォルダ/ネットワーク共有（Box/Drive 等の同期フォルダ含む）へ実名 flat 配置（外部CLI不要）" },
+    ],
+    params: [
+      // --to（配置先）: backend ごとに形が違うので個別宣言（archive push-* と同名・同 placeholder）。
+      { name: "--to", type: "string", required: true, subcommand: "push-s3",
+        label: "S3 destination", placeholder: "s3://bucket/prefix",
+        description: "S3 destination（この直下へ実名 flat 配置）" },
+      { name: "--to", type: "string", required: true, subcommand: "push-gcs",
+        label: "GCS destination", placeholder: "gs://bucket/prefix",
+        description: "Google Cloud Storage destination（この直下へ実名 flat 配置）" },
+      { name: "--to", type: "string", required: true, subcommand: "push-azure",
+        label: "Azure Blob destination", placeholder: "https://<account>.blob.core.windows.net/<container>/<prefix>",
+        description: "Azure Blob destination (blob endpoint URL)（この直下へ実名 flat 配置）" },
+      { name: "--to", type: "string", required: true, subcommand: "push-local",
+        label: "保存先フォルダ/ファイルサーバー",
+        placeholder: "/Volumes/share/reports ・ \\\\server\\share\\reports ・ D:\\reports",
+        description: "ローカル/ネットワーク共有の配置先パス（同期クライアントの共有フォルダ含む）" },
+      // --prefix / --cleanup は 4 サブコマンド共通の同文言（archive と同名・同 tokens・同 placeholder）。
+      ...PLACE_SUBS.flatMap((sub) => [
+        { name: "--prefix", type: "string", subcommand: sub, filter: false,
+          label: "配置先サブパス（任意）", placeholder: "{flow}/{date}/{batchId}",
+          tokens: ["{batchId}", "{date}", "{datetime}", "{flow}"],
+          description: "<--to>/ 配下の配置先サブパス。未指定なら <--to> 直下へ実名 flat 配置（実行ごとフォルダは作らない）。下のチップで差し込み可（{date}=YYYY-MM-DD, {datetime}=YYYYMMDDTHHMMSS, {flow}=フロー名, {batchId}=bundle 名）。安全な相対パスへ無害化（.. ・scheme 不可）— 無害化で空/危険になる指定はフォールバックせずエラー（exit 2）" },
+        { name: "--cleanup", type: "boolean", subcommand: sub, destructive: true,
+          label: "Clean up local archive",
+          description: "配置が verified（verified:true かつ失敗0件）のときだけローカル bundle を削除" },
+      ]),
+      // push-s3 無人認証（archive と同名・同 envVar。secret 値は argv でなく env でクラウド CLI へ）。
+      { name: "--access-key-id", type: "string", subcommand: "push-s3", envVar: "AWS_ACCESS_KEY_ID",
+        label: "AWS アクセスキーID（任意・無人用）",
+        description: "IAM アクセスキーID。値は環境変数 AWS_ACCESS_KEY_ID で aws に渡す（対話 aws sso login 不要で無人化）" },
+      { name: "--secret-access-key", type: "string", subcommand: "push-s3", secret: true, envVar: "AWS_SECRET_ACCESS_KEY",
+        label: "AWS シークレットアクセスキー（任意・無人用）",
+        description: "IAM シークレットアクセスキー。値は argv に出さず環境変数 AWS_SECRET_ACCESS_KEY で aws に渡す" },
+      { name: "--profile", type: "string", subcommand: "push-s3", envVar: "AWS_PROFILE",
+        label: "AWS プロファイル（任意）",
+        description: "named profile（~/.aws 構成）。値は環境変数 AWS_PROFILE で aws に渡す" },
+      { name: "--region", type: "string", subcommand: "push-s3", envVar: "AWS_REGION",
+        label: "AWS リージョン（任意）",
+        description: "リージョン。値は環境変数 AWS_REGION で aws に渡す" },
+      // push-gcs 無人認証
+      { name: "--gcp-credentials", type: "string", subcommand: "push-gcs", envVar: "GOOGLE_APPLICATION_CREDENTIALS",
+        label: "GCP サービスアカウント鍵のパス（任意・無人用）",
+        description: "サービスアカウント鍵 JSON のファイルパス（鍵そのものではない）。env GOOGLE_APPLICATION_CREDENTIALS で受け、プラグインが gcloud CLI 用に CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE へも複写して無人化（対話 gcloud auth login 不要）" },
+      // push-azure 無人認証
+      { name: "--sas", type: "string", subcommand: "push-azure", secret: true, envVar: "AZURE_STORAGE_SAS_TOKEN",
+        label: "SAS トークン（任意）",
+        description: "Shared Access Signature。値は argv ではなく環境変数で az に渡す（未指定時は接続文字列か az login）" },
+      { name: "--connection-string", type: "string", subcommand: "push-azure", secret: true, envVar: "AZURE_STORAGE_CONNECTION_STRING",
+        label: "接続文字列（任意）",
+        description: "ストレージアカウント接続文字列。値は argv ではなく環境変数で az に渡す" },
+      // 全サブコマンド共通
+      { name: "--only", type: "string", repeatable: true,
+        label: "配置対象ファイル名（反復可）",
+        description: "documents/ 内のファイル名に完全一致で絞って部分配置する（**反復可**・台帳駆動の部分再送用）。bundle に無い名前を指定するとエラー（exit 2・黙殺失敗防止）" },
+      { name: "--dry-run", type: "boolean", label: "Dry run",
+        description: "Validate without writing（配置先プレビューと artifacts 一覧を receipt で返すだけ）" },
+    ],
+    // ── ADC-1（gemba-adc/1.0）着地スキーマ宣言。placement 形（実体のみ・実名 flat・目録なし）──
+    // contract は 1.0 のまま（placement は宣言語彙のみの fail-open 追加で、読み手の新動作を
+    // 要求しない）。query 経路が無いので endpointFp 絞りも宣言しない。
+    dataset: PLACE_SUBS.map((sub) => ({
+      datasetApi: ["1"], contract: "gemba-adc/1.0",
+      store: `${sub === "push-local" ? "dir" : sub.slice("push-".length)}-place`,
+      subcommand: sub, layout: "placement/1",
+      locator: { to: { param: "--to" } },
+      contents: "cumulative",
+      // overwrite-on-rerun: 同名は in-place 置換（再実行で上書き・冪等）。
+      // detail-optional: 実体は bundle 由来（--with-detail の有無は bundle 側に依存）。
+      quirks: ["overwrite-on-rerun", "detail-optional"],
+    })),
+  }));
+  process.exit(0);
+}
+
+// ── Contract version check: unsupported → stderr + exit 11 ──
+const announcedApi = process.env.IREPO_PLUGIN_API;
+if (arg0 !== "--plugin-healthcheck" && announcedApi && announcedApi !== PLUGIN_API) {
+  console.error(`${PLUGIN}: unsupported IREPO_PLUGIN_API=${announcedApi} (supported: ${PLUGIN_API})`);
+  process.exit(11);
+}
+
+// Promise.resolve() でモジュール評価の完了後に起動する（main は async でも本文の先頭は
+// 同期実行されるため、直接呼ぶと後方で const 宣言している backend が TDZ になる）。
+if (arg0 === "--plugin-healthcheck") {
+  Promise.resolve().then(healthcheck).then((ok) => process.exit(ok ? 0 : 1));
+} else {
+  Promise.resolve().then(main).catch((error) => {
+    console.error(`${PLUGIN}: ${error instanceof Error ? error.message : String(error)}`);
+    // 使い方/検証エラー（unsafe --prefix・--only 不在名・非ファイル混在 等）は exit 2 で
+    // fail-loud にする（usageError 参照）。それ以外の実行時失敗は 1。
+    process.exitCode = (error && error.exitCode) || 1;
+  });
+}
+
+// 使い方・入力検証の失敗（呼び出し側が引数を直せば解決するもの）は exit 2 に分類する。
+function usageError(message) {
+  return Object.assign(new Error(message), { exitCode: 2 });
+}
+
+async function healthcheck() {
+  // クラウド転送 CLI は各 push サブコマンド専用 — severity でスコープを示す。
+  // 必須依存はゼロ（push-local は Node fs のみ）なので全体 ok は常に true。
+  // i-repo CLI のチェックは入れない（この plugin は i-repo を呼び戻さない）。
+  const checks = [];
+  checks.push({
+    name: "aws-cli", ok: await commandExists("aws", ["--version"]), severity: "required-for:push-s3",
+    hint: "Install AWS CLI v2 to use push-s3",
+  });
+  checks.push({
+    name: "gcloud-cli", ok: await commandExists("gcloud", ["--version"]), severity: "required-for:push-gcs",
+    hint: "Install Google Cloud SDK (gcloud) to use push-gcs",
+  });
+  checks.push({
+    name: "az-cli", ok: await commandExists("az", ["--version"]), severity: "required-for:push-azure",
+    hint: "Install Azure CLI (az) to use push-azure",
+  });
+  checks.push({
+    name: "local-fs", ok: true, severity: "required-for:push-local",
+    hint: "No external CLI needed (uses Node fs)",
+  });
+  console.log(JSON.stringify({ ok: true, checks }));
+  return true;
+}
+
+// ── Entry ──────────────────────────────────────────────────────────────────
+
+async function main() {
+  const [command, ...rest] = process.argv.slice(2);
+  if (command === "push-s3") return pushPlacement(parsePushArgs(rest, S3_BACKEND), S3_BACKEND);
+  if (command === "push-gcs") return pushPlacement(parsePushArgs(rest, GCS_BACKEND), GCS_BACKEND);
+  if (command === "push-azure") return pushPlacement(parsePushArgs(rest, AZURE_BACKEND), AZURE_BACKEND);
+  if (command === "push-local") return pushPlacement(parsePushArgs(rest, LOCAL_BACKEND), LOCAL_BACKEND);
+  usage();
+  process.exitCode = command === undefined || command === "--help" || command === "-h" ? 0 : 2;
+}
+
+function usage() {
+  console.error(`Usage:
+  ${PLUGIN} push-s3    <archive-dir> --to s3://bucket/prefix [options]
+      [--access-key-id <id> --secret-access-key <key> | --profile <name>] [--region <r>]
+  ${PLUGIN} push-gcs   <archive-dir> --to gs://bucket/prefix [options]
+      [--gcp-credentials <service-account-key.json path>]
+  ${PLUGIN} push-azure <archive-dir> --to https://<account>.blob.core.windows.net/<container>/<prefix> [options]
+      [--sas <token> | --connection-string <cs>]
+  ${PLUGIN} push-local <archive-dir> --to <folder|network-share path> [options]
+  Options:
+      --prefix <template>  <--to>/ 配下の配置先サブパス（{batchId}/{date}/{datetime}/{flow}）。
+                           未指定なら <--to> 直下。無害化で空/危険になる指定は exit 2
+      --only <fileName>    documents/ 内のファイル名で部分配置（反復可）。不在名は exit 2
+      --cleanup            verified:true かつ失敗0件のときだけローカル bundle を削除
+      --dry-run            配置せず write receipt（dryRun:true・artifacts 一覧付き）だけ返す
+  Places ONLY the files inside <archive-dir>/documents/ flat（実名のまま）into the
+  destination — no manifests/, no receipts/, no batch folder. Same-name files are
+  replaced IN PLACE (versioned stores keep the old version as history).
+  Unattended creds are read from the flags above OR env and passed to the cloud CLI
+  via env, never argv.`);
+}
+
+// ── Tiny argv parser（archive と同形・ゼロ依存）────────────────────────────
+// spec: { "--name": "value" | "flag" | "list" }
+
+function parseArgv(argv, spec, label) {
+  const out = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    let token = argv[i];
+    if (!token.startsWith("-")) {
+      out._.push(token);
+      continue;
+    }
+    let inlineValue;
+    const eq = token.indexOf("=");
+    if (eq > -1) {
+      inlineValue = token.slice(eq + 1);
+      token = token.slice(0, eq);
+    }
+    const kind = spec[token];
+    if (!kind) throw usageError(`Unknown option for ${label}: ${token}\nRun "${PLUGIN} --help".`);
+    const key = token.replace(/^--/, "");
+    if (kind === "flag") {
+      if (inlineValue !== undefined) throw usageError(`Option ${token} does not take a value.`);
+      out[key] = true;
+      continue;
+    }
+    const value = inlineValue !== undefined ? inlineValue : argv[++i];
+    if (value === undefined) throw usageError(`Option ${token} requires a value.`);
+    if (kind === "list") (out[key] = out[key] ?? []).push(value);
+    else out[key] = value;
+  }
+  return out;
+}
+
+// file:// URL を OS パスへ正規化（archive normalizeLocalDest と同基準）。
+function normalizeLocalDest(to) {
+  const t = String(to).trim();
+  if (!t.startsWith("file://")) return t;
+  const rest = t.slice("file://".length);
+  const i = rest.indexOf("/");
+  if (i === -1) return "//" + rest;            // ホストのみ → UNC host
+  const host = rest.slice(0, i);
+  const path = rest.slice(i);                   // 先頭 '/'
+  const isDrive = (s) => /^[A-Za-z]:/.test(s);
+  if (host === "" || host.toLowerCase() === "localhost") {
+    const inner = path.slice(1);
+    return isDrive(inner) ? inner : path;       // C:/... か /abs
+  }
+  return "//" + host + path;                     // UNC //server/share/...
+}
+
+function parsePushArgs(argv, backend) {
+  const label = `push-${backend.store}`;
+  const spec = { "--to": "value", "--prefix": "value", "--only": "list", "--dry-run": "flag", "--cleanup": "flag" };
+  // 無人認証フラグ（archive #92 と同作法）。secret 値は argv に出さず env でクラウド CLI に渡す。
+  if (backend.store === "azure") { spec["--sas"] = "value"; spec["--connection-string"] = "value"; }
+  if (backend.store === "s3") {
+    spec["--access-key-id"] = "value"; spec["--secret-access-key"] = "value";
+    spec["--profile"] = "value"; spec["--region"] = "value";
+  }
+  if (backend.store === "gcs") { spec["--gcp-credentials"] = "value"; }
+  const o = parseArgv(argv, spec, label);
+  if (o._.length !== 1) throw usageError(`${label} requires exactly one <archive-dir> argument.`);
+  if (backend.store === "local") {
+    const to = normalizeLocalDest(o.to ?? "");
+    if (!to) throw usageError(`${label} requires --to <folder|network-share path>.`);
+    o.to = to;
+  } else {
+    if (!o.to) throw usageError(`${label} requires --to ${backend.scheme}…`);
+    if (!o.to.startsWith(backend.scheme)) throw usageError(`destination must start with "${backend.scheme}".`);
+  }
+  // Azure は blob エンドポイント URL の構造まで parse 時に検証（SAS 付き URL 拒否を含む）。
+  if (backend.store === "azure") parseAzureTo(o.to);
+  const out = {
+    archiveDir: o._[0], to: o.to, prefix: o.prefix,
+    only: [...new Set(o.only ?? [])],
+    dryRun: Boolean(o["dry-run"]), cleanup: Boolean(o.cleanup),
+  };
+  if (backend.store === "azure") {
+    out.azure = true;
+    out.sas = o.sas || process.env.AZURE_STORAGE_SAS_TOKEN || "";
+    out.connectionString = o["connection-string"] || process.env.AZURE_STORAGE_CONNECTION_STRING || "";
+  }
+  if (backend.store === "s3") Object.assign(out, s3CredsFromArgs(o, label));
+  if (backend.store === "gcs") out.gcpCredentials = o["gcp-credentials"] || "";
+  return out;
+}
+
+// ── 認証（archive s3CredsFromArgs / buildPushEnv / parseAzureTo の流用）──────
+
+/** s3 無人認証フラグの検証（IAM キーは対でのみ・--profile と排他）。 */
+function s3CredsFromArgs(o, label) {
+  const accessKeyId = o["access-key-id"] || "";
+  const secretAccessKey = o["secret-access-key"] || "";
+  const profile = o.profile || "";
+  const region = o.region || "";
+  if (Boolean(accessKeyId) !== Boolean(secretAccessKey)) {
+    throw usageError(`${label}: --access-key-id and --secret-access-key must be provided together.`);
+  }
+  if ((accessKeyId || secretAccessKey) && profile) {
+    throw usageError(`${label}: use either IAM keys (--access-key-id/--secret-access-key) or --profile, not both.`);
+  }
+  return { accessKeyId, secretAccessKey, profile, region };
+}
+
+// secret（SAS / 接続文字列 / IAM キー）は argv に載せず、各クラウド CLI が読む環境変数で渡す。
+function buildPushEnv(options) {
+  const env = { ...process.env };
+  if (options.connectionString) env.AZURE_STORAGE_CONNECTION_STRING = options.connectionString;
+  else if (options.sas) env.AZURE_STORAGE_SAS_TOKEN = options.sas;
+  // Azure で明示 secret が無ければ az login 認証を使う（既定の account-key モードは
+  // RBAC-only / listKeys 無効アカウントで失敗するため）。s3/gcs は options.azure 未設定なので素通り。
+  else if (options.azure) env.AZURE_STORAGE_AUTH_MODE = "login";
+  if (options.accessKeyId) env.AWS_ACCESS_KEY_ID = options.accessKeyId;
+  if (options.secretAccessKey) env.AWS_SECRET_ACCESS_KEY = options.secretAccessKey;
+  if (options.profile) env.AWS_PROFILE = options.profile;
+  // AWS_REGION（CLI v2）と AWS_DEFAULT_REGION（v1/botocore 系）の双方を立てる。
+  if (options.region) { env.AWS_REGION = options.region; env.AWS_DEFAULT_REGION = options.region; }
+  // gcs 無人認証: GOOGLE_APPLICATION_CREDENTIALS は ADC 用で gcloud CLI 自体は読まない —
+  // gcloud が読む CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE へも複写する。
+  if (options.gcpCredentials) env.GOOGLE_APPLICATION_CREDENTIALS = options.gcpCredentials;
+  if (env.GOOGLE_APPLICATION_CREDENTIALS && !env.CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE) {
+    env.CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE = env.GOOGLE_APPLICATION_CREDENTIALS;
+  }
+  return env;
+}
+
+// https://<account>.blob.core.windows.net/<container>/<prefix...> を分解（archive と同基準）。
+function parseAzureTo(to) {
+  // SAS 付き URL を --to に貼られると secret が receipt・表示コマンドへ漏洩する。
+  // query/fragment を含む URL は拒否し、SAS は env-only の --sas で渡させる。
+  if (/[?#]/.test(to)) {
+    throw usageError('Azure --to must not contain a query string or SAS token (pass the SAS via --sas; --to is not secret).');
+  }
+  const m = /^https:\/\/([a-z0-9]+)\.blob\.core\.windows\.net\/([^/]+)(?:\/(.*))?$/i.exec(to);
+  if (!m) throw usageError('Azure destination must be https://<account>.blob.core.windows.net/<container>/<prefix>.');
+  return { account: m[1], container: m[2], prefix: (m[3] || "").replace(/\/+$/, "") };
+}
+
+// ── backends ────────────────────────────────────────────────────────────────
+//
+// upload は全量=ディレクトリ一括（O(1) 呼び出し・ファイル名を argv に載せない）、--only 時のみ
+// per-file。verify は宛先 1 回 list（local は per-file stat）で「存在＋バイト数」を照合する。
+// sha256 の読み戻し照合はしない（GET を増やさない — sha256 は receipt に載せる台帳突合用の証跡）。
+// 置換は全 backend で in-place（ヘッダの契約参照）。
+//
+// 各 backend の実装面:
+//   placed(expandedTo, destSub) … 実配置ベース（receipt の placedPrefix になる値）
+//   uploadAll(docsDir, placed, env) … documents/ の中身を placed 直下へ一括転送
+//   uploadOne(filePath, fileName, placed, env) … 1 ファイルを placed/<fileName> へ
+//   statPlaced(placed, fileNames, env) … 配置済みファイルの Map<fileName, bytes>
+
+// スキーム非依存のスラッシュ結合（s3:// / gs:// / https:// すべてに使える）。
+function joinUri(prefix, child) {
+  return `${prefix.replace(/\/+$/, "")}/${child.replace(/^\/+/, "")}`;
+}
+
+const S3_BACKEND = {
+  store: "s3", scheme: "s3://",
+  placed(expandedTo, destSub) { return destSub ? joinUri(expandedTo, destSub) : expandedTo; },
+  async uploadAll(docsDir, placed, env) {
+    // cp --recursive は <docsDir> の中身を placed 直下へ置き、同一キーは常に上書き（in-place）。
+    // sync は同サイズ skip があるため使わない（置換の確実性を優先）。
+    await runCommand("aws", ["s3", "cp", docsDir, placed, "--recursive"], { env, captureStdout: false });
+  },
+  async uploadOne(filePath, fileName, placed, env) {
+    await runCommand("aws", ["s3", "cp", filePath, joinUri(placed, fileName)], { env, captureStdout: false });
+  },
+  async statPlaced(placed, _fileNames, env) {
+    const m = /^s3:\/\/([^/]+)(?:\/(.+))?$/.exec(placed.replace(/\/+$/, ""));
+    if (!m) throw new Error(`unexpected S3 destination: ${placed}`);
+    const bucket = m[1];
+    const keyPrefix = m[2] ? `${m[2]}/` : "";
+    const args = ["s3api", "list-objects-v2", "--bucket", bucket, "--output", "json"];
+    if (keyPrefix) args.push("--prefix", keyPrefix);
+    // AWS CLI は既定で自動ページングし Contents を結合して返す（1000 件超も 1 呼び出しで OK）。
+    const r = await runCommand("aws", args, { env, captureStdout: true });
+    const contents = r.stdout.trim() ? (JSON.parse(r.stdout).Contents ?? []) : [];
+    const sizes = new Map();
+    for (const obj of contents) {
+      const rest = String(obj.Key).slice(keyPrefix.length);
+      if (!rest || rest.includes("/")) continue; // 直下のみ（flat 配置の検証単位）
+      sizes.set(rest, Number(obj.Size));
+    }
+    return sizes;
+  },
+};
+
+const GCS_BACKEND = {
+  store: "gcs", scheme: "gs://",
+  placed(expandedTo, destSub) { return destSub ? joinUri(expandedTo, destSub) : expandedTo; },
+  async uploadAll(docsDir, placed, env) {
+    // cp --recursive はディレクトリの扱いが非決定的（宛先既存で basename 入れ子）なので、
+    // 内容を決定的に同期する rsync を使う（archive push-gcs の実機知見）。--delete は付けない
+    // ＝送り先の既存オブジェクトを消さない（追加/上書きのみ・in-place）。
+    await runCommand("gcloud", ["storage", "rsync", "--recursive", docsDir, placed], { env, captureStdout: false });
+  },
+  async uploadOne(filePath, fileName, placed, env) {
+    // 宛先をオブジェクト名まで明示した cp（単一ファイルは入れ子問題なし・同名は上書き）。
+    await runCommand("gcloud", ["storage", "cp", filePath, joinUri(placed, fileName)], { env, captureStdout: false });
+  },
+  async statPlaced(placed, _fileNames, env) {
+    // 直下ワイルドカードで 1 回 list（--json は url + metadata(size) を返す）。
+    // マッチ 0 件だと gcloud は非 0 exit → 呼び出し側 catch で「全滅」扱い（verified:false）。
+    const r = await runCommand("gcloud", ["storage", "ls", "--json", joinUri(placed, "*")], { env, captureStdout: true });
+    const entries = r.stdout.trim() ? JSON.parse(r.stdout) : [];
+    const sizes = new Map();
+    for (const e of Array.isArray(entries) ? entries : []) {
+      const meta = e && e.metadata;
+      if (!meta || typeof meta.size === "undefined") continue; // フォルダ等はスキップ
+      const key = String(meta.name ?? String(e.url).split("/").pop());
+      const base = key.split("/").pop();
+      if (base) sizes.set(base, Number(meta.size));
+    }
+    return sizes;
+  },
+};
+
+const AZURE_BACKEND = {
+  store: "azure", scheme: "https://",
+  placed(expandedTo, destSub) { return destSub ? joinUri(expandedTo, destSub) : expandedTo; },
+  async uploadAll(docsDir, placed, env) {
+    const { account, container, prefix } = parseAzureTo(placed);
+    // upload-batch --overwrite は同名 blob を直接置き換える（in-place・versioning 有効なら新版化）。
+    const args = ["storage", "blob", "upload-batch", "--account-name", account,
+      "--destination", container, "--source", docsDir, "--overwrite"];
+    if (prefix) args.push("--destination-path", prefix);
+    await runCommand("az", args, { env, captureStdout: false });
+  },
+  async uploadOne(filePath, fileName, placed, env) {
+    const { account, container, prefix } = parseAzureTo(placed);
+    const name = prefix ? `${prefix}/${fileName}` : fileName;
+    await runCommand("az", ["storage", "blob", "upload", "--account-name", account,
+      "--container-name", container, "--name", name, "--file", filePath, "--overwrite"],
+      { env, captureStdout: false });
+  },
+  async statPlaced(placed, _fileNames, env) {
+    const { account, container, prefix } = parseAzureTo(placed);
+    const args = ["storage", "blob", "list", "--account-name", account,
+      "--container-name", container, "-o", "json"];
+    if (prefix) args.push("--prefix", `${prefix}/`);
+    const r = await runCommand("az", args, { env, captureStdout: true });
+    const entries = r.stdout.trim() ? JSON.parse(r.stdout) : [];
+    const keyPrefix = prefix ? `${prefix}/` : "";
+    const sizes = new Map();
+    for (const b of Array.isArray(entries) ? entries : []) {
+      const rest = String(b.name).slice(keyPrefix.length);
+      if (!rest || rest.includes("/")) continue; // 直下のみ
+      sizes.set(rest, Number(b.properties?.contentLength));
+    }
+    return sizes;
+  },
+};
+
+// push-local: 外部 CLI 不要・Node fs。copyFile は宛先を O_TRUNC で直接書き換える＝
+// 同一パスへの in-place 置換（同期クライアント/版機構がファイル同一性を保てる経路）。
+// Windows の cmd.exe メタ文字問題も無関係（子プロセスを起動しない）。
+const LOCAL_BACKEND = {
+  store: "local", scheme: "",
+  placed(to, destSub) {
+    const destination = destSub ? join(to, destSub) : to;
+    // 越境ガード（多層防御）: destSub は resolvePlacePrefix で相対パス保証済みだが、
+    // 結合後も --to 配下に収まることを path.relative で確認する。
+    // `root + sep` 方式は --to がルート（C:\ や \\server\share）のとき resolve が末尾
+    // セパレータ付き（C:\）を返し、正当な子パスまで「escapes」と誤判定するため使わない。
+    // relative が "" か、".." 始まりでなく絶対でもなければ root 配下（Windows の
+    // 大文字小文字差は relative が吸収する）。
+    const root = resolve(to);
+    const target = resolve(destination);
+    const rel = relative(root, target);
+    const contained = rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+    if (!contained) {
+      throw new Error(`push-local: resolved destination escapes --to (${destination}).`);
+    }
+    return destination;
+  },
+  // 一括転送は無し（常に per-file copyFile）。呼び出し側が perFileAlways を見て分岐する。
+  perFileAlways: true,
+  async prepare(placed) {
+    await fsp.mkdir(placed, { recursive: true });
+  },
+  async uploadOne(filePath, fileName, placed, _env) {
+    await fsp.copyFile(filePath, join(placed, fileName));
+  },
+  async statPlaced(placed, fileNames, _env) {
+    const sizes = new Map();
+    for (const name of fileNames) {
+      const st = await fsp.stat(join(placed, name)).catch(() => null);
+      if (st && st.isFile()) sizes.set(name, st.size);
+    }
+    return sizes;
+  },
+};
+
+// ── push（placement 本体）───────────────────────────────────────────────────
+//
+// フロー: bundle 検証 → artifacts 索引 → documents/ 列挙（--only 絞り）→ 宛先解決 →
+//         sha256 前計算 → (--dry-run はここまで) → upload → write receipt → verify →
+//         (--cleanup) → verify receipt。verified:true になれなければ exit 1。
+
+async function pushPlacement(options, backend) {
+  const archivePath = resolve(expandHome(options.archiveDir));
+  await validateArchiveDirectory(archivePath);
+
+  const jobId = `push-${timestampTag()}-${process.pid}`;
+  // receipts/archive.json の artifacts[] から fileName → {itemId, revNo, type} を逆引き
+  //（create が objectKey:"documents/<name>" で記録している）。欠落は null 埋め。
+  const metaByName = await readArtifactIndex(archivePath);
+  const docsDir = join(archivePath, "documents");
+  let files = await listDocumentFiles(docsDir);
+
+  if (options.only.length > 0) {
+    const have = new Set(files.map((f) => f.fileName));
+    const missing = options.only.filter((n) => !have.has(n));
+    if (missing.length > 0) {
+      throw usageError(`--only file(s) not found in documents/: ${missing.join(", ")}`);
+    }
+    const wanted = new Set(options.only);
+    files = files.filter((f) => wanted.has(f.fileName));
+  }
+
+  // --to のテンプレ展開（{flow} のみ・run-varying トークンは拒否）。
+  const expandedTo = expandToTemplate(options.to);
+  // --prefix: 安全な相対パスへ無害化。archive と違い、無害化で空/危険になったら
+  // batchDir フォールバックせず exit 2 で fail-loud（placement で UUID フォルダを
+  // 黙って作るのは「裏方ゼロ」要件違反）。未指定なら <--to> 直下。
+  const destSub = options.prefix
+    ? resolvePlacePrefix(options.prefix, { batchDir: basename(archivePath) })
+    : "";
+  // バッチ非依存の安定 store location（catalog 掲載用・--prefix は含めない）。
+  const dest = canonicalPlaceDest(backend.store, expandedTo);
+  const storeKind = `${backend.store === "local" ? "dir" : backend.store}-place`;
+  const env = buildPushEnv(options);
+  // 実配置ベース URI。キー名は placedPrefix 固定（s3Prefix 等の LANDED_PREFIX_KEYS は
+  // deliver enrich が documents/ ネスト前提の URI を組むため絶対に名乗らない — ヘッダ参照）。
+  const placedPrefix = backend.placed(expandedTo, destSub);
+
+  // ── 全ファイルの sha256 + bytes を upload 前に計算（receipt の artifacts[] 証跡）──
+  const artifacts = [];
+  const bytesByName = new Map();
+  for (const f of files) {
+    const st = await fsp.stat(f.path);
+    const sha256 = await sha256File(f.path);
+    const meta = metaByName.get(f.fileName) ?? {};
+    bytesByName.set(f.fileName, st.size);
+    artifacts.push({
+      fileName: f.fileName,
+      objectKey: f.fileName, // flat 配置＝実名がそのままオブジェクトキー
+      sha256, bytes: st.size,
+      itemId: meta.itemId ?? null, revNo: meta.revNo ?? null, type: meta.type ?? null,
+    });
+  }
+  const count = files.length; // count はファイル数（placement の検証単位）
+
+  if (options.dryRun) {
+    emitReceipt("write", jobId, count, 0, false,
+      { archivePath, dest, storeKind, placedPrefix, artifacts, dryRun: true });
+    return;
+  }
+
+  // ── upload ──
+  // 全量はディレクトリ一括（ファイル名を argv に載せない＝Windows メタ文字の影響なし）。
+  // --only 時と push-local は per-file — ファイル名に cmd.exe メタ文字（& ! % 等）が含まれ
+  // spawn.js が拒否した場合は、そのファイルだけ failedCount 計上で続行する（全体 throw しない）。
+  const failedUpload = new Set();
+  if (count > 0) {
+    if (backend.prepare) await backend.prepare(placedPrefix);
+    if (backend.perFileAlways || options.only.length > 0) {
+      for (const f of files) {
+        try {
+          await backend.uploadOne(f.path, f.fileName, placedPrefix, env);
+        } catch (error) {
+          failedUpload.add(f.fileName);
+          console.error(`upload failed for ${f.fileName}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    } else {
+      // 一括転送の失敗は全体の失敗（throw → exit 1・write receipt 無し）。
+      await backend.uploadAll(docsDir, placedPrefix, env);
+    }
+  }
+  emitReceipt("write", jobId, count, failedUpload.size, false,
+    { archivePath, dest, storeKind, placedPrefix, artifacts });
+
+  // ── verify: 宛先 1 回 list（local は per-file stat）で存在＋バイト数を照合 ──
+  const failedVerify = new Set(failedUpload);
+  const survivors = files.filter((f) => !failedUpload.has(f.fileName));
+  if (survivors.length > 0) {
+    let sizes = null;
+    try {
+      sizes = await backend.statPlaced(placedPrefix, survivors.map((f) => f.fileName), env);
+    } catch (error) {
+      console.error(`verify listing failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    for (const f of survivors) {
+      const expected = bytesByName.get(f.fileName);
+      const got = sizes ? sizes.get(f.fileName) : undefined;
+      if (got === undefined || Number.isNaN(got) || got !== expected) {
+        failedVerify.add(f.fileName);
+        console.error(`verify failed: ${f.fileName} (expected ${expected} bytes, got ${got ?? "missing"})`);
+      }
+    }
+  }
+  const verified = failedVerify.size === 0;
+
+  // ── --cleanup: verified:true かつ失敗 0 件のときだけローカル bundle を削除 ──
+  // (発火条件は exit 0 ではなく verified receipt — SCHEMA.md §6)。削除失敗は配送の
+  // 失敗ではないので exit 0 のまま、cleanedUp:false と stderr で必ず報告する。
+  const extras = { archivePath, dest, storeKind, placedPrefix };
+  if (options.cleanup) {
+    if (verified && failedVerify.size === 0) {
+      try {
+        await fsp.rm(archivePath, { recursive: true, force: true });
+        extras.cleanedUp = true;
+        console.error(`cleaned up local archive: ${archivePath}`);
+      } catch (error) {
+        extras.cleanedUp = false;
+        console.error(
+          `cleanup failed (local archive kept): ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    } else {
+      extras.cleanedUp = false; // verify 失敗時は絶対に消さない
+    }
+  }
+  emitReceipt("verify", jobId, count, failedVerify.size, verified, extras);
+  if (!verified) process.exitCode = 1;
+}
+
+// ── bundle 検証・列挙 ───────────────────────────────────────────────────────
+
+// archive validateArchiveDirectory の流用（receipts/archive.json 必須の厳格側）。
+// 未完成 bundle で「0件配置 verified:true」の嘘 receipt を作らないため。
+async function validateArchiveDirectory(path) {
+  const details = await fsp.stat(path).catch(() => null);
+  if (!details || !details.isDirectory()) throw new Error(`Archive directory does not exist: ${path}`);
+  await fsp.access(join(path, "manifests", "reports.ndjson"));
+  await fsp.access(join(path, "receipts", "archive.json")).catch(() => {
+    throw new Error(
+      `Archive is incomplete (missing receipts/archive.json): ${path}\n` +
+      "The create step may have failed before finishing; re-run create.",
+    );
+  });
+}
+
+/** receipts/archive.json の artifacts[]（objectKey:"documents/<name>"）から実名→来歴の索引を作る。 */
+async function readArtifactIndex(archivePath) {
+  const receipt = await readJsonObject(join(archivePath, "receipts", "archive.json"));
+  const index = new Map();
+  for (const a of Array.isArray(receipt.artifacts) ? receipt.artifacts : []) {
+    if (!a || typeof a.objectKey !== "string") continue;
+    const name = a.objectKey.replace(/^documents\//, "");
+    if (!name || index.has(name)) continue;
+    index.set(name, {
+      itemId: a.itemId ?? null,
+      revNo: a.revNo ?? null,
+      type: a.type ?? null,
+    });
+  }
+  return index;
+}
+
+/**
+ * documents/ の通常ファイルのみを列挙する。非ファイル（サブディレクトリ・シンボリックリンク等）
+ * の混在は exit 2 — flat 配置の対象外の実体を黙って除外/同行させない。documents/ が
+ * 存在しない bundle（--with-artifacts none/text）は 0 件として正常扱い。
+ */
+async function listDocumentFiles(docsDir) {
+  let entries;
+  try {
+    entries = await fsp.readdir(docsDir, { withFileTypes: true });
+  } catch (error) {
+    if (error && error.code === "ENOENT") return []; // documents/ 無し＝配置対象 0 件
+    throw error;
+  }
+  const files = [];
+  for (const entry of entries) {
+    if (!entry.isFile()) {
+      throw usageError(
+        `documents/ contains a non-file entry: ${entry.name}\n` +
+        "Placement copies plain files flat — remove subdirectories/symlinks from the bundle first.",
+      );
+    }
+    files.push({ fileName: entry.name, path: join(docsDir, entry.name) });
+  }
+  files.sort((a, b) => (a.fileName < b.fileName ? -1 : a.fileName > b.fileName ? 1 : 0));
+  return files;
+}
+
+// ── receipts（SCHEMA.md §6・sink なので provenance 非搭載）─────────────────
+
+function emitReceipt(phase, jobId, count, failedCount, verified, extras) {
+  process.stdout.write(JSON.stringify({
+    schemaVersion: "1.0", recordType: "receipt", plugin: PLUGIN,
+    producedBy: { plugin: PLUGIN, version: VERSION },
+    phase, jobId, count, failedCount, verified,
+    ...extras,
+  }) + "\n");
+}
+
+// ── 子プロセス（spec 構築は lib/spawn.js・spawn 部は archive runCommand の移植）──
+
+// ENOENT のとき CLI 導入への導線を出す（healthcheck の hint と同内容）。
+const INSTALL_HINTS = {
+  aws: "Install the AWS CLI v2 to use push-s3.",
+  gcloud: "Install the Google Cloud SDK (gcloud) to use push-gcs.",
+  az: "Install the Azure CLI (az) to use push-azure.",
+};
+
+function runCommand(command, args, options) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    let spec;
+    try {
+      // Windows では cmd.exe argv を明示構築し、メタ文字を含む引数は throw する（spawn.js 契約）。
+      // per-file 経路の呼び出し側はこの reject を「そのファイルだけの失敗」として扱う。
+      spec = spawnSpec(command, args);
+    } catch (error) {
+      rejectPromise(error);
+      return;
+    }
+    const child = spawn(spec.bin, spec.argv, {
+      env: options.env,
+      ...spec.extra,
+      // 非 capture 時は子の stdout を我々の stderr(fd 2) へ逃がす — 転送進捗などの
+      // おしゃべりが stdout の機械可読 receipt を汚さないように。
+      stdio: ["inherit", options.captureStdout ? "pipe" : 2, "inherit"],
+    });
+    let stdout = "";
+    if (options.captureStdout && child.stdout) {
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+    }
+    child.on("error", (error) => {
+      if (error.code === "ENOENT") {
+        rejectPromise(new Error(
+          `Required command not found: ${command}\n` +
+          (INSTALL_HINTS[command] ?? `Make sure "${command}" is on PATH.`),
+        ));
+        return;
+      }
+      rejectPromise(error);
+    });
+    // "close"（"exit" でなく）: stdout パイプのドレイン完了後に発火するので、
+    // capture した大きな出力（list 結果）が途中で切れない。
+    child.on("close", (code, signal) => {
+      if (signal) return rejectPromise(new Error(`${command} exited from signal ${signal}.`));
+      if ((code ?? 0) !== 0) {
+        return rejectPromise(new Error(`${command} ${args.join(" ")} failed with exit code ${code}.`));
+      }
+      resolvePromise({ stdout });
+    });
+  });
+}
+
+function commandExists(command, args) {
+  return runCommand(command, args, { env: process.env, captureStdout: true })
+    .then(() => true)
+    .catch(() => false);
+}
+
+// ── small helpers ───────────────────────────────────────────────────────────
+
+/** sha256 をストリームで逐次計算する（大きな PDF/写真でもメモリ一定）。 */
+function sha256File(path) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const hash = createHash("sha256");
+    const stream = fs.createReadStream(path);
+    stream.on("error", rejectPromise);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("end", () => resolvePromise(hash.digest("hex")));
+  });
+}
+
+async function readJsonObject(path) {
+  try {
+    const parsed = JSON.parse(await fsp.readFile(path, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return parsed;
+  } catch {
+    return {};
+  }
+}
+
+function expandHome(value) {
+  if (value === "~") return homedir();
+  if (value.startsWith(`~${sep}`) || value.startsWith("~/")) return join(homedir(), value.slice(2));
+  return value;
+}
+
+function timestampTag(date = new Date()) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}T` +
+    `${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+// {date} = YYYY-MM-DD（{datetime} は timestampTag が担う）。
+function dateTag(date = new Date()) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+/** ファイル名の無害化（日本語は保持・パス区切り/Windows 禁止文字のみ潰す。archive と同一）。 */
+function sanitizeUnicodeFileName(value) {
+  return value.replace(/[/\\<>:"|?*\u0000-\u001f\u007f]/g, "_").replace(/[. ]+$/, "");
+}
+
+const PREFIX_MAX_LEN = 200; // 宛先キー総長の上限（S3/GCS/Azure のキー長・Windows パス長の安全側）。
+// push-local で危険な Windows 予約デバイス名（拡張子付きも同様に予約）。セグメント単位で弾く。
+const WIN_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i;
+
+/**
+ * --prefix テンプレートを解決し、宛先キーとして安全な「相対パス」へ無害化する
+ * （archive resolvePrefixTemplate の改変版）。security-sensitive な経路であることは同じだが、
+ * placement では無害化の結果が空/危険なとき batchDir へフォールバック**しない** —
+ * UUID フォルダを黙って作るのは「実名 flat・裏方ゼロ」要件違反なので exit 2 で fail-loud。
+ * {flow} は host が env(IREPO_FLOW_NAME) で渡す。
+ */
+function resolvePlacePrefix(template, { batchDir }) {
+  const flow = (process.env.IREPO_FLOW_NAME || "").replace(/[\x00-\x1f\x7f]/g, "");
+  const now = new Date();
+  // 制御文字を先に除去（置換前の生入力に \0 等が混ざる事故を断つ）。
+  const substituted = String(template)
+    .replace(/[\x00-\x1f\x7f]/g, "")
+    .replace(/\{batchId\}/g, batchDir)
+    .replace(/\{datetime\}/g, timestampTag(now))
+    .replace(/\{date\}/g, dateTag(now))
+    .replace(/\{flow\}/g, flow);
+  // 展開→検査→sanitize の順で、無害化前に scheme/ドライブ文字/UNC を fail-loud で拒否する。
+  // sanitizeUnicodeFileName は `:` を `_` に潰すので、これを検査せず通すと
+  // `s3://bucket`→`s3_/bucket`・`C:/drop`→`C_/drop` として黙って exit 0 で配置されてしまい、
+  // 「無害化で危険になる指定は拒否」というプラグイン契約（exit 2）と食い違う。
+  // {flow} 等のトークン展開後（substituted）を検査対象にする。
+  if (
+    /^[/\\]/.test(substituted) ||                  // 絶対パス（先頭 / または \。UNC の // \\ も含む）
+    /^[A-Za-z]:/.test(substituted) ||              // ドライブ文字 C:
+    /^[A-Za-z][A-Za-z0-9+.-]*:/.test(substituted)  // scheme（s3: file: 等）
+  ) {
+    throw usageError(
+      `--prefix "${template}" is not a relative path ("${substituted}" is an absolute path, or has a scheme, drive letter, or UNC prefix).\n` +
+      "Placement never falls back to a generated folder — fix --prefix (relative path, no leading / \\ / .. / scheme / drive).",
+    );
+  }
+  // `/` と `\` 双方で分割 → 各 segment を無害化。Windows 予約名は `_` 前置。
+  // archive と違い `..` は「黙って除去」しない — 上昇を意図した指定を残り部分だけで
+  // 実行すると想定外の場所へ置くので、traversal 指定そのものを exit 2 で拒否する。
+  // 空 segment / `.`（連続・先頭・末尾スラッシュの残骸）だけは無害なので読み飛ばす。
+  const segments = [];
+  for (const raw of substituted.split(/[/\\]/)) {
+    if (raw === "" || raw === ".") continue;
+    const cleaned = sanitizeUnicodeFileName(raw);
+    if (raw === ".." || cleaned === "") {
+      throw usageError(
+        `--prefix "${template}" contains a traversal or empty segment ("${raw}").\n` +
+        "Placement never falls back to a generated folder — fix --prefix (relative path, no .. / scheme / drive).",
+      );
+    }
+    segments.push(WIN_RESERVED.test(cleaned) ? `_${cleaned}` : cleaned);
+  }
+  const safe = segments.join("/");
+  // 再結合後ガード: 相対パスのみ許可（絶対/ドライブ/UNC/scheme の残骸は拒否）。
+  const unsafe =
+    safe === "" ||
+    safe.length > PREFIX_MAX_LEN ||
+    /^[/\\]/.test(safe) ||            // 先頭スラッシュ（絶対）
+    /^[A-Za-z]:/.test(safe) ||        // ドライブ文字 C:
+    /^\/\//.test(safe) ||             // UNC //server
+    /:\//.test(safe) ||               // scheme っぽい :/ の残骸
+    /^[a-z][a-z0-9+.-]*:/i.test(safe); // scheme（file: 等）
+  if (unsafe) {
+    throw usageError(
+      `--prefix "${template}" resolves to an empty or unsafe path ("${safe}").\n` +
+      "Placement never falls back to a generated folder — fix --prefix (relative path, no .. / scheme / drive).",
+    );
+  }
+  return safe;
+}
+
+/**
+ * --to トークンを URI パスセグメント安全な単一トークンへ無害化する（archive と同一）。
+ */
+function sanitizeToToken(value) {
+  let s = sanitizeUnicodeFileName(String(value).replace(/[\x00-\x1f\x7f]/g, ""));
+  s = s.replace(/[#?@%\s]/g, "_");
+  return WIN_RESERVED.test(s) ? `_${s}` : s;
+}
+
+/**
+ * --to のテンプレートを展開する（archive expandToTemplate と同一契約）。dest はバッチ非依存で
+ * なければならないので --to で許すのは安定キー `{flow}` のみ。run-varying トークン
+ * （{batchId}/{datetime}/{date}）は --prefix 専用で、--to にあれば拒否する。
+ */
+function expandToTemplate(to) {
+  const raw = String(to).replace(/[\x00-\x1f\x7f]/g, "");
+  if (/\{(batchId|datetime|date)\}/.test(raw)) {
+    throw usageError(
+      "--to must not contain run-varying tokens ({batchId}/{datetime}/{date}) — dest must be batch-independent; " +
+      "put those in --prefix. --to may use {flow} only.",
+    );
+  }
+  const flow = sanitizeToToken(process.env.IREPO_FLOW_NAME || "");
+  const expanded = raw.replace(/\{flow\}/g, flow);
+  // 空 {flow} 等で生じる連続スラッシュを畳む。ただし
+  //  - scheme の `://`（s3:// 等）は lookbehind `(?<!:)` で保護し、
+  //  - 先頭の `//`（POSIX/Windows の UNC/ネットワークパス表記。--to //server/share や
+  //    normalizeLocalDest が file://server/share を正規化した //server/share）は
+  //    退避→畳み込み→復元で保護する（潰すと dir:/server/... としてローカルルート配下に書く実害）。
+  // backslash 形式 \\server\share はこの畳み込み対象外（挙動を変えない）。
+  const uncPrefix = /^\/\//.test(expanded) ? "//" : "";
+  const body = expanded.slice(uncPrefix.length);
+  return uncPrefix + body.replace(/(?<!:)\/{2,}/g, "/");
+}
+
+/**
+ * 展開後 --to からバッチ非依存の canonical な store location（dest）を作る
+ * （archive canonicalBundleDest と同文法・改名）: s3:bucket/prefix・gcs:bucket/prefix・
+ * azure:account/container[/prefix]・dir:absPath。--prefix（配置サブパス）は dest に含めない。
+ */
+function canonicalPlaceDest(store, expandedTo) {
+  if (store === "s3" || store === "gcs") {
+    const scheme = store === "s3" ? "s3://" : "gs://";
+    const rest = String(expandedTo).slice(scheme.length).replace(/\/+$/, ""); // bucket[/prefix...]
+    return `${store === "s3" ? "s3" : "gcs"}:${rest}`;
+  }
+  if (store === "azure") {
+    const { account, container, prefix } = parseAzureTo(expandedTo);
+    return prefix ? `azure:${account}/${container}/${prefix}` : `azure:${account}/${container}`;
+  }
+  // local: 絶対パスへ正規化して dir: スキーム（dir-place と同表現）。
+  const abs = resolve(normalizeLocalDest(expandedTo));
+  return `dir:${abs}`;
+}
