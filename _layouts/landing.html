@@ -126,6 +126,8 @@
   .tile h4{margin:14px 0 4px; font-size:16px; font-weight:900; letter-spacing:-.01em}
   .tile p{margin:0; font-size:13px; color:#5c5447; font-weight:500}
   .tile.star .shot{box-shadow:6px 6px 0 var(--accent)}
+  .log-preview{padding:18px; background:#171717; color:#f3efe6; font:11px/1.7 var(--mono)}
+  .log-preview span{display:block}.log-preview .ok{color:#80d99a}.log-preview .err{color:#ff8d80}
 
   /* ---- docs ---- */
   .doclink{display:flex; align-items:center; justify-content:space-between; gap:16px; border:2px solid var(--ink);
@@ -279,7 +281,7 @@
   <section id="screens">
     <div class="wrap">
       <div class="sec-head">
-        <div><span class="kick">Screen tour</span><h2>13画面＋クラウド配信先、流れの順に。</h2></div>
+        <div><span class="kick">Screen tour</span><h2>14画面＋クラウド配信先、流れの順に。</h2></div>
         <p class="sd">サイドバーは「つなぐ→作る→動かす→見る→片付ける」の順。</p>
       </div>
       <div class="grid">
@@ -289,14 +291,15 @@
         <figure class="tile"><div class="shot"><div class="shot-bar"><span class="dot"></span> 実行状況 <span class="idx">03</span></div><div class="shot-body"><img src="assets/img/screen-runs.png" alt="実行状況" onerror="this.style.display='none'"></div></div><h4>実行状況</h4><p>ログ・成功確認・再実行。</p></figure>
         <figure class="tile"><div class="shot"><div class="shot-bar"><span class="dot"></span> 現場蓄積データ <span class="idx">04</span></div><div class="shot-body"><img src="assets/img/screen-gemba.png" alt="現場蓄積データ" onerror="this.style.display='none'"></div></div><h4>現場蓄積データ</h4><p>送信済みを読み取り専用で閲覧・検索。</p></figure>
         <figure class="tile"><div class="shot"><div class="shot-bar"><span class="dot"></span> データ確認 <span class="idx">05</span></div><div class="shot-body"><img src="assets/img/screen-reports.png" alt="データ確認" onerror="this.style.display='none'"></div></div><h4>データ確認</h4><p>送信元×送信済みの突き合わせ。</p></figure>
-        <figure class="tile"><div class="shot"><div class="shot-bar"><span class="dot"></span> スケジュール <span class="idx">07</span></div><div class="shot-body"><img src="assets/img/screen-scheduler.png" alt="スケジュール" onerror="this.style.display='none'"></div></div><h4>スケジュール</h4><p>定期実行を OS スケジューラに登録。カレンダーで予定と実績。</p></figure>
-        <figure class="tile"><div class="shot"><div class="shot-bar"><span class="dot"></span> 着信 Webhook <span class="idx">08</span></div><div class="shot-body"><img src="assets/img/screen-webhook.png" alt="着信 Webhook" onerror="this.style.display='none'"></div></div><h4>着信 Webhook</h4><p>外部システムからフローを起動。</p></figure>
-        <figure class="tile"><div class="shot"><div class="shot-bar"><span class="dot"></span> プラグイン <span class="idx">09</span></div><div class="shot-body"><img src="assets/img/screen-plugins.png" alt="プラグイン" onerror="this.style.display='none'"></div></div><h4>プラグイン</h4><p>送り先部品の状態・フォルダ・削除。</p></figure>
-        <figure class="tile"><div class="shot"><div class="shot-bar"><span class="dot"></span> クラウド配信先 <span class="idx">GCS</span></div><div class="shot-body"><img src="assets/img/screen-cloud.png" alt="クラウド配信先（GCS バケットの実例）" onerror="this.style.display='none'"></div></div><h4>クラウド配信先（着地点）</h4><p>S3 / GCS / Azure Blob へ bundle 配信。上位フォルダ名も自由化（{date} 等）。</p></figure>
-        <figure class="tile"><div class="shot"><div class="shot-bar"><span class="dot"></span> エージェント接続 <span class="idx">10</span></div><div class="shot-body"><img src="assets/img/screen-mcp.png" alt="エージェント接続" onerror="this.style.display='none'"></div></div><h4>エージェント接続</h4><p>AI ツールへ読み取り専用で接続（MCP）。</p></figure>
         <figure class="tile star" style="grid-column:span 2"><div class="shot"><div class="shot-bar"><span class="dot"></span> Ontology Studio <span class="idx">★ NEW</span></div><div class="shot-body"><img src="assets/img/screen-ontology.png" alt="Ontology Studio" onerror="this.style.display='none'"></div></div><h4>Ontology Studio</h4><p>帳票の項目に型と意味を付け、人が確認して<strong>現場スキル（NEW）</strong>に育てる。複数の帳票をまたぐ“見方”をAIインタビューで引き出して確定すると、現場AIは「どの現場スキルを使いますか？」から始まる。書き出せばお使いの Claude / Codex でもそのまま働く。</p></figure>
         <figure class="tile"><div class="shot"><div class="shot-bar"><span class="dot"></span> クリーンアップ設定</div><div class="shot-body"><img src="assets/img/screen-cleanup.png" alt="クリーンアップ設定" onerror="this.style.display='none'"></div></div><h4>クリーンアップ設定</h4><p>保持期間・承認・ソフトデリート。</p></figure>
+        <figure class="tile"><div class="shot"><div class="shot-bar"><span class="dot"></span> スケジュール</div><div class="shot-body"><img src="assets/img/screen-scheduler.png" alt="スケジュール" onerror="this.style.display='none'"></div></div><h4>スケジュール</h4><p>定期実行を OS スケジューラに登録。カレンダーで予定と実績。</p></figure>
+        <figure class="tile"><div class="shot"><div class="shot-bar"><span class="dot"></span> 着信 Webhook</div><div class="shot-body"><img src="assets/img/screen-webhook.png" alt="着信 Webhook" onerror="this.style.display='none'"></div></div><h4>着信 Webhook</h4><p>外部システムからフローを起動。</p></figure>
+        <figure class="tile"><div class="shot"><div class="shot-bar"><span class="dot"></span> プラグイン</div><div class="shot-body"><img src="assets/img/screen-plugins.png" alt="プラグイン" onerror="this.style.display='none'"></div></div><h4>プラグイン</h4><p>送り先部品の状態・フォルダ・削除。</p></figure>
+        <figure class="tile"><div class="shot"><div class="shot-bar"><span class="dot"></span> エージェント接続</div><div class="shot-body"><img src="assets/img/screen-mcp.png" alt="エージェント接続" onerror="this.style.display='none'"></div></div><h4>エージェント接続</h4><p>AI ツールへ読み取り専用で接続（MCP）。</p></figure>
+        <figure class="tile"><div class="shot"><div class="shot-bar"><span class="dot"></span> ログ（i-repo CLI）</div><div class="log-preview"><span>[CMD] archive create</span><span>[HTTP] GetReportList 200</span><span class="ok">[DONE] verified: true</span><span class="err">[ERROR] 認証・通信エラーも絞り込み</span></div></div><h4>ログ（i-repo CLI）</h4><p>直近7日の操作・通信・エラーを読み取り専用で確認。</p></figure>
         <figure class="tile star" style="grid-column:span 2"><div class="shot"><div class="shot-bar"><span class="dot"></span> 現場 AI チャット <span class="idx">★ 11</span></div><div class="shot-body"><img src="assets/img/screen-agent.png" alt="現場 AI チャット" onerror="this.style.display='none'"></div></div><h4>現場 AI チャット</h4><p>現場データについて、アプリの中で AI に日本語で質問。意味づけした帳票は“この現場の言葉”で根拠つきに答える。</p></figure>
+        <figure class="tile"><div class="shot"><div class="shot-bar"><span class="dot"></span> クラウド配信先 <span class="idx">GCS</span></div><div class="shot-body"><img src="assets/img/screen-cloud.png" alt="クラウド配信先（GCS バケットの実例）" onerror="this.style.display='none'"></div></div><h4>クラウド配信先（着地点）</h4><p>S3 / GCS / Azure Blob へ bundle 配信。上位フォルダ名も自由化（{date} 等）。</p></figure>
       </div>
     </div>
   </section>
