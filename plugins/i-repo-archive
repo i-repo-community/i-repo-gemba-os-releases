@@ -44,7 +44,7 @@ async function loadBuiltins() {
 }
 
 const PLUGIN = "i-repo-archive";
-const VERSION = "0.8.0";
+const VERSION = "0.9.2";
 const PLUGIN_API = "1";
 const defaultArchiveRoot = () => join(homedir(), ".i-repo", "archives");
 
@@ -118,7 +118,7 @@ if (arg0 === "--plugin-schema") {
         label: "クラスター詳細を含める",
         description: "各帳票の reports get を呼び、manifest にクラスター値(detail)を埋め込む" },
       { name: "--detail-sleep-ms", type: "string", subcommand: "create", filter: true,
-        label: "詳細取得間隔(ms)", placeholder: "200", default: "200",
+        label: "詳細取得間隔(ms)", placeholder: "500", default: "500",
         description: "各帳票の詳細取得ごとのスリープ時間(ms)。0 で無効。API 過負荷防止用",
         dependsOn: "--with-detail" },
       { name: "--detail-sleep-every", type: "string", subcommand: "create", filter: true,
@@ -180,13 +180,16 @@ if (arg0 === "--plugin-schema") {
       { name: "--cleanup", type: "boolean", subcommand: "push-s3", destructive: true,
         label: "Clean up local archive",
         description: "Delete the local archive directory after the upload is verified" },
+      { name: "--receipt-portable", type: "boolean", subcommand: "push-s3", filter: false,
+        label: "着地 receipt を可搬化",
+        description: "共有エクスポート時に、着地 receipt（push-*.json）と bundle 内 receipts/archive.json の着地コピーからローカル絶対パス（archivePath/savedFiles/filters）を除去する。dest とリモートキーは宛先そのものなので残す。ローカル bundle 側は不変。既定 off（stdout receipt は不変）" },
       // push-s3 無人認証（#92・push-azure と同作法）: 値は argv ではなく env で aws に渡す。
       { name: "--access-key-id", type: "string", subcommand: "push-s3", envVar: "AWS_ACCESS_KEY_ID",
         label: "AWS アクセスキーID（任意・無人用）",
-        description: "IAM アクセスキーID。値は環境変数 AWS_ACCESS_KEY_ID で aws に渡す（対話 aws sso login 不要で無人化）" },
+        description: "IAM アクセスキーID。値は環境変数 AWS_ACCESS_KEY_ID で aws に渡す（対話 aws sso login 不要で無人化）。相方（secret）は envVar でも可（片方 argv・片方 env の分離注入に対応・#144）" },
       { name: "--secret-access-key", type: "string", subcommand: "push-s3", secret: true, envVar: "AWS_SECRET_ACCESS_KEY",
         label: "AWS シークレットアクセスキー（任意・無人用）",
-        description: "IAM シークレットアクセスキー。値は argv に出さず環境変数 AWS_SECRET_ACCESS_KEY で aws に渡す" },
+        description: "IAM シークレットアクセスキー。値は argv に出さず環境変数 AWS_SECRET_ACCESS_KEY で aws に渡す。相方（key-id）は envVar でも可（片方 argv・片方 env の分離注入に対応・#144）" },
       { name: "--profile", type: "string", subcommand: "push-s3", envVar: "AWS_PROFILE",
         label: "AWS プロファイル（任意）",
         description: "named profile（~/.aws 構成）。値は環境変数 AWS_PROFILE で aws に渡す" },
@@ -204,6 +207,9 @@ if (arg0 === "--plugin-schema") {
       { name: "--cleanup", type: "boolean", subcommand: "push-gcs", destructive: true,
         label: "Clean up local archive",
         description: "Delete the local archive directory after the upload is verified" },
+      { name: "--receipt-portable", type: "boolean", subcommand: "push-gcs", filter: false,
+        label: "着地 receipt を可搬化",
+        description: "共有エクスポート時に、着地 receipt（push-*.json）と bundle 内 receipts/archive.json の着地コピーからローカル絶対パス（archivePath/savedFiles/filters）を除去する。dest とリモートキーは宛先そのものなので残す。ローカル bundle 側は不変。既定 off（stdout receipt は不変）" },
       // push-gcs 無人認証（#92）: SA 鍵 JSON の**パス**を env(GOOGLE_APPLICATION_CREDENTIALS)で gcloud に渡す。
       { name: "--gcp-credentials", type: "string", subcommand: "push-gcs", envVar: "GOOGLE_APPLICATION_CREDENTIALS",
         label: "GCP サービスアカウント鍵のパス（任意・無人用）",
@@ -225,6 +231,9 @@ if (arg0 === "--plugin-schema") {
       { name: "--cleanup", type: "boolean", subcommand: "push-azure", destructive: true,
         label: "Clean up local archive",
         description: "Delete the local archive directory after the upload is verified" },
+      { name: "--receipt-portable", type: "boolean", subcommand: "push-azure", filter: false,
+        label: "着地 receipt を可搬化",
+        description: "共有エクスポート時に、着地 receipt（push-*.json）と bundle 内 receipts/archive.json の着地コピーからローカル絶対パス（archivePath/savedFiles/filters）を除去する。dest とリモートキーは宛先そのものなので残す。ローカル bundle 側は不変。既定 off（stdout receipt は不変）" },
       // push-local（ローカル/ファイルサーバー。外部CLI不要・Node fs でコピー）
       { name: "--to", type: "string", required: true, subcommand: "push-local",
         label: "保存先フォルダ/ファイルサーバー",
@@ -237,11 +246,14 @@ if (arg0 === "--plugin-schema") {
       { name: "--cleanup", type: "boolean", subcommand: "push-local", destructive: true,
         label: "Clean up local archive",
         description: "Delete the staged local archive directory after the copy is verified" },
+      { name: "--receipt-portable", type: "boolean", subcommand: "push-local", filter: false,
+        label: "着地 receipt を可搬化",
+        description: "共有エクスポート時に、着地 receipt（push-local.json）と bundle 内 receipts/archive.json の着地コピーからローカル絶対パス（archivePath/savedFiles/filters）を除去する。宛先パス localPrefix は宛先そのものなので残す。ローカル bundle 側は不変。既定 off（stdout receipt は不変）" },
       // pull-*（取り戻し・host 管理。GUI 配信フォームには出ない＝mode:read。Rust が固定引数で渡す）
       { name: "--from", type: "string", subcommand: "pull-s3", description: "取得元 s3://bucket/prefix（着地した bundle のルート）" },
       { name: "--out", type: "string", subcommand: "pull-s3", description: "取得先ローカルディレクトリ" },
-      { name: "--access-key-id", type: "string", subcommand: "pull-s3", envVar: "AWS_ACCESS_KEY_ID", description: "無人取り戻し用 IAM アクセスキーID（env AWS_ACCESS_KEY_ID）" },
-      { name: "--secret-access-key", type: "string", subcommand: "pull-s3", secret: true, envVar: "AWS_SECRET_ACCESS_KEY", description: "無人取り戻し用 IAM シークレットキー（env のみ・argv 非掲載）" },
+      { name: "--access-key-id", type: "string", subcommand: "pull-s3", envVar: "AWS_ACCESS_KEY_ID", description: "無人取り戻し用 IAM アクセスキーID（env AWS_ACCESS_KEY_ID）。相方（secret）は envVar でも可（片方 argv・片方 env の分離注入に対応・#144）" },
+      { name: "--secret-access-key", type: "string", subcommand: "pull-s3", secret: true, envVar: "AWS_SECRET_ACCESS_KEY", description: "無人取り戻し用 IAM シークレットキー（env のみ・argv 非掲載）。相方（key-id）は envVar でも可（片方 argv・片方 env の分離注入に対応・#144）" },
       { name: "--profile", type: "string", subcommand: "pull-s3", envVar: "AWS_PROFILE", description: "AWS named profile（env AWS_PROFILE）" },
       { name: "--region", type: "string", subcommand: "pull-s3", envVar: "AWS_REGION", description: "AWS リージョン（env AWS_REGION）" },
       { name: "--from", type: "string", subcommand: "pull-gcs", description: "取得元 gs://bucket/prefix" },
@@ -364,7 +376,7 @@ function usage() {
       --force                  Reuse an existing archive directory
       --with-artifacts <t,..>  pdf,pdfLayer,excel,text,none (default: pdf; text=no binaries, cluster values only)
       --with-detail            Embed cluster values (reports get per record)
-      --detail-sleep-ms <ms>   Sleep between detail fetches (default: 0)
+      --detail-sleep-ms <ms>   Sleep between detail fetches (default: 500)
       --detail-sleep-every <n> Apply sleep every N records (default: 1)
       --dry-run                Resolve inputs and report without writing
       --endpoint/--user/--password <v>   Override i-repo credentials
@@ -463,7 +475,7 @@ function parseCreateArgs(argv) {
     withArtifacts: artifacts,
     // text モードはバイナリ無し＋フィールド値（クラスター値）を必ず埋めるので detail を強制 ON。
     withDetail: Boolean(o["with-detail"]) || artifacts.includes("text"),
-    detailSleepMs: Math.max(0, parseInt(o["detail-sleep-ms"] ?? "200", 10) || 0),
+    detailSleepMs: Math.max(0, parseInt(o["detail-sleep-ms"] ?? "500", 10) || 0),
     detailSleepEvery: Math.max(1, parseInt(o["detail-sleep-every"] ?? "1", 10) || 1),
     dryRun: Boolean(o["dry-run"]),
     endpoint: o.endpoint,
@@ -507,7 +519,7 @@ function normalizeLocalDest(to) {
 
 function parsePushArgs(argv, backend) {
   const label = `push-${backend.store}`;
-  const spec = { "--to": "value", "--prefix": "value", "--dry-run": "flag", "--cleanup": "flag" };
+  const spec = { "--to": "value", "--prefix": "value", "--dry-run": "flag", "--cleanup": "flag", "--receipt-portable": "flag" };
   // 無人認証フラグ（#92）。secret 値は argv に出さず env でクラウド CLI に渡す（buildPushEnv 参照）。
   if (backend.store === "azure") { spec["--sas"] = "value"; spec["--connection-string"] = "value"; }
   if (backend.store === "s3") {
@@ -530,7 +542,7 @@ function parsePushArgs(argv, backend) {
   // Azure は blob エンドポイント URL の構造（account/container/prefix）まで parse 時に検証する
   // （dry-run でも不正 URL を早期に弾く。upload 時の parseAzureTo と同基準）。
   if (backend.store === "azure") parseAzureTo(o.to);
-  const out = { archiveDir: o._[0], to: o.to, prefix: o.prefix, dryRun: Boolean(o["dry-run"]), cleanup: Boolean(o.cleanup) };
+  const out = { archiveDir: o._[0], to: o.to, prefix: o.prefix, dryRun: Boolean(o["dry-run"]), cleanup: Boolean(o.cleanup), receiptPortable: Boolean(o["receipt-portable"]) };
   if (backend.store === "azure") {
     out.azure = true;
     // フラグ未指定なら env から拾う（host の secret env 注入＝envVar 宣言と整合）。
@@ -715,12 +727,20 @@ function joinUri(prefix, child) {
  * （usage は排他表記）。フラグ無指定時は ambient/host 注入の env が素通り。
  */
 function s3CredsFromArgs(o, label) {
-  const accessKeyId = o["access-key-id"] || "";
-  const secretAccessKey = o["secret-access-key"] || "";
+  let accessKeyId = o["access-key-id"] || "";
+  let secretAccessKey = o["secret-access-key"] || "";
+  // ホストが secret 衛生（SEC-1）で --secret-access-key を env（AWS_SECRET_ACCESS_KEY）へ退避し
+  // argv から除去する分離注入形（#144）を受け付ける: argv で片方だけ指定されたときに限り、
+  // 欠けた側を env で補完してから検査する。argv 両方なし＝従来どおり ambient 素通り
+  // （ここで env を拾うと ambient キー＋--profile の既存正常系が排他検査で落ちる逆回帰になる）。
+  if (Boolean(accessKeyId) !== Boolean(secretAccessKey)) {
+    if (!accessKeyId) accessKeyId = process.env.AWS_ACCESS_KEY_ID || "";
+    if (!secretAccessKey) secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY || "";
+  }
   const profile = o.profile || "";
   const region = o.region || "";
   if (Boolean(accessKeyId) !== Boolean(secretAccessKey)) {
-    throw new Error(`${label}: --access-key-id and --secret-access-key must be provided together.`);
+    throw new Error(`${label}: --access-key-id and --secret-access-key must be provided together (the counterpart may also be supplied via AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY).`);
   }
   if ((accessKeyId || secretAccessKey) && profile) {
     throw new Error(`${label}: use either IAM keys (--access-key-id/--secret-access-key) or --profile, not both.`);
@@ -763,7 +783,12 @@ const S3_BACKEND = {
     return destination;
   },
   async uploadReceipt(receiptPath, destination, env) {
-    await runCommand("aws", ["s3", "cp", receiptPath, joinUri(destination, `receipts/${this.receiptName}`)], { env, captureStdout: false });
+    await this.uploadReceiptNamed(receiptPath, destination, this.receiptName, env);
+  },
+  // 単一ファイルを <destination>/receipts/<name> へ個別 PUT（uploadReceipt の一般化）。
+  // --receipt-portable が着地 archive.json を可搬化コピーで上書きするのに使う。
+  async uploadReceiptNamed(localFile, destination, name, env) {
+    await runCommand("aws", ["s3", "cp", localFile, joinUri(destination, `receipts/${name}`)], { env, captureStdout: false });
   },
   async verify(destination, env) {
     const r = await runCommand("aws", ["s3", "ls", joinUri(destination, `receipts/${this.receiptName}`)], { env, captureStdout: true }).catch(() => null);
@@ -787,7 +812,10 @@ const GCS_BACKEND = {
     return destination;
   },
   async uploadReceipt(receiptPath, destination, env) {
-    await runCommand("gcloud", ["storage", "cp", receiptPath, joinUri(destination, `receipts/${this.receiptName}`)], { env, captureStdout: false });
+    await this.uploadReceiptNamed(receiptPath, destination, this.receiptName, env);
+  },
+  async uploadReceiptNamed(localFile, destination, name, env) {
+    await runCommand("gcloud", ["storage", "cp", localFile, joinUri(destination, `receipts/${name}`)], { env, captureStdout: false });
   },
   async verify(destination, env) {
     const r = await runCommand("gcloud", ["storage", "ls", joinUri(destination, `receipts/${this.receiptName}`)], { env, captureStdout: true }).catch(() => null);
@@ -825,10 +853,13 @@ const AZURE_BACKEND = {
     return joinUri(to, destSub);
   },
   async uploadReceipt(receiptPath, destination, env) {
+    await this.uploadReceiptNamed(receiptPath, destination, this.receiptName, env);
+  },
+  async uploadReceiptNamed(localFile, destination, name, env) {
     const { account, container, prefix } = parseAzureTo(destination);
-    const name = [prefix, `receipts/${this.receiptName}`].filter(Boolean).join("/");
+    const blobName = [prefix, `receipts/${name}`].filter(Boolean).join("/");
     await runCommand("az", ["storage", "blob", "upload", "--account-name", account,
-      "--container-name", container, "--name", name, "--file", receiptPath, "--overwrite"],
+      "--container-name", container, "--name", blobName, "--file", localFile, "--overwrite"],
       { env, captureStdout: false });
   },
   async verify(destination, env) {
@@ -870,10 +901,13 @@ const LOCAL_BACKEND = {
     await fsp.cp(archivePath, destination, { recursive: true });
     return destination;
   },
-  async uploadReceipt(receiptPath, destination, _env) {
-    const target = join(destination, "receipts", this.receiptName);
+  async uploadReceipt(receiptPath, destination, env) {
+    await this.uploadReceiptNamed(receiptPath, destination, this.receiptName, env);
+  },
+  async uploadReceiptNamed(localFile, destination, name, _env) {
+    const target = join(destination, "receipts", name);
     await fsp.mkdir(dirname(target), { recursive: true });
-    await fsp.cp(receiptPath, target);
+    await fsp.cp(localFile, target);
   },
   async verify(destination, _env) {
     const st = await fsp.stat(join(destination, "receipts", this.receiptName)).catch(() => null);
@@ -917,8 +951,25 @@ async function pushArchiveBundle(options, backend) {
   const destination = await backend.upload(archivePath, expandedTo, destSub, env);
   emitReceipt("write", jobId, count, 0, false, { archivePath, [backend.prefixKey]: destination, dest, storeKind });
 
-  await writeJsonFile(receiptPath, { jobId, count, archivePath, [backend.prefixKey]: destination, dest, storeKind, pushedAt: new Date().toISOString() });
+  // 着地 receipt（送り先へ up する receipts/push-*.json）。--receipt-portable のときは
+  // ローカル staging の絶対パス（archivePath＝OS ユーザー名を含む）を除去して共有先へ漏らさない。
+  // dest / [prefixKey]（cloud=リモート URI, local=宛先パス）は「宛先そのもの」なので残す。
+  // stdout receipt（emitReceipt）は不変＝ローカル消費者は従来どおり archivePath を使える。
+  const landedReceipt = { jobId, count, archivePath, [backend.prefixKey]: destination, dest, storeKind, pushedAt: new Date().toISOString() };
+  if (options.receiptPortable) delete landedReceipt.archivePath;
+  await writeJsonFile(receiptPath, landedReceipt);
   await backend.uploadReceipt(receiptPath, destination, env);
+
+  // --receipt-portable: push は bundle を丸ごと再帰アップロードするため、create が
+  // 書いた完了マーカー receipts/archive.json も共有先へ着地する。この中には
+  // archivePath（OS ユーザー名入り staging パス）・savedFiles（全保存ファイルの
+  // ローカル絶対パス配列）・filters が残っている。可搬化コピー（3キー除去）を同キー
+  // receipts/archive.json へ個別 PUT で上書きし、ローカル絶対パスの漏れを断つ。
+  // ローカル bundle の archive.json は変更しない（ローカル消費者・再 push・
+  // validateArchiveDirectory への影響ゼロ）。
+  if (options.receiptPortable) {
+    await overwriteLandedArchiveJsonPortable(archivePath, destination, backend, env);
+  }
 
   // ── verify phase: read the receipt object back from the destination ──
   const verified = await backend.verify(destination, env);
@@ -947,6 +998,30 @@ async function pushArchiveBundle(options, backend) {
   }
   emitReceipt("verify", jobId, count, verified ? 0 : count, verified, extras);
   if (!verified) process.exitCode = 1;
+}
+
+// --receipt-portable の後始末: 再帰アップロードで着地した bundle 内 receipts/archive.json
+// から archivePath・savedFiles・filters の3キーを除去した可搬化コピーを、同キーへ個別 PUT で
+// 上書きする（uploadReceiptNamed = uploadReceipt と同一の単一ファイルアップロード経路）。
+// 他のキー（jobId/count/artifacts[]（objectKey は相対キー）/createdAt/producedBy/provenance/
+// requestedArtifacts 等）は維持。ローカル bundle 内の archive.json には触れない。
+async function overwriteLandedArchiveJsonPortable(archivePath, destination, backend, env) {
+  const source = join(archivePath, "receipts", "archive.json");
+  const original = await readJsonObject(source);
+  // 読めない/空（壊れ・不在）なら何もしない: 着地物をそのまま残す（読めない元は可搬化しようがない）。
+  if (Object.keys(original).length === 0) return;
+  const portable = { ...original };
+  delete portable.archivePath;
+  delete portable.savedFiles;
+  delete portable.filters;
+  const tmpDir = await fsp.mkdtemp(join(tmpdir(), "irepo-archive-portable-"));
+  try {
+    const tmpFile = join(tmpDir, "archive.json");
+    await writeJsonFile(tmpFile, portable);
+    await backend.uploadReceiptNamed(tmpFile, destination, "archive.json", env);
+  } finally {
+    await fsp.rm(tmpDir, { recursive: true, force: true });
+  }
 }
 
 // ── pull（取り戻し・read-only）: クラウドの bundle をローカルへ DL するだけ。store へ write/delete しない。

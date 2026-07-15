@@ -34,7 +34,7 @@ async function loadBuiltins() {
 }
 
 const PLUGIN = "i-repo-report-delete";
-const VERSION = "0.1.5";
+const VERSION = "0.1.6";
 const PLUGIN_API = "1";
 
 // 検索フィルタ（DeleteReport 仕様の抽出条件・すべて filter:true）。
@@ -92,6 +92,9 @@ if (arg0 === "--plugin-schema") {
         label: "段階消化", description: "対象が無くなる（result-code=8）まで execute-count 件ずつ反復削除" },
       { name: "--receipt", type: "boolean", subcommand: "delete",
         label: "削除receipt", description: "ドレインを実行し結果を receipt（verified/件数/errors/producedBy）として出力（要 --execute-count・--force／非対話）" },
+      { name: "--slice-sleep-ms", type: "number", subcommand: "delete", default: 500,
+        label: "削除リクエスト間隔(ms)",
+        description: "ドレインのスライス（DeleteReport 1回）間の待機。API 過負荷防止用" },
       { name: "--count-only", type: "boolean", subcommand: "delete",
         label: "件数プレビュー", description: "削除せず対象件数の概算のみ表示（読み取り専用・GetReportList 近似）" },
       { name: "--force", type: "boolean", subcommand: "delete",
@@ -121,6 +124,7 @@ const ARG_SPEC = {
   "--update-user": "value", "--update-from": "value", "--update-to": "value",
   "--deleted": "value", "--mode": "value", "--transaction-mode": "value",
   "--execute-count": "value", "--drain": "flag", "--receipt": "flag",
+  "--slice-sleep-ms": "value",
   "--count-only": "flag", "--force": "flag", "-f": "--force",
   "--endpoint": "value", "--user": "value", "--password": "value",
 };
@@ -130,6 +134,7 @@ const FORWARD_FLAGS = [
   "report", "label-id", "definition", "report-name", "public-status", "edit-status",
   "remarks", "value", "regist-user", "regist-from", "regist-to",
   "update-user", "update-from", "update-to", "deleted", "transaction-mode", "execute-count",
+  "slice-sleep-ms",
 ];
 const FILTER_KEYS = [
   "report", "label-id", "definition", "report-name", "public-status", "edit-status",
@@ -463,6 +468,7 @@ Control:
       --execute-count <n>       1回の処理件数（transaction-mode=1／--drain／--receipt で有効）
       --drain                   対象が無くなる（result-code=8）まで execute-count 件ずつ反復削除
       --receipt                 ドレインし結果を receipt（verified/件数/errors/producedBy）で出力（要 --execute-count・--force）
+      --slice-sleep-ms <ms>     削除リクエスト間隔(ms)。ドレインのスライス間の待機（API 過負荷防止用・既定 500）
       --count-only              削除せず対象件数の概算のみ表示（読み取り専用）
   -f, --force                   確認プロンプトを省略（無人実行）
       --endpoint/--user/--password <v>  呼び戻す i-repo の認証を上書き

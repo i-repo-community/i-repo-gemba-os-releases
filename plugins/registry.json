@@ -5,7 +5,7 @@
       "name": "archive",
       "file": "i-repo-archive",
       "displayName": "i-repo-archive",
-      "version": "0.8.0",
+      "version": "0.9.2",
       "description": "帳票を bundle 化して保管：ローカル/ファイルサーバー、または S3 / GCS / Azure Blob へ配信（create=取得、push-*=配信）",
       "platforms": [
         "macos",
@@ -25,7 +25,7 @@
         {
           "path": "i-repo-archive",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-archive",
-          "sha256": "dd23113f8e3675cf061ff511494fc451fedc1ddae99acc6262918a640b01e9aa"
+          "sha256": "f364a2eb62900796816a0b2d9304e518dac87216a94f654520a651afa695e3d4"
         }
       ]
     },
@@ -148,7 +148,7 @@
       "name": "report-delete",
       "file": "i-repo-report-delete",
       "displayName": "i-repo-report-delete",
-      "version": "0.1.5",
+      "version": "0.1.6",
       "description": "帳票削除（DeleteReport）— 寿命管理。認証済み組み込み report-batches delete を呼び戻す（自分では認証しない）",
       "platforms": [
         "macos",
@@ -167,7 +167,7 @@
         {
           "path": "i-repo-report-delete",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-report-delete",
-          "sha256": "178e730ecd596462b109e007b8971cabdbab3ff2707cef8442a110881cbac2c0"
+          "sha256": "06e67dbaafff5789d132b174d122f1628b083ab3eff2feb60af6aedf4ac37929"
         }
       ]
     },
@@ -203,7 +203,7 @@
       "name": "upload",
       "file": "i-repo-upload",
       "displayName": "i-repo-upload",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "description": "帳票 bundle の documents/ の中身だけを送り先直下へ実名のまま flat 配置（manifests/receipts 等の裏方ファイルはゼロ）。同名は in-place 置換＝版機構を持つストア（Box/SharePoint/Drive 同期・S3/Blob バージョニング）では新バージョンとして積まれる。人が開くファイル共有向けの egress-only 配信",
       "platforms": [
         "macos",
@@ -222,7 +222,7 @@
         {
           "path": "i-repo-upload",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-upload",
-          "sha256": "554c7d095c5b75fd6cbcf84ebed203932f0028b61f4a3bbe54bdde92ffc73e28"
+          "sha256": "a8f48d8d21f0441c182c50aecef78e4c6040ee31cdf26a95d37fe5d066c654dd"
         }
       ]
     }

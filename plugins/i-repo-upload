@@ -50,7 +50,7 @@ const { basename, join, resolve, relative, isAbsolute, sep } = require("node:pat
 const { spawnSpec } = require("./lib/spawn.js");
 
 const PLUGIN = "i-repo-upload";
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 const PLUGIN_API = "1";
 
 const PLACE_SUBS = ["push-s3", "push-gcs", "push-azure", "push-local"];
@@ -107,10 +107,10 @@ if (arg0 === "--plugin-schema") {
       // push-s3 無人認証（archive と同名・同 envVar。secret 値は argv でなく env でクラウド CLI へ）。
       { name: "--access-key-id", type: "string", subcommand: "push-s3", envVar: "AWS_ACCESS_KEY_ID",
         label: "AWS アクセスキーID（任意・無人用）",
-        description: "IAM アクセスキーID。値は環境変数 AWS_ACCESS_KEY_ID で aws に渡す（対話 aws sso login 不要で無人化）" },
+        description: "IAM アクセスキーID。値は環境変数 AWS_ACCESS_KEY_ID で aws に渡す（対話 aws sso login 不要で無人化）。相方（secret）は envVar でも可（片方 argv・片方 env の分離注入に対応・#144）" },
       { name: "--secret-access-key", type: "string", subcommand: "push-s3", secret: true, envVar: "AWS_SECRET_ACCESS_KEY",
         label: "AWS シークレットアクセスキー（任意・無人用）",
-        description: "IAM シークレットアクセスキー。値は argv に出さず環境変数 AWS_SECRET_ACCESS_KEY で aws に渡す" },
+        description: "IAM シークレットアクセスキー。値は argv に出さず環境変数 AWS_SECRET_ACCESS_KEY で aws に渡す。相方（key-id）は envVar でも可（片方 argv・片方 env の分離注入に対応・#144）" },
       { name: "--profile", type: "string", subcommand: "push-s3", envVar: "AWS_PROFILE",
         label: "AWS プロファイル（任意）",
         description: "named profile（~/.aws 構成）。値は環境変数 AWS_PROFILE で aws に渡す" },
@@ -327,12 +327,20 @@ function parsePushArgs(argv, backend) {
 
 /** s3 無人認証フラグの検証（IAM キーは対でのみ・--profile と排他）。 */
 function s3CredsFromArgs(o, label) {
-  const accessKeyId = o["access-key-id"] || "";
-  const secretAccessKey = o["secret-access-key"] || "";
+  let accessKeyId = o["access-key-id"] || "";
+  let secretAccessKey = o["secret-access-key"] || "";
+  // ホストが secret 衛生で --secret-access-key を env（AWS_SECRET_ACCESS_KEY）へ退避し argv から
+  // 除去する分離注入形（#144）を受け付ける: argv で片方だけ指定されたときに限り、欠けた側を env で
+  // 補完してから検査する。argv 両方なし＝従来どおり ambient 素通り（ここで env を拾うと ambient
+  // キー＋--profile の既存正常系が排他検査で落ちる逆回帰になる）。
+  if (Boolean(accessKeyId) !== Boolean(secretAccessKey)) {
+    if (!accessKeyId) accessKeyId = process.env.AWS_ACCESS_KEY_ID || "";
+    if (!secretAccessKey) secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY || "";
+  }
   const profile = o.profile || "";
   const region = o.region || "";
   if (Boolean(accessKeyId) !== Boolean(secretAccessKey)) {
-    throw usageError(`${label}: --access-key-id and --secret-access-key must be provided together.`);
+    throw usageError(`${label}: --access-key-id and --secret-access-key must be provided together (the counterpart may also be supplied via AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY).`);
   }
   if ((accessKeyId || secretAccessKey) && profile) {
     throw usageError(`${label}: use either IAM keys (--access-key-id/--secret-access-key) or --profile, not both.`);
