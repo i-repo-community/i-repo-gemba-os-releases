@@ -1,0 +1,1958 @@
+#!/usr/bin/env node
+/**
+ * i-repo-share — gemba-share の**目次系可変オブジェクト**（share-catalog.json /
+ * datasets/<id>/dataset.json / runs/<YYYY-MM>.ndjson）を shareRoot へ **clean に PUT** する
+ * egress verb（put-catalog-*）、snapshot 実体（バイナリ .db/.db.gz）を世代キーへ **clean に単発 PUT**
+ * する egress verb（push-snapshot-*）、および目次を辿って着地実体を**ローカルへ取り戻す** read-only な
+ * pull verb。spec/gemba-share/spec.md §9.1（put-catalog 契約=雛形）/ §9.2（pull 契約）/ §9.6（予約動詞）。
+ *
+ * 目的: archive push（bundle レイアウト・着地 receipt・manifests を作る）と違い、
+ * put-catalog は **1 つの目次系オブジェクトを 1 キーへ置くだけ**。bundle レイアウトも
+ * 裏方ファイルも一切作らない。付加価値は「spec の SI（不変条件）を**書込時に強制する**」こと:
+ *   - SI-1（portable）: 目次・dataset・run 行にローカル絶対パスを混入させない（書込前に拒否）。
+ *   - SI-5（secret 非混入）: credential 値・signed URL 断片・チケット URI を混入させない。
+ * fail-loud（違反は書かずに exit 2）で、汚れた目次が shareRoot に着地するのを未然に防ぐ。
+ *
+ * 【pull 系（pull-azure/pull-s3/pull-gcs/pull-local・§9.2）の設計要点】
+ *   - **read-only**: ストアへ write/delete API を一切呼ばない。取得は「1 オブジェクト＝1 GET」のみ
+ *     （pull-azure=内蔵 fetch 直 GET・s3=aws s3api get-object・gcs=gcloud storage cp・local=fs コピー）。
+ *   - **列挙不要（§7.1）**: object store の list（ListObjects 等）を経路に含めない。既知キー
+ *     share-catalog.json を GET し、目次が教える相対キー（dataset.json / snapshot / runs シャード）
+ *     だけを 1 個ずつ取りに行く（archive pull の再帰 DL とは違う）。
+ *   - **SI-1 読み手版**: 取得目次への全文字列スキャン（put の SI-1/SI-5）は掛けない。読み手は
+ *     「自分が dereference するキーだけ」を検証する（REL_KEY_RE 一致・絶対 URL/先頭 /・.. 拒否・
+ *     join(out,key) 後の containment。local は source 側 containment も）。違反は exit 1（ストア汚染）。
+ *   - **更新中（§3.4）**: 目次記載 sha256 と取得実体の sha256 が食い違えば「更新中」とみなし、
+ *     IREPO_SHARE_PULL_RETRY_MS 待って目次から丸ごと再読（プロセス全体で 1 回）。なお不一致は exit 1。
+ *   - **.gz 再水和（§4.3）**: snapshot .db.gz は .gz バイトで sha256 照合後 node:zlib で展開し .db
+ *     のみ着地（.gz は残さない）。materialize は実体→dataset.json→runs→**最後に目次**（§3.4 の鏡映）。
+ *   - **secret 非露出（§8.1/SI-5）**: SAS/credential を receipt・stderr のどこにも出さない
+ *     （エラー表示は URL の query を落とす。elastic の fetch マスク流儀・§7.2）。
+ *
+ * 【push-snapshot 系（push-snapshot-s3/gcs/azure/local・spec §4.2/§9.3/§9.6・#147）の設計要点】
+ *   - archive push（bundle レイアウト・manifests/receipts マーカーを撒く）と違い、snapshot 実体
+ *     （バイナリ .db / .db.gz）1 個を世代キー `datasets/<id>/snapshot-<compactUTC>[-<suffix>].db[.gz]`
+ *     へ **単発 PUT する**だけ。裏方ファイル（manifests/ ・receipts/）を一切作らない clean PUT。
+ *   - **--key（世代キー）必須・既定なし**: relKey 文法（REL_KEY_RE）＋ §2 snapshot キー文法
+ *     （SNAPSHOT_KEY_RE）で検証。世代キーは一意ゆえ `--if-none-match`（新規のみ作成）を推奨する。
+ *   - **generation の前進（目次 share-catalog.json の再 PUT）は行わない**: それは put-catalog で
+ *     owner writer が行う（§6.2.2 の owner 責務・DC 分担・#147）。push-snapshot は実体 PUT＋verify まで。
+ *   - **書込前検査はバイナリ向け**: JSON/SI-1/SI-5 の内容スキャンはしない。代わりに (a) ファイル存在・
+ *     非空 (b) キー文法 (c) `.gz` キーなのに gzip マジック(1f 8b)でない／逆＝非 .gz キーなのに gzip
+ *     内容、を exit 2 で弾く（.db/.db.gz 取り違え防止）。
+ *   - **sourceDigest（#142 前倒し）**: 素の .db は sourceDigest=sha256 と同値。.gz はストリーム gunzip →
+ *     非圧縮 .db の sha256 を sourceDigest に併記（sha256 は転送物＝.gz バイトに対して計算）。壊れた gz は
+ *     gunzip 失敗で exit 2。DC は目次エントリの generation.sourceDigest にそのまま転記できる。
+ *   - PUT／verify／exit 規約／CAS 配管／認証は put-catalog（§9.1）と同型（backend put/stat 流用）。
+ *
+ * 【SI-1/SI-5 検査ロジックは「第2実装」である旨の注記】
+ * 下の findPortabilityViolations / findSecretViolations は scripts/check-share.mjs の
+ * SH3/SH4（findPortabilityViolations / findSecretViolations）と**同じ判定**を持つ。
+ * プラグインはゼロ依存・単体コピー配布（~/.i-repo/plugins/ へ本体と lib/ だけコピーされて動く）
+ * なので check-share.mjs から import できない — 配布制約ゆえの自己完結コピーである。
+ * **正本は scripts/check-share.mjs 側**（適合ハーネス）。判定を変えるときは両方を同時に直す
+ * （.claude/rules/gemba-share-spec.md「三面をセットで動かす」）。
+ *
+ * 成功判定は receipt `verified:true` のみ（SCHEMA.md §6・stdout NDJSON・§0.1-1）。
+ *
+ * exit code 規約（put-catalog=spec §9.1・pull=spec §9.2 で契約化）:
+ *   0 = 成功（put=verify receipt verified:true／pull=verified:true・unchanged 含む）
+ *   1 = put: verify 不達（PUT はしたが read-back の存在／サイズ照合に失敗）／
+ *       pull: DL 失敗・更新中再読後も sha256 不一致・取得目次の契約違反（fail-closed/schema 核/
+ *       SI-1 読み手版/SI-7）・verify 不達・目次に無い --dataset（ストア状態起因）
+ *   2 = 引数・入力検証エラー（put=relKey 文法・SI-1/SI-5 違反・非 JSON/非 NDJSON／
+ *       pull=--from/--out 欠落/形式・Azure [?#]・--dataset/--since-generation 文法・使い方）
+ *   3 = E_PRECONDITION（put の条件付き書込 CAS の precondition 失敗＝412/PreconditionFailed。
+ *       将来の CAS read-merge-write リトライが 0/1/2 と機械判別できる専用コード。**pull では未使用・予約**）
+ *   11 = 非対応 IREPO_PLUGIN_API
+ *
+ * ZERO DEPENDENCIES: node 内蔵 + ./lib/spawn.js（同梱の spawn 正本）のみ。単一ファイル・CJS。
+ *   install: ~/.i-repo/plugins/ へ本体と lib/ をコピー && chmod +x
+ *
+ * Usage:
+ *   i-repo share put-catalog-s3    <file> --to s3://bucket/prefix [--key <relKey>] [options]
+ *   i-repo share put-catalog-gcs   <file> --to gs://bucket/prefix [--key <relKey>] [options]
+ *   i-repo share put-catalog-azure <file> --to https://<acct>.blob.core.windows.net/<container>/<p> [--key <relKey>] [options]
+ *   i-repo share put-catalog-local <file> --to <folder|network-share> [--key <relKey>] [options]
+ *   i-repo share pull-azure --from https://<acct>.blob.core.windows.net/<container>/<p> --out <dir> [options]
+ *   i-repo share pull-s3    --from s3://bucket/prefix --out <dir> [options]
+ *   i-repo share pull-gcs   --from gs://bucket/prefix --out <dir> [options]
+ *   i-repo share pull-local --from <folder|network-share> --out <dir> [options]
+ *   i-repo share push-snapshot-s3    <file.db[.gz]> --to s3://bucket/prefix --key datasets/<id>/snapshot-<compactUTC>.db[.gz] [options]
+ *   i-repo share push-snapshot-gcs   <file.db[.gz]> --to gs://bucket/prefix --key … [options]
+ *   i-repo share push-snapshot-azure <file.db[.gz]> --to https://<acct>.blob.core.windows.net/<container>/<p> --key … [options]
+ *   i-repo share push-snapshot-local <file.db[.gz]> --to <folder|network-share> --key … [options]
+ * push-snapshot は実装済み（#147・実体 PUT＋verify まで）。ls / get は本弾では未実装（spec §11 の Phase 3）。
+ */
+"use strict";
+
+const fs = require("node:fs");
+const fsp = require("node:fs/promises");
+const zlib = require("node:zlib");
+const { pipeline } = require("node:stream/promises");
+const { Readable } = require("node:stream");
+const { createHash, randomBytes } = require("node:crypto");
+const { spawn } = require("node:child_process");
+const { homedir, tmpdir } = require("node:os");
+const { join, dirname, basename, resolve, relative, isAbsolute, sep } = require("node:path");
+// 子プロセスの spec 構築は全プラグイン共通の正本 lib/spawn.js に一本化する
+// （Windows .cmd シム対応・cmd.exe メタ文字拒否）。spawn 自体はここで非同期に行う。
+const { spawnSpec } = require("./lib/spawn.js");
+
+const PLUGIN = "i-repo-share";
+const VERSION = "0.3.0";
+const PLUGIN_API = "1";
+
+const PUT_SUBS = ["put-catalog-s3", "put-catalog-gcs", "put-catalog-azure", "put-catalog-local"];
+const PUSH_SNAP_SUBS = ["push-snapshot-s3", "push-snapshot-gcs", "push-snapshot-azure", "push-snapshot-local"];
+const PULL_SUBS = ["pull-azure", "pull-s3", "pull-gcs", "pull-local"];
+
+// 「更新中」（目次 sha256 ≠ 取得実体）と判断したときに、目次から丸ごと再読するまでの待ち時間
+// （§3.4/§7.3）。既定 1500ms・テストは IREPO_SHARE_PULL_RETRY_MS=10 で短縮する。schema には載せない
+// 内部 knob（読み手 UX ではなく整合窓の調整）。
+const PULL_RETRY_MS = Number(process.env.IREPO_SHARE_PULL_RETRY_MS) || 1500;
+
+// 内蔵 fetch（pull-azure）の 1 GET あたりのタイムアウト。既定 120000ms。--plugin-schema 非掲載の内部
+// knob（RETRY_MS と同じ流儀・読み手 UX ではなく整合窓/耐障害性の調整）。ネットワークが応答しないときに
+// 無限待ちにならないための安全網。
+const HTTP_TIMEOUT_MS = Number(process.env.IREPO_SHARE_HTTP_TIMEOUT_MS) || 120000;
+
+// shareRoot 相対キーの文法（spec §2/§3.2）。**正本は
+// spec/gemba-share/share-catalog.schema.json の $defs.relKey.pattern**。ゼロ依存ゆえ schema を
+// 読み込まず同一パターンを焼き込む（変更時は schema と check-share SH3e を同時に直す）。
+// 印字可能 ASCII のみ・先頭 /・~ 禁止・# ? % @ : \ 禁止・.. セグメント禁止。
+const REL_KEY_RE = /^(?!\/|~)(?!(?:.*\/)?\.\.(?:\/|$))(?:(?![#?%@:\\])[\x21-\x7e])+$/;
+const DEFAULT_KEY = "share-catalog.json";
+
+// snapshot 世代キー文法（spec §2/§4.2・push-snapshot 専用）: datasets/<datasetId>/snapshot-<compactUTC>
+// [-<suffix>].db[.gz]。<compactUTC>=YYYYMMDDThhmmssZ（辞書順＝時系列順のソートキー）・<suffix>=[0-9a-z]{1,16}
+// （同一秒衝突回避）・.gz は任意（.db / .db.gz 両合法）。REL_KEY_RE の狭い部分集合（この形は必ず relKey
+// にも合致する）だが、push-snapshot は「実体を世代キー以外へ置かせない」ため追加でこの形を強制する。
+const SNAPSHOT_KEY_RE = /^datasets\/ds-[0-9a-f]{12}\/snapshot-\d{8}T\d{6}Z(-[0-9a-z]{1,16})?\.db(\.gz)?$/;
+
+// ── 予約フラグ: --plugin-schema は API 検査より先に応答する（docs/PLUGINS.md）──
+const arg0 = process.argv[2];
+if (arg0 === "--plugin-schema") {
+  console.log(JSON.stringify({
+    pluginApi: [PLUGIN_API], schemaVersions: ["1.0"], recordTypes: [],
+    name: PLUGIN, version: VERSION,
+    description: "gemba-share の目次系オブジェクト（share-catalog.json / dataset.json / runs/<YYYY-MM>.ndjson）を shareRoot へ clean に PUT する egress verb（put-catalog-*）、snapshot 実体（バイナリ .db/.db.gz）を世代キーへ clean に単発 PUT する egress verb（push-snapshot-*）、目次を辿って着地実体をローカルへ取り戻す read-only な pull verb（pull-*）。put/push はどちらも 1 オブジェクトを 1 キーへ置くだけで archive push と違い bundle レイアウト・着地 receipt・manifests を一切作らない。put-catalog は SI-1（ローカル絶対パス非混入）と SI-5（secret 非混入）を書込前に強制し、push-snapshot は generation 前進を行わず（put-catalog で owner が行う・#147）sourceDigest（非圧縮 .db の sha256）を receipt に併記する。pull は列挙なしで目次が教える相対キーを 1 個ずつ GET し、ストアへ書込・削除を一切しない（.db.gz は展開して .db のみ着地）",
+    phases: ["write", "verify", "read"],
+    platforms: ["macos", "linux", "windows"],
+    // sink（put-catalog-*）＋ read（pull-*・read-only な取り戻し）。
+    roles: ["sink", "read"],
+    // 表示カテゴリ（GUI が配信先を種別グループ表示するために読む）。
+    category: "share",
+    subcommands: [
+      { name: "put-catalog-s3", input: ["files"],
+        description: "目次系オブジェクト 1 個を S3 の <to>/<key> へ clean に PUT（要 aws CLI・SI-1/SI-5 を書込前に強制）" },
+      { name: "put-catalog-gcs", input: ["files"],
+        description: "目次系オブジェクト 1 個を Google Cloud Storage の <to>/<key> へ clean に PUT（要 gcloud CLI・SI-1/SI-5 を書込前に強制）" },
+      { name: "put-catalog-azure", input: ["files"],
+        description: "目次系オブジェクト 1 個を Azure Blob の <to>/<key> へ clean に PUT（要 az CLI・SI-1/SI-5 を書込前に強制）" },
+      { name: "put-catalog-local", input: ["files"],
+        description: "目次系オブジェクト 1 個をフォルダ/ネットワーク共有の <to>/<key> へ clean に PUT（外部CLI不要・SI-1/SI-5 を書込前に強制）" },
+      // push-snapshot-*（snapshot 実体の egress・#147）: バイナリ .db/.db.gz 1 個を世代キー <to>/<key> へ
+      // 単発 PUT する。archive push と違い manifests/receipts のマーカーを一切撒かない clean PUT。generation
+      // の前進（目次再 PUT）は行わず put-catalog で owner が行う（#147）。sourceDigest（非圧縮 .db の sha256）を
+      // receipt に併記する。put-catalog と同型宣言（input:["files"]・sink）。
+      { name: "push-snapshot-s3", input: ["files"],
+        description: "snapshot 実体（.db/.db.gz）1 個を S3 の <to>/<key> へ clean に単発 PUT（要 aws CLI・マーカーを撒かない・generation 前進は put-catalog で行う・#147）" },
+      { name: "push-snapshot-gcs", input: ["files"],
+        description: "snapshot 実体（.db/.db.gz）1 個を Google Cloud Storage の <to>/<key> へ clean に単発 PUT（要 gcloud CLI・マーカーを撒かない・generation 前進は put-catalog で行う・#147）" },
+      { name: "push-snapshot-azure", input: ["files"],
+        description: "snapshot 実体（.db/.db.gz）1 個を Azure Blob の <to>/<key> へ clean に単発 PUT（要 az CLI・マーカーを撒かない・generation 前進は put-catalog で行う・#147）" },
+      { name: "push-snapshot-local", input: ["files"],
+        description: "snapshot 実体（.db/.db.gz）1 個をフォルダ/ネットワーク共有の <to>/<key> へ clean に単発 PUT（外部CLI不要・マーカーを撒かない・generation 前進は put-catalog で行う・#147）" },
+      // pull-*（取り戻し・read-only）: 目次が教える相対キーだけを列挙なしで 1 個ずつ GET し <out> へ
+      // materialize する。ストアへ write/delete は一切しない（mode:read・destructive:false）。GUI 配信
+      // フォームには出ない（input:none＝ホスト側が固定引数で渡す host-managed verb）。describe.ts は
+      // mode/output を検査しない（fail-open）ので archive pull-* の先例そのままに宣言する。
+      { name: "pull-azure", input: ["none"], mode: "read", output: ["files"], destructive: false,
+        description: "Azure Blob shareRoot（--from）の目次を内蔵 fetch で GET し、教えられた相対キーだけを 1 個ずつ直 GET で <out> へ取り戻す（列挙不要・read-only・.db.gz は展開して .db のみ着地）" },
+      { name: "pull-s3", input: ["none"], mode: "read", output: ["files"], destructive: false,
+        description: "S3 shareRoot（--from）の目次を辿り、相対キーだけを aws s3api get-object で 1 個ずつ <out> へ取り戻す（列挙不要・read-only・要 aws CLI）" },
+      { name: "pull-gcs", input: ["none"], mode: "read", output: ["files"], destructive: false,
+        description: "GCS shareRoot（--from）の目次を辿り、相対キーだけを gcloud storage cp で 1 個ずつ <out> へ取り戻す（列挙不要・read-only・要 gcloud CLI）" },
+      { name: "pull-local", input: ["none"], mode: "read", output: ["files"], destructive: false,
+        description: "フォルダ/ネットワーク共有 shareRoot（--from）の目次を辿り、相対キーだけを fs コピーで <out> へ取り戻す（列挙不要・read-only・外部CLI不要）" },
+    ],
+    params: [
+      // --to（shareRoot）: backend ごとに形が違うので個別宣言。{flow} 等のトークン展開はしない
+      //（shareRoot は固定 URI。実値は DC が渡す）。
+      { name: "--to", type: "string", required: true, subcommand: "put-catalog-s3",
+        label: "S3 shareRoot", placeholder: "s3://bucket/gemba-share/<endpointFp12>",
+        description: "S3 上の shareRoot（この直下の <key> へ 1 オブジェクトを PUT）" },
+      { name: "--to", type: "string", required: true, subcommand: "put-catalog-gcs",
+        label: "GCS shareRoot", placeholder: "gs://bucket/gemba-share/<endpointFp12>",
+        description: "Google Cloud Storage 上の shareRoot（この直下の <key> へ 1 オブジェクトを PUT）" },
+      { name: "--to", type: "string", required: true, subcommand: "put-catalog-azure",
+        label: "Azure Blob shareRoot", placeholder: "https://<account>.blob.core.windows.net/<container>/<prefix>",
+        description: "Azure Blob 上の shareRoot (blob endpoint URL・SAS を URL に含めない)（この直下の <key> へ 1 オブジェクトを PUT）" },
+      { name: "--to", type: "string", required: true, subcommand: "put-catalog-local",
+        label: "保存先フォルダ/ファイルサーバー",
+        placeholder: "/Volumes/share/gemba-share ・ \\\\server\\share ・ D:\\gemba-share",
+        description: "ローカル/ネットワーク共有上の shareRoot パス（同期クライアントの共有フォルダ含む）" },
+      // push-snapshot-* の --to（shareRoot・put-catalog と同基準）。個別宣言。
+      { name: "--to", type: "string", required: true, subcommand: "push-snapshot-s3",
+        label: "S3 shareRoot", placeholder: "s3://bucket/gemba-share/<endpointFp12>",
+        description: "S3 上の shareRoot（この直下の <key>＝snapshot 世代キーへ実体を単発 PUT）" },
+      { name: "--to", type: "string", required: true, subcommand: "push-snapshot-gcs",
+        label: "GCS shareRoot", placeholder: "gs://bucket/gemba-share/<endpointFp12>",
+        description: "Google Cloud Storage 上の shareRoot（この直下の <key>＝snapshot 世代キーへ実体を単発 PUT）" },
+      { name: "--to", type: "string", required: true, subcommand: "push-snapshot-azure",
+        label: "Azure Blob shareRoot", placeholder: "https://<account>.blob.core.windows.net/<container>/<prefix>",
+        description: "Azure Blob 上の shareRoot (blob endpoint URL・SAS を URL に含めない)（この直下の <key>＝snapshot 世代キーへ実体を単発 PUT）" },
+      { name: "--to", type: "string", required: true, subcommand: "push-snapshot-local",
+        label: "保存先フォルダ/ファイルサーバー",
+        placeholder: "/Volumes/share/gemba-share ・ \\\\server\\share ・ D:\\gemba-share",
+        description: "ローカル/ネットワーク共有上の shareRoot パス（同期クライアントの共有フォルダ含む）" },
+      // push-snapshot-* の --key（必須・snapshot 世代キー文法で検証）/ --dry-run は 4 サブコマンド共通。
+      ...PUSH_SNAP_SUBS.flatMap((sub) => [
+        { name: "--key", type: "string", required: true, subcommand: sub,
+          label: "snapshot 世代キー（必須）", placeholder: "datasets/ds-3f8a2b91c04d/snapshot-20260711T023000Z.db.gz",
+          description: "shareRoot 相対の書込キー（既定なし・必須）。spec §2 の relKey 文法＋ snapshot 世代キー文法 ^datasets/ds-[0-9a-f]{12}/snapshot-<compactUTC>[-<suffix>].db[.gz]$ で検証（<compactUTC>=YYYYMMDDThhmmssZ・<suffix>=[0-9a-z]{1,16}）。違反は exit 2。世代キーは一意なので --if-none-match（新規のみ作成）の併用を推奨" },
+        { name: "--dry-run", type: "boolean", subcommand: sub, label: "Dry run",
+          description: "検査（ファイル存在・非空・キー文法・gzip マジック整合・sha256/sourceDigest）だけ行い write receipt（dryRun:true）を 1 行返す。PUT はしない（dest 未作成）" },
+      ]),
+      // push-snapshot-* の CAS フラグ（put-catalog と同配管・値の意味も同一）。世代キーは一意なので
+      // --if-none-match の併用を推奨（新規世代のみ作成が安全）。precondition 失敗は exit 3。
+      ...PUSH_SNAP_SUBS.flatMap((sub) => [
+        { name: "--if-match", type: "string", subcommand: sub, filter: false,
+          label: "If-Match（CAS・任意）", placeholder: "<etag|generation>",
+          description: "条件付き書込（CAS）: 現在の版が一致するときだけ差し替える。S3=If-Match <etag>／GCS=--if-generation-match <generation>／Azure=If-Match <ETag>。local（dir-share）は非対応（ETag が無い・指定すると exit 2）。--if-none-match と排他。precondition 失敗は exit 3" },
+        { name: "--if-none-match", type: "boolean", subcommand: sub, filter: false,
+          label: "If-None-Match=*（新規のみ作成・CAS・推奨）",
+          description: "条件付き書込（CAS）: オブジェクトが存在しない場合のみ作成する（S3/Azure=If-None-Match '*'／GCS=--if-generation-match 0／local=existsSync 検査）。**snapshot 世代キーは一意なので新規作成が安全＝推奨**。--if-match と排他。既存ありは exit 3" },
+      ]),
+      // push-snapshot-s3 無人認証（put-catalog-s3 と同名・同 envVar）。
+      { name: "--access-key-id", type: "string", subcommand: "push-snapshot-s3", envVar: "AWS_ACCESS_KEY_ID",
+        label: "AWS アクセスキーID（任意・無人用）",
+        description: "IAM アクセスキーID。値は環境変数 AWS_ACCESS_KEY_ID で aws に渡す。相方（secret）は envVar でも可（#144）" },
+      { name: "--secret-access-key", type: "string", subcommand: "push-snapshot-s3", secret: true, envVar: "AWS_SECRET_ACCESS_KEY",
+        label: "AWS シークレットアクセスキー（任意・無人用）",
+        description: "IAM シークレットアクセスキー。値は argv に出さず環境変数 AWS_SECRET_ACCESS_KEY で aws に渡す。相方（key-id）は envVar でも可（#144）" },
+      { name: "--profile", type: "string", subcommand: "push-snapshot-s3", envVar: "AWS_PROFILE",
+        label: "AWS プロファイル（任意）",
+        description: "named profile（~/.aws 構成）。値は環境変数 AWS_PROFILE で aws に渡す" },
+      { name: "--region", type: "string", subcommand: "push-snapshot-s3", envVar: "AWS_REGION",
+        label: "AWS リージョン（任意）",
+        description: "リージョン。値は環境変数 AWS_REGION で aws に渡す" },
+      // push-snapshot-gcs 無人認証
+      { name: "--gcp-credentials", type: "string", subcommand: "push-snapshot-gcs", envVar: "GOOGLE_APPLICATION_CREDENTIALS",
+        label: "GCP サービスアカウント鍵のパス（任意・無人用）",
+        description: "サービスアカウント鍵 JSON のファイルパス（鍵そのものではない）。env GOOGLE_APPLICATION_CREDENTIALS で受け、プラグインが gcloud CLI 用に CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE へも複写して無人化" },
+      // push-snapshot-azure 無人認証
+      { name: "--sas", type: "string", subcommand: "push-snapshot-azure", secret: true, envVar: "AZURE_STORAGE_SAS_TOKEN",
+        label: "SAS トークン（任意）",
+        description: "Shared Access Signature。値は argv ではなく環境変数で az に渡す（未指定時は接続文字列か az login）" },
+      { name: "--connection-string", type: "string", subcommand: "push-snapshot-azure", secret: true, envVar: "AZURE_STORAGE_CONNECTION_STRING",
+        label: "接続文字列（任意）",
+        description: "ストレージアカウント接続文字列。値は argv ではなく環境変数で az に渡す" },
+      // --key / --dry-run は 4 サブコマンド共通。
+      ...PUT_SUBS.flatMap((sub) => [
+        { name: "--key", type: "string", subcommand: sub,
+          label: "shareRoot 相対キー（任意）", placeholder: "share-catalog.json",
+          description: "shareRoot 相対の書込キー（既定 share-catalog.json）。spec §2 の relKey 文法で検証（印字可能 ASCII のみ・先頭 / ~ 禁止・# ? % @ : \\ 禁止・.. 禁止）。runs/<YYYY-MM>.ndjson を指すと NDJSON（share-run 行）として検証する。違反は exit 2" },
+        { name: "--dry-run", type: "boolean", subcommand: sub, label: "Dry run",
+          description: "検査（file 種別・SI-1・SI-5・sha256）だけ行い write receipt（dryRun:true）を 1 行返す。PUT はしない（dest 未作成）" },
+      ]),
+      // 条件付き書込（CAS）フラグ。値なしの --if-none-match は「存在しない場合のみ作成」。
+      // filter:false（絞り込み条件ではなく書込制御）。precondition 失敗は exit 3（E_PRECONDITION）。
+      ...PUT_SUBS.flatMap((sub) => [
+        { name: "--if-match", type: "string", subcommand: sub, filter: false,
+          label: "If-Match（CAS・任意）", placeholder: "<etag|generation>",
+          description: "条件付き書込（CAS）: 現在の版が一致するときだけ差し替える。S3=If-Match <etag>／GCS=--if-generation-match <generation>／Azure=If-Match <ETag>。local（dir-share）は非対応（ETag が無い・指定すると exit 2。上書き系の並行書込は単一 writer 前提。複数 writer 共有はオブジェクトストアを使う）。GCS の etag(generation) は cp 後の describe で取る best-effort（cp→describe の間に他 writer が書くと他者の generation になり得る）ので CAS 前は読み直し推奨。--if-none-match と排他。precondition 失敗は exit 3" },
+        { name: "--if-none-match", type: "boolean", subcommand: sub, filter: false,
+          label: "If-None-Match=*（新規のみ作成・CAS・任意）",
+          description: "条件付き書込（CAS）: オブジェクトが存在しない場合のみ作成する（S3/Azure=If-None-Match '*'／GCS=--if-generation-match 0／local=existsSync 検査）。--if-match と排他。既存ありは exit 3" },
+      ]),
+      // put-catalog-s3 無人認証（archive/upload と同名・同 envVar。secret 値は argv でなく env で aws へ）。
+      { name: "--access-key-id", type: "string", subcommand: "put-catalog-s3", envVar: "AWS_ACCESS_KEY_ID",
+        label: "AWS アクセスキーID（任意・無人用）",
+        description: "IAM アクセスキーID。値は環境変数 AWS_ACCESS_KEY_ID で aws に渡す（対話 aws sso login 不要で無人化）。相方（secret）は envVar でも可（片方 argv・片方 env の分離注入に対応・#144）" },
+      { name: "--secret-access-key", type: "string", subcommand: "put-catalog-s3", secret: true, envVar: "AWS_SECRET_ACCESS_KEY",
+        label: "AWS シークレットアクセスキー（任意・無人用）",
+        description: "IAM シークレットアクセスキー。値は argv に出さず環境変数 AWS_SECRET_ACCESS_KEY で aws に渡す。相方（key-id）は envVar でも可（片方 argv・片方 env の分離注入に対応・#144）" },
+      { name: "--profile", type: "string", subcommand: "put-catalog-s3", envVar: "AWS_PROFILE",
+        label: "AWS プロファイル（任意）",
+        description: "named profile（~/.aws 構成）。値は環境変数 AWS_PROFILE で aws に渡す" },
+      { name: "--region", type: "string", subcommand: "put-catalog-s3", envVar: "AWS_REGION",
+        label: "AWS リージョン（任意）",
+        description: "リージョン。値は環境変数 AWS_REGION で aws に渡す" },
+      // put-catalog-gcs 無人認証
+      { name: "--gcp-credentials", type: "string", subcommand: "put-catalog-gcs", envVar: "GOOGLE_APPLICATION_CREDENTIALS",
+        label: "GCP サービスアカウント鍵のパス（任意・無人用）",
+        description: "サービスアカウント鍵 JSON のファイルパス（鍵そのものではない）。env GOOGLE_APPLICATION_CREDENTIALS で受け、プラグインが gcloud CLI 用に CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE へも複写して無人化（対話 gcloud auth login 不要）" },
+      // put-catalog-azure 無人認証
+      { name: "--sas", type: "string", subcommand: "put-catalog-azure", secret: true, envVar: "AZURE_STORAGE_SAS_TOKEN",
+        label: "SAS トークン（任意）",
+        description: "Shared Access Signature。値は argv ではなく環境変数で az に渡す（未指定時は接続文字列か az login）" },
+      { name: "--connection-string", type: "string", subcommand: "put-catalog-azure", secret: true, envVar: "AZURE_STORAGE_CONNECTION_STRING",
+        label: "接続文字列（任意）",
+        description: "ストレージアカウント接続文字列。値は argv ではなく環境変数で az に渡す" },
+
+      // ── pull-*（取り戻し・read-only）の引数（§9.2.2）──
+      // --from（shareRoot・読み書き方向の構造的防止で --to でなく --from）は backend ごとに形が違うので個別宣言。
+      { name: "--from", type: "string", required: true, subcommand: "pull-azure",
+        label: "Azure Blob shareRoot", placeholder: "https://<account>.blob.core.windows.net/<container>/<prefix>",
+        description: "取得元 Azure Blob shareRoot（blob endpoint URL・SAS を URL に含めない＝[?#] 付きは exit 2）。この直下の share-catalog.json を GET する" },
+      { name: "--from", type: "string", required: true, subcommand: "pull-s3",
+        label: "S3 shareRoot", placeholder: "s3://bucket/gemba-share/<endpointFp12>",
+        description: "取得元 S3 shareRoot（この直下の share-catalog.json を GET する）" },
+      { name: "--from", type: "string", required: true, subcommand: "pull-gcs",
+        label: "GCS shareRoot", placeholder: "gs://bucket/gemba-share/<endpointFp12>",
+        description: "取得元 GCS shareRoot（この直下の share-catalog.json を GET する）" },
+      { name: "--from", type: "string", required: true, subcommand: "pull-local",
+        label: "取得元フォルダ/ファイルサーバー",
+        placeholder: "/Volumes/share/gemba-share ・ \\\\server\\share ・ D:\\gemba-share",
+        description: "取得元ローカル/ネットワーク共有 shareRoot パス（この直下の share-catalog.json を読む）" },
+      // --out（取得先ローカル dir）・--dataset / --since-generation（反復可）・--dry-run は 4 サブコマンド共通。
+      ...PULL_SUBS.flatMap((sub) => [
+        { name: "--out", type: "string", required: true, subcommand: sub,
+          label: "取得先ローカルディレクトリ", placeholder: "/var/tmp/gemba-share-pull",
+          description: "取得したオブジェクトを相対構造のまま materialize するローカルディレクトリ（scheme 付きは exit 2・無ければ再帰 mkdir）" },
+        { name: "--dataset", type: "string", subcommand: sub,
+          label: "対象データセット（任意・反復可）", placeholder: "ds-3f8a2b91c04d",
+          description: "取り戻す datasetId（^ds-[0-9a-f]{12}$）。反復指定で複数。空＝目次の全データセット。目次に無い id は exit 1" },
+        { name: "--since-generation", type: "string", subcommand: sub,
+          label: "変更なし判定の基準世代キー（任意・反復可）", placeholder: "datasets/ds-…/snapshot-….db.gz",
+          description: "既知の generation.key（relKey 文法＋^datasets/）。目次の generation.key がこれと文字列一致し着地 .db が実在すれば snapshot DL を skip し unchanged:true。反復可" },
+        { name: "--dry-run", type: "boolean", subcommand: sub, label: "Dry run",
+          description: "目次の取得・検証（版 fail-closed・schema 核・SI-1 読み手版）だけ行い、--out へ一切書かず read receipt（dryRun:true・datasets[].wouldDownload）を 1 行返す" },
+      ]),
+      // pull-azure 認証: SAS（put-catalog と同名・同 envVar）。未指定＝匿名 GET。fetch 直 GET なので
+      // az CLI・接続文字列は使わない（connection-string は宣言しない）。
+      { name: "--sas", type: "string", subcommand: "pull-azure", secret: true, envVar: "AZURE_STORAGE_SAS_TOKEN",
+        label: "SAS トークン（任意）",
+        description: "Shared Access Signature。値は argv ではなく環境変数で受け、fetch の URL query に付す（先頭 ? は除去）。未指定なら匿名 GET。receipt・エラー表示に SAS は出さない（URL の query を落とす）" },
+      // pull-s3 認証（put-catalog-s3 と同名・同 envVar・env フォールバック）。
+      { name: "--access-key-id", type: "string", subcommand: "pull-s3", envVar: "AWS_ACCESS_KEY_ID",
+        label: "AWS アクセスキーID（任意・無人用）",
+        description: "IAM アクセスキーID。値は環境変数 AWS_ACCESS_KEY_ID で aws に渡す。相方（secret）は envVar でも可（片方 argv・片方 env の分離注入に対応・#144）" },
+      { name: "--secret-access-key", type: "string", subcommand: "pull-s3", secret: true, envVar: "AWS_SECRET_ACCESS_KEY",
+        label: "AWS シークレットアクセスキー（任意・無人用）",
+        description: "IAM シークレットアクセスキー。値は argv に出さず環境変数 AWS_SECRET_ACCESS_KEY で aws に渡す。相方（key-id）は envVar でも可（片方 argv・片方 env の分離注入に対応・#144）" },
+      { name: "--profile", type: "string", subcommand: "pull-s3", envVar: "AWS_PROFILE",
+        label: "AWS プロファイル（任意）",
+        description: "named profile（~/.aws 構成）。値は環境変数 AWS_PROFILE で aws に渡す" },
+      { name: "--region", type: "string", subcommand: "pull-s3", envVar: "AWS_REGION",
+        label: "AWS リージョン（任意）",
+        description: "リージョン。値は環境変数 AWS_REGION で aws に渡す" },
+      // pull-gcs 認証（put-catalog-gcs と同名・同 envVar・CLOUDSDK 複写は buildPushEnv が担う）。
+      { name: "--gcp-credentials", type: "string", subcommand: "pull-gcs", envVar: "GOOGLE_APPLICATION_CREDENTIALS",
+        label: "GCP サービスアカウント鍵のパス（任意・無人用）",
+        description: "サービスアカウント鍵 JSON のファイルパス。env GOOGLE_APPLICATION_CREDENTIALS で受け、gcloud 用に CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE へも複写して無人化" },
+    ],
+    // dataset ブロックは宣言しない: これは gemba-adc の dataset ではない（gemba-share の
+    // 存在は spec/gemba-share が正本）。report-delete 型＝カタログに載らない fail-open 追加。
+  }));
+  process.exit(0);
+}
+
+// ── Contract version check: unsupported → stderr + exit 11 ──
+const announcedApi = process.env.IREPO_PLUGIN_API;
+if (arg0 !== "--plugin-healthcheck" && announcedApi && announcedApi !== PLUGIN_API) {
+  console.error(`${PLUGIN}: unsupported IREPO_PLUGIN_API=${announcedApi} (supported: ${PLUGIN_API})`);
+  process.exit(11);
+}
+
+// Promise.resolve() でモジュール評価の完了後に起動する（main は async でも本文の先頭は
+// 同期実行されるため、直接呼ぶと後方で const 宣言している backend が TDZ になる）。
+if (arg0 === "--plugin-healthcheck") {
+  Promise.resolve().then(healthcheck).then((ok) => process.exit(ok ? 0 : 1));
+} else {
+  Promise.resolve().then(main).catch((error) => {
+    console.error(`${PLUGIN}: ${error instanceof Error ? error.message : String(error)}`);
+    // usageError=2 / preconditionError=3 / それ以外の実行時失敗=1（verify 不達も main が 1 を立てる）。
+    process.exitCode = (error && error.exitCode) || 1;
+  });
+}
+
+// 使い方・入力検証の失敗（呼び出し側が引数/入力を直せば解決するもの）は exit 2 に分類する。
+function usageError(message) {
+  return Object.assign(new Error(message), { exitCode: 2 });
+}
+// CAS の precondition 失敗（412/PreconditionFailed）。専用コード 3 で 0/1/2 と機械判別可能にする。
+// メッセージ先頭を E_PRECONDITION にして stderr から grep できる形にする（spec §9.1）。
+function preconditionError(message) {
+  return Object.assign(new Error(`E_PRECONDITION: ${message}`), { exitCode: 3 });
+}
+// ストア状態起因の失敗（pull・exit 1）: DL 失敗・更新中再読後も sha256 不一致・取得目次の契約違反
+// （fail-closed / schema 核 / SI-1 読み手版 / SI-7）・verify 不達・目次に無い --dataset。呼び出し側が
+// 引数を直しても解決しない（＝exit 2 ではない）ものを 1 に分類する（spec §9.2.5 exit 表）。
+function storeError(message) {
+  return Object.assign(new Error(message), { exitCode: 1 });
+}
+
+async function healthcheck() {
+  // クラウド CLI は各サブコマンド専用 — severity でスコープを示す。必須依存はゼロ
+  // （local は Node fs のみ・pull-azure は内蔵 fetch）なので全体 ok は常に true。
+  const checks = [];
+  checks.push({
+    name: "aws-cli", ok: await commandExists("aws", ["--version"]), severity: "required-for:put-catalog-s3,push-snapshot-s3,pull-s3",
+    hint: "Install AWS CLI v2 to use put-catalog-s3 / push-snapshot-s3 / pull-s3",
+  });
+  checks.push({
+    name: "gcloud-cli", ok: await commandExists("gcloud", ["--version"]), severity: "required-for:put-catalog-gcs,push-snapshot-gcs,pull-gcs",
+    hint: "Install Google Cloud SDK (gcloud) to use put-catalog-gcs / push-snapshot-gcs / pull-gcs",
+  });
+  // az CLI は put-catalog-azure / push-snapshot-azure 専用（pull-azure は az でなく内蔵 fetch を使うため az を要さない）。
+  checks.push({
+    name: "az-cli", ok: await commandExists("az", ["--version"]), severity: "required-for:put-catalog-azure,push-snapshot-azure",
+    hint: "Install Azure CLI (az) to use put-catalog-azure / push-snapshot-azure",
+  });
+  checks.push({
+    name: "local-fs", ok: true, severity: "required-for:put-catalog-local,push-snapshot-local,pull-local",
+    hint: "No external CLI needed (uses Node fs)",
+  });
+  // pull-azure は素の HTTPS 直 GET（elastic の fetch 流儀・§7.2）。Node 内蔵 fetch（>=18）が要る。
+  const fetchOk = typeof fetch === "function";
+  checks.push({
+    name: "node-fetch", ok: fetchOk, severity: "required-for:pull-azure",
+    hint: fetchOk ? `Node ${process.version} built-in fetch available`
+      : "Node.js 18+ is required for pull-azure (uses built-in fetch)",
+  });
+  console.log(JSON.stringify({ ok: true, checks }));
+  return true;
+}
+
+// ── Entry ──────────────────────────────────────────────────────────────────
+
+async function main() {
+  const [command, ...rest] = process.argv.slice(2);
+  if (command === "put-catalog-s3") return putCatalog(parsePutArgs(rest, S3_BACKEND), S3_BACKEND);
+  if (command === "put-catalog-gcs") return putCatalog(parsePutArgs(rest, GCS_BACKEND), GCS_BACKEND);
+  if (command === "put-catalog-azure") return putCatalog(parsePutArgs(rest, AZURE_BACKEND), AZURE_BACKEND);
+  if (command === "put-catalog-local") return putCatalog(parsePutArgs(rest, LOCAL_BACKEND), LOCAL_BACKEND);
+  if (command === "push-snapshot-s3") return pushSnapshot(parsePushSnapshotArgs(rest, S3_BACKEND), S3_BACKEND);
+  if (command === "push-snapshot-gcs") return pushSnapshot(parsePushSnapshotArgs(rest, GCS_BACKEND), GCS_BACKEND);
+  if (command === "push-snapshot-azure") return pushSnapshot(parsePushSnapshotArgs(rest, AZURE_BACKEND), AZURE_BACKEND);
+  if (command === "push-snapshot-local") return pushSnapshot(parsePushSnapshotArgs(rest, LOCAL_BACKEND), LOCAL_BACKEND);
+  if (command === "pull-azure") return pullShare(parsePullArgs(rest, AZURE_PULL), AZURE_PULL);
+  if (command === "pull-s3") return pullShare(parsePullArgs(rest, S3_PULL), S3_PULL);
+  if (command === "pull-gcs") return pullShare(parsePullArgs(rest, GCS_PULL), GCS_PULL);
+  if (command === "pull-local") return pullShare(parsePullArgs(rest, LOCAL_PULL), LOCAL_PULL);
+  usage();
+  process.exitCode = command === undefined || command === "--help" || command === "-h" ? 0 : 2;
+}
+
+function usage() {
+  console.error(`Usage:
+  ${PLUGIN} put-catalog-s3    <file> --to s3://bucket/prefix [--key <relKey>] [options]
+      [--access-key-id <id> --secret-access-key <key> | --profile <name>] [--region <r>]
+  ${PLUGIN} put-catalog-gcs   <file> --to gs://bucket/prefix [--key <relKey>] [options]
+      [--gcp-credentials <service-account-key.json path>]
+  ${PLUGIN} put-catalog-azure <file> --to https://<account>.blob.core.windows.net/<container>/<prefix> [--key <relKey>] [options]
+      [--sas <token> | --connection-string <cs>]
+  ${PLUGIN} put-catalog-local <file> --to <folder|network-share path> [--key <relKey>] [options]
+  ${PLUGIN} push-snapshot-s3    <file.db[.gz]> --to s3://bucket/prefix --key datasets/<id>/snapshot-<compactUTC>.db[.gz] [options]
+      [--if-none-match] [--access-key-id <id> --secret-access-key <key> | --profile <name>] [--region <r>]
+  ${PLUGIN} push-snapshot-gcs   <file.db[.gz]> --to gs://bucket/prefix --key <snapshotKey> [options]
+      [--if-none-match] [--gcp-credentials <service-account-key.json path>]
+  ${PLUGIN} push-snapshot-azure <file.db[.gz]> --to https://<account>.blob.core.windows.net/<container>/<prefix> --key <snapshotKey> [options]
+      [--if-none-match] [--sas <token> | --connection-string <cs>]
+  ${PLUGIN} push-snapshot-local <file.db[.gz]> --to <folder|network-share path> --key <snapshotKey> [options]
+  ${PLUGIN} pull-azure --from https://<account>.blob.core.windows.net/<container>/<prefix> --out <dir> [options]
+      [--sas <token>]
+  ${PLUGIN} pull-s3    --from s3://bucket/prefix --out <dir> [options]
+      [--access-key-id <id> --secret-access-key <key> | --profile <name>] [--region <r>]
+  ${PLUGIN} pull-gcs   --from gs://bucket/prefix --out <dir> [options]
+      [--gcp-credentials <service-account-key.json path>]
+  ${PLUGIN} pull-local --from <folder|network-share path> --out <dir> [options]
+  put-catalog Options:
+      --key <relKey>       shareRoot 相対の書込キー（既定 share-catalog.json・spec §2 relKey 文法で検証）
+      --if-match <v>       CAS: 現在の版が一致するときだけ差し替え（S3 ETag/GCS generation/Azure ETag。local 非対応）
+      --if-none-match      CAS: 存在しない場合のみ作成（既存ありは exit 3）
+      --dry-run            検査だけ行い write receipt(dryRun:true)を返す（PUT しない）
+  push-snapshot Options:
+      --key <relKey>       shareRoot 相対の書込キー（必須・既定なし）。§2 snapshot 世代キー文法で検証
+                           （^datasets/ds-[0-9a-f]{12}/snapshot-<compactUTC>[-<suffix>].db[.gz]$）
+      --if-none-match      CAS: 存在しない場合のみ作成（世代キーは一意ゆえ推奨・既存ありは exit 3）
+      --if-match <v>       CAS: 現在の版が一致するときだけ差し替え（local 非対応）
+      --dry-run            検査だけ行い write receipt(dryRun:true)を返す（PUT しない）
+  pull Options:
+      --dataset <id>       取り戻す datasetId（^ds-[0-9a-f]{12}$・反復可・空=全件・目次に無い id は exit 1）
+      --since-generation <key>  基準 generation.key（反復可）。一致＋着地 .db 実在で snapshot DL skip（unchanged）
+      --dry-run            目次の取得・検証だけ行い read receipt(dryRun:true・wouldDownload)を返す（--out へ書かない）
+  put-catalog places EXACTLY ONE index-class object (<file>) at <--to>/<--key>. No bundle
+  layout, no receipts/, no manifests. SI-1 (no local absolute paths) and SI-5 (no secrets)
+  are enforced BEFORE writing — violations are rejected (exit 2) without touching the store.
+  push-snapshot places EXACTLY ONE binary snapshot (.db/.db.gz) at <--to>/<--key> (a generation
+  key) with the same clean single-PUT (no markers). --key is REQUIRED and validated against the
+  §2 snapshot key grammar; it does NOT advance the catalog generation (put-catalog does, by the
+  owner writer — #147). The receipt carries sourceDigest (sha256 of the uncompressed .db).
+  Precondition (CAS) failures exit 3 with E_PRECONDITION on stderr.
+  pull-* is read-only: it GETs share-catalog.json from <--from>, follows the relative keys the
+  catalog names (no store listing), verifies each object's sha256, and materializes them under
+  <--out> (relative structure preserved; .db.gz is gunzipped so only .db lands). It never calls
+  a store write/delete API. Catalog contract violations / sha256 mismatch after re-read exit 1.
+  Unattended creds are read from the flags above OR env and passed to the cloud CLI (or the
+  fetch URL query for pull-azure) via env, never argv.`);
+}
+
+// ── Tiny argv parser（upload/archive と同形・ゼロ依存）──────────────────────
+// spec: { "--name": "value" | "flag" }
+
+// repeatable（任意の Set）に含めたフラグは値を配列へ集約する（pull の --dataset / --since-generation）。
+// 既定は空＝従来どおり後勝ちの上書き（put-catalog の呼び出しは無変更）。
+function parseArgv(argv, spec, label, repeatable) {
+  const out = { _: [] };
+  const rep = repeatable || new Set();
+  for (let i = 0; i < argv.length; i++) {
+    let token = argv[i];
+    if (!token.startsWith("-")) {
+      out._.push(token);
+      continue;
+    }
+    let inlineValue;
+    const eq = token.indexOf("=");
+    if (eq > -1) {
+      inlineValue = token.slice(eq + 1);
+      token = token.slice(0, eq);
+    }
+    const kind = spec[token];
+    if (!kind) throw usageError(`Unknown option for ${label}: ${token}\nRun "${PLUGIN} --help".`);
+    const key = token.replace(/^--/, "");
+    if (kind === "flag") {
+      if (inlineValue !== undefined) throw usageError(`Option ${token} does not take a value.`);
+      out[key] = true;
+      continue;
+    }
+    const value = inlineValue !== undefined ? inlineValue : argv[++i];
+    if (value === undefined) throw usageError(`Option ${token} requires a value.`);
+    if (rep.has(token)) (out[key] || (out[key] = [])).push(value);
+    else out[key] = value;
+  }
+  return out;
+}
+
+// file:// URL を OS パスへ正規化（upload normalizeLocalDest と同基準）。
+function normalizeLocalDest(to) {
+  const t = String(to).trim();
+  if (!t.startsWith("file://")) return t;
+  const rest = t.slice("file://".length);
+  const i = rest.indexOf("/");
+  if (i === -1) return "//" + rest;            // ホストのみ → UNC host
+  const host = rest.slice(0, i);
+  const path = rest.slice(i);                   // 先頭 '/'
+  const isDrive = (s) => /^[A-Za-z]:/.test(s);
+  if (host === "" || host.toLowerCase() === "localhost") {
+    const inner = path.slice(1);
+    return isDrive(inner) ? inner : path;       // C:/... か /abs
+  }
+  return "//" + host + path;                     // UNC //server/share/...
+}
+
+function parsePutArgs(argv, backend) {
+  const label = backend.sub;
+  const spec = {
+    "--to": "value", "--key": "value",
+    "--if-match": "value", "--if-none-match": "flag", "--dry-run": "flag",
+  };
+  // 無人認証フラグ（upload/archive と同作法）。secret 値は argv に出さず env でクラウド CLI に渡す。
+  if (backend.store === "azure") { spec["--sas"] = "value"; spec["--connection-string"] = "value"; }
+  if (backend.store === "s3") {
+    spec["--access-key-id"] = "value"; spec["--secret-access-key"] = "value";
+    spec["--profile"] = "value"; spec["--region"] = "value";
+  }
+  if (backend.store === "gcs") { spec["--gcp-credentials"] = "value"; }
+  const o = parseArgv(argv, spec, label);
+  if (o._.length !== 1) throw usageError(`${label} requires exactly one <file> argument.`);
+
+  // --to（backend 別）
+  if (backend.store === "local") {
+    const to = normalizeLocalDest(o.to ?? "");
+    if (!to) throw usageError(`${label} requires --to <folder|network-share path>.`);
+    o.to = to;
+  } else {
+    if (!o.to) throw usageError(`${label} requires --to ${backend.scheme}…`);
+    if (!o.to.startsWith(backend.scheme)) throw usageError(`shareRoot must start with "${backend.scheme}".`);
+  }
+
+  // --key（relKey 文法で検証・既定 share-catalog.json）
+  const key = o.key ?? DEFAULT_KEY;
+  if (!REL_KEY_RE.test(key)) {
+    throw usageError(
+      `--key "${key}" is not a valid shareRoot relative key.\n` +
+      "Must be printable ASCII, no leading / or ~, no # ? % @ : \\, no .. segment (spec gemba-share §2).",
+    );
+  }
+
+  // CAS フラグの排他・local 制約
+  const ifMatch = o["if-match"];
+  const ifNoneMatch = Boolean(o["if-none-match"]);
+  if (ifMatch && ifNoneMatch) {
+    throw usageError(`${label}: --if-match and --if-none-match are mutually exclusive.`);
+  }
+  if (backend.store === "local" && ifMatch) {
+    throw usageError(
+      `${label}: --if-match is not supported for local/dir-share (no ETag). Use --if-none-match for create-only. ` +
+      "Overwrite on dir-share assumes a single writer (spec §6.3); share across multiple writers via an object store (s3/gcs/azure).",
+    );
+  }
+
+  const out = {
+    file: o._[0], to: o.to, key,
+    ifMatch: ifMatch || undefined, ifNoneMatch,
+    dryRun: Boolean(o["dry-run"]),
+  };
+  if (backend.store === "azure") {
+    out.sas = o.sas || process.env.AZURE_STORAGE_SAS_TOKEN || "";
+    out.connectionString = o["connection-string"] || process.env.AZURE_STORAGE_CONNECTION_STRING || "";
+  }
+  if (backend.store === "s3") Object.assign(out, s3CredsFromArgs(o, label));
+  if (backend.store === "gcs") out.gcpCredentials = o["gcp-credentials"] || "";
+  return out;
+}
+
+// push-snapshot-* の引数解析（#147）。put-catalog と同型（--to/CAS/認証は同基準・put backend を流用する）
+// が、以下だけ違う: (1) <file> はバイナリ snapshot（JSON 検証しない）。(2) --key は **必須・既定なし**
+// で、relKey 文法＋ snapshot 世代キー文法（SNAPSHOT_KEY_RE）で検証する（世代キー以外へ実体を置かせない）。
+function parsePushSnapshotArgs(argv, backend) {
+  // backend は put-catalog の PUT backend を流用する（put/stat/parse は共有）。ただし backend.sub は
+  // "put-catalog-*" なので、エラー文言用のラベルは push-snapshot-<store> を自前で組む（取り違え防止）。
+  const label = `push-snapshot-${backend.store}`;
+  const spec = {
+    "--to": "value", "--key": "value",
+    "--if-match": "value", "--if-none-match": "flag", "--dry-run": "flag",
+  };
+  if (backend.store === "azure") { spec["--sas"] = "value"; spec["--connection-string"] = "value"; }
+  if (backend.store === "s3") {
+    spec["--access-key-id"] = "value"; spec["--secret-access-key"] = "value";
+    spec["--profile"] = "value"; spec["--region"] = "value";
+  }
+  if (backend.store === "gcs") { spec["--gcp-credentials"] = "value"; }
+  const o = parseArgv(argv, spec, label);
+  if (o._.length !== 1) throw usageError(`${label} requires exactly one <file> argument (a binary .db or .db.gz snapshot).`);
+
+  // --to（backend 別・put-catalog と同基準）
+  if (backend.store === "local") {
+    const to = normalizeLocalDest(o.to ?? "");
+    if (!to) throw usageError(`${label} requires --to <folder|network-share path>.`);
+    o.to = to;
+  } else {
+    if (!o.to) throw usageError(`${label} requires --to ${backend.scheme}…`);
+    if (!o.to.startsWith(backend.scheme)) throw usageError(`shareRoot must start with "${backend.scheme}".`);
+  }
+
+  // --key は必須・既定なし（世代キーは呼び出し側が一意に発番する）。relKey 文法＋ snapshot 世代キー文法。
+  const key = o.key;
+  if (key === undefined) {
+    throw usageError(`${label} requires --key <relKey> (a snapshot generation key; no default). Recommended with --if-none-match.`);
+  }
+  if (!REL_KEY_RE.test(key)) {
+    throw usageError(
+      `--key "${key}" is not a valid shareRoot relative key.\n` +
+      "Must be printable ASCII, no leading / or ~, no # ? % @ : \\, no .. segment (spec gemba-share §2).",
+    );
+  }
+  if (!SNAPSHOT_KEY_RE.test(key)) {
+    throw usageError(
+      `--key "${key}" is not a valid snapshot generation key.\n` +
+      "Must match datasets/ds-<12hex>/snapshot-<compactUTC>[-<suffix>].db[.gz] " +
+      "(<compactUTC>=YYYYMMDDThhmmssZ, <suffix>=[0-9a-z]{1,16}) (spec gemba-share §2/§4.2).",
+    );
+  }
+
+  // CAS フラグの排他・local 制約（put-catalog と同一）。
+  const ifMatch = o["if-match"];
+  const ifNoneMatch = Boolean(o["if-none-match"]);
+  if (ifMatch && ifNoneMatch) {
+    throw usageError(`${label}: --if-match and --if-none-match are mutually exclusive.`);
+  }
+  if (backend.store === "local" && ifMatch) {
+    throw usageError(
+      `${label}: --if-match is not supported for local/dir-share (no ETag). Use --if-none-match for create-only. ` +
+      "Overwrite on dir-share assumes a single writer (spec §6.3); share across multiple writers via an object store (s3/gcs/azure).",
+    );
+  }
+
+  const out = {
+    file: o._[0], to: o.to, key,
+    ifMatch: ifMatch || undefined, ifNoneMatch,
+    dryRun: Boolean(o["dry-run"]),
+  };
+  if (backend.store === "azure") {
+    out.sas = o.sas || process.env.AZURE_STORAGE_SAS_TOKEN || "";
+    out.connectionString = o["connection-string"] || process.env.AZURE_STORAGE_CONNECTION_STRING || "";
+  }
+  if (backend.store === "s3") Object.assign(out, s3CredsFromArgs(o, label));
+  if (backend.store === "gcs") out.gcpCredentials = o["gcp-credentials"] || "";
+  return out;
+}
+
+// ── 認証（upload/archive の s3CredsFromArgs / buildPushEnv / parseAzureTo の流用）──
+
+/** s3 無人認証フラグの検証（IAM キーは対でのみ・--profile と排他）。 */
+function s3CredsFromArgs(o, label) {
+  let accessKeyId = o["access-key-id"] || "";
+  let secretAccessKey = o["secret-access-key"] || "";
+  // ホストが secret 衛生で --secret-access-key を env（AWS_SECRET_ACCESS_KEY）へ退避し argv から
+  // 除去する分離注入形（#144）を受け付ける: argv で片方だけ指定されたときに限り、欠けた側を env で
+  // 補完してから検査する。argv 両方なし＝従来どおり ambient 素通り（ここで env を拾うと ambient
+  // キー＋--profile の既存正常系が排他検査で落ちる逆回帰になる）。
+  if (Boolean(accessKeyId) !== Boolean(secretAccessKey)) {
+    if (!accessKeyId) accessKeyId = process.env.AWS_ACCESS_KEY_ID || "";
+    if (!secretAccessKey) secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY || "";
+  }
+  const profile = o.profile || "";
+  const region = o.region || "";
+  if (Boolean(accessKeyId) !== Boolean(secretAccessKey)) {
+    throw usageError(`${label}: --access-key-id and --secret-access-key must be provided together (the counterpart may also be supplied via AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY).`);
+  }
+  if ((accessKeyId || secretAccessKey) && profile) {
+    throw usageError(`${label}: use either IAM keys (--access-key-id/--secret-access-key) or --profile, not both.`);
+  }
+  return { accessKeyId, secretAccessKey, profile, region };
+}
+
+// secret（SAS / 接続文字列 / IAM キー）は argv に載せず、各クラウド CLI が読む環境変数で渡す。
+function buildPushEnv(options) {
+  const env = { ...process.env };
+  if (options.connectionString) env.AZURE_STORAGE_CONNECTION_STRING = options.connectionString;
+  else if (options.sas) env.AZURE_STORAGE_SAS_TOKEN = options.sas;
+  // Azure で明示 secret が無ければ az login 認証を使う（既定の account-key モードは
+  // RBAC-only / listKeys 無効アカウントで失敗するため）。s3/gcs は該当キー未設定なので素通り。
+  else if (options.store === "azure") env.AZURE_STORAGE_AUTH_MODE = "login";
+  if (options.accessKeyId) env.AWS_ACCESS_KEY_ID = options.accessKeyId;
+  if (options.secretAccessKey) env.AWS_SECRET_ACCESS_KEY = options.secretAccessKey;
+  if (options.profile) env.AWS_PROFILE = options.profile;
+  // AWS_REGION（CLI v2）と AWS_DEFAULT_REGION（v1/botocore 系）の双方を立てる。
+  if (options.region) { env.AWS_REGION = options.region; env.AWS_DEFAULT_REGION = options.region; }
+  // gcs 無人認証: GOOGLE_APPLICATION_CREDENTIALS は ADC 用で gcloud CLI 自体は読まない —
+  // gcloud が読む CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE へも複写する。
+  if (options.gcpCredentials) env.GOOGLE_APPLICATION_CREDENTIALS = options.gcpCredentials;
+  if (env.GOOGLE_APPLICATION_CREDENTIALS && !env.CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE) {
+    env.CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE = env.GOOGLE_APPLICATION_CREDENTIALS;
+  }
+  return env;
+}
+
+// https://<account>.blob.core.windows.net/<container>/<prefix...> を分解（upload と同基準）。
+function parseAzureTo(to) {
+  // SAS 付き URL を --to に貼られると secret が receipt・表示コマンドへ漏洩する。
+  // query/fragment を含む URL は拒否し、SAS は env-only の --sas で渡させる。
+  if (/[?#]/.test(to)) {
+    throw usageError('Azure --to must not contain a query string or SAS token (pass the SAS via --sas; --to is not secret).');
+  }
+  const m = /^https:\/\/([a-z0-9]+)\.blob\.core\.windows\.net\/([^/]+)(?:\/(.*))?$/i.exec(to);
+  if (!m) throw usageError('Azure shareRoot must be https://<account>.blob.core.windows.net/<container>/<prefix>.');
+  return { account: m[1], container: m[2], prefix: (m[3] || "").replace(/\/+$/, "") };
+}
+
+// ── 書込前検査（SI-1 portable / SI-5 secret）─────────────────────────────────
+// **正本は scripts/check-share.mjs（findPortabilityViolations / findSecretViolations）**。
+// ゼロ依存・単体コピー配布ゆえ import できないので同一判定をここに複製する（ヘッダ注記参照）。
+
+function walk(node, visit, path = "$") {
+  visit(node, path);
+  if (Array.isArray(node)) node.forEach((v, i) => walk(v, visit, `${path}[${i}]`));
+  else if (node && typeof node === "object") for (const [k, v] of Object.entries(node)) walk(v, visit, `${path}.${k}`);
+}
+
+// SI-1（spec §3.2/§10）: 全 string 値の再帰スキャンでローカル絶対パスを検出する。
+// check-share SH3 の中核（/・~・[A-Za-z]:[\\/]・@）に、UNC バックスラッシュ(\\server)を加えた
+// 保守的スーパーセット（説明文フィールドも除外せず全 string を対象にする）。
+function findPortabilityViolations(root) {
+  const hits = [];
+  walk(root, (n, p) => {
+    if (typeof n !== "string") return;
+    if (/^(\/|~|[A-Za-z]:[\\/]|\\\\)/.test(n)) hits.push(`${p}: abs-path(${n.slice(0, 24)})`);
+    if (n.includes("@")) hits.push(`${p}: at-char`);
+  });
+  return hits;
+}
+
+// SI-5（spec §5.3/§8.1/§10）: userinfo(user:pass@)・チケット URI・signed URL/SAS 断片・
+// credential/secretAccessKey キーを検出する（check-share SH4 findSecretViolations と同一）。
+function findSecretViolations(root) {
+  const hits = [];
+  walk(root, (n, p) => {
+    if (typeof n === "string") {
+      if (/:\/\/[^\s/@]+:[^\s/@]+@/.test(n)) hits.push(`${p}: userinfo`);
+      if (n.includes("gemba-share://")) hits.push(`${p}: ticket-uri`);
+      if (/(?:^|[?&])sig=|X-Amz-Signature=/i.test(n)) hits.push(`${p}: signed-url-fragment`);
+    } else if (n && typeof n === "object" && !Array.isArray(n)) {
+      for (const k of ["credential", "secretAccessKey"]) if (k in n) hits.push(`${p}.${k}: credential`);
+    }
+  });
+  return hits;
+}
+
+// ファイルを読み、目次系オブジェクトとして検証する。**種別は key で決める**（spec §9.1.2）:
+//   目次系 key（runs 以外）→ 単一 JSON オブジェクト専用・recordType∈{share-catalog,share-dataset}。
+//     単一 parse に失敗／配列・null なら exit 2（NDJSON フォールバックへは落とさない）。
+//   runs key（`runs/` 始まり or `.ndjson` 終わり）→ NDJSON（各行 share-run）。1 行だけの単一
+//     JSON オブジェクト（share-run 1 行）も可。
+//   どちらでもない → exit 2（put-catalog は目次系専用。実体は扱わない）
+// 全 record を SI-1/SI-5 スキャンにかけ、違反があれば exit 2（書かない）。
+function readAndValidate(filePath, key) {
+  let text;
+  try {
+    text = fs.readFileSync(filePath, "utf8");
+  } catch (error) {
+    if (error && error.code === "ENOENT") throw usageError(`file not found: ${filePath}`);
+    throw error;
+  }
+  const trimmed = text.trim();
+  if (trimmed === "") throw usageError(`file is empty: ${filePath}`);
+
+  const isRunsKey = /^runs\//.test(key) || /\.ndjson$/i.test(key);
+  const tryParse = (s) => { try { return { ok: true, value: JSON.parse(s) }; } catch { return { ok: false }; } };
+
+  let kind, records;
+  if (!isRunsKey) {
+    // 目次系 key は単一 JSON オブジェクト専用。ここで NDJSON へフォールバックすると、share-run の
+    // 複数行を既定キー share-catalog.json 等へ verified:true で書けてしまう（key を無視した種別
+    // 誤爆）。NDJSON は runs key 限定なので、非 runs key の parse 失敗は即 exit 2（spec §9.1.2）。
+    const single = tryParse(trimmed);
+    if (!single.ok || single.value === null || typeof single.value !== "object" || Array.isArray(single.value)) {
+      throw usageError(
+        `${filePath} is not a single JSON object.\n` +
+        "index-class keys accept only a single JSON object; NDJSON is limited to runs keys " +
+        "(key starting with 'runs/' or ending '.ndjson') (spec §9.1.2).",
+      );
+    }
+    kind = "json";
+    records = [single.value];
+  } else {
+    // runs key: 空行を除く全行が JSON オブジェクトとして parse できること（1 行だけでも可）。
+    const lines = trimmed.split(/\r?\n/).filter((l) => l.trim() !== "");
+    const parsed = [];
+    for (const line of lines) {
+      const r = tryParse(line);
+      if (!r.ok || r.value === null || typeof r.value !== "object" || Array.isArray(r.value)) {
+        throw usageError(
+          `${filePath} is not valid NDJSON (line failed to parse).\n` +
+          "runs keys accept newline-delimited JSON objects (share-run), one per line (spec §9.1.2).",
+        );
+      }
+      parsed.push(r.value);
+    }
+    if (parsed.length === 0) throw usageError(`file has no JSON records: ${filePath}`);
+    kind = "ndjson";
+    records = parsed;
+  }
+
+  // 版 fail-closed（§0.1-4）＋ recordType 検査（目次系専用）。
+  const wantTypes = kind === "json" ? ["share-catalog", "share-dataset"] : ["share-run"];
+  for (const rec of records) {
+    if (!Array.isArray(rec.shareApi) || !rec.shareApi.includes("1")) {
+      throw usageError(
+        `object does not declare shareApi:["1"] (version fail-closed, spec §0.1-4). got ${JSON.stringify(rec.shareApi)}`,
+      );
+    }
+    if (!wantTypes.includes(rec.recordType)) {
+      throw usageError(
+        `unexpected recordType ${JSON.stringify(rec.recordType)} for a ${kind === "json" ? "JSON" : "runs NDJSON"} object` +
+        ` (expected ${wantTypes.join(" | ")}). put-catalog is for index-class objects only.`,
+      );
+    }
+  }
+
+  // SI-1 portable / SI-5 secret（書込前強制）。全 record を対象に走査する。
+  const portability = records.flatMap((r) => findPortabilityViolations(r));
+  if (portability.length > 0) {
+    throw usageError(
+      `SI-1 violation: local absolute path(s) found in index object — refusing to write (spec §3.2/§10).\n` +
+      `  ${portability.slice(0, 5).join("\n  ")}`,
+    );
+  }
+  const secrets = records.flatMap((r) => findSecretViolations(r));
+  if (secrets.length > 0) {
+    throw usageError(
+      `SI-5 violation: secret material (credential / signed URL / ticket URI) found in index object — refusing to write (spec §5.3/§8.1/§10).\n` +
+      `  ${secrets.slice(0, 5).join("\n  ")}`,
+    );
+  }
+  return { kind, count: records.length };
+}
+
+// ── put-catalog 本体 ─────────────────────────────────────────────────────────
+//
+// フロー（spec §9.1・付加価値=SI 書込時強制）:
+//   file 読込＋種別判定＋SI-1/SI-5 検査 → sha256/bytes 前計算 → (--dry-run はここまで) →
+//   PUT（単一オブジェクト・CAS 条件付き）→ write receipt → verify（read-back・存在＋サイズ照合）→
+//   verify receipt。precondition 失敗は PUT 段で exit 3（write receipt 無し）・verify 不達は exit 1。
+
+async function putCatalog(options, backend) {
+  const filePath = resolve(expandHome(options.file));
+  // 書込前検査（違反は exit 2 でここで throw・store に触れない）。
+  readAndValidate(filePath, options.key);
+
+  const st = await fsp.stat(filePath).catch(() => null);
+  if (!st || !st.isFile()) throw usageError(`file not found or not a regular file: ${filePath}`);
+  const sha256 = await sha256File(filePath);
+  const bytes = st.size;
+
+  const jobId = `put-${timestampTag()}-${process.pid}`;
+  const target = backend.parse(options);
+  const shareRoot = backend.shareRoot(target);
+  const storeKind = backend.storeKind;
+  const env = buildPushEnv({ ...options, store: backend.store });
+
+  const baseExtras = () => ({ shareRoot, objectKey: options.key, sha256, bytes, storeKind });
+
+  if (options.dryRun) {
+    // 検査のみ通過。PUT しない＝dest 未作成。write receipt を 1 行だけ返す。
+    emitReceipt("write", jobId, 1, 0, false, { ...baseExtras(), dryRun: true });
+    return;
+  }
+
+  // ── PUT（単一オブジェクト・CAS）──
+  // precondition 失敗（412）は backend が preconditionError(exit 3) を投げる → 上位 catch で
+  // exit 3・write receipt 無し。それ以外の PUT 失敗は throw → exit 1（write receipt 無し）。
+  const cond = { ifMatch: options.ifMatch, ifNoneMatch: options.ifNoneMatch };
+  const putResult = await backend.put(target, options.key, filePath, cond, env);
+  const etag = putResult && putResult.etag ? putResult.etag : undefined;
+  emitReceipt("write", jobId, 1, 0, false, etag ? { ...baseExtras(), etag } : baseExtras());
+
+  // ── verify: read-back で存在＋サイズ照合（sha256 の読み戻し照合はしない・upload と同流儀）──
+  let verified = false;
+  let observed = null;
+  try {
+    observed = await backend.stat(target, options.key, env);
+  } catch (error) {
+    console.error(`verify read-back failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (observed && Number(observed.bytes) === bytes) {
+    verified = true;
+  } else {
+    console.error(`verify failed: ${options.key} (expected ${bytes} bytes, got ${observed ? observed.bytes : "missing"})`);
+  }
+  const verifyEtag = (observed && observed.etag) || etag;
+  emitReceipt("verify", jobId, 1, verified ? 0 : 1, verified,
+    verifyEtag ? { ...baseExtras(), etag: verifyEtag } : baseExtras());
+  if (!verified) process.exitCode = 1;
+}
+
+// ── push-snapshot 本体（#147・spec §4.2/§9.3）────────────────────────────────
+//
+// snapshot 実体（バイナリ .db / .db.gz）1 個を世代キー <to>/<key> へ **clean に単発 PUT** する。
+// archive push（bundle レイアウト・manifests/receipts マーカー）と違い裏方ファイルを一切作らない。
+// generation の前進（目次 share-catalog.json の再 PUT）は行わない — それは put-catalog で owner が行う
+// （§6.2.2・#147）。backend の put/stat は put-catalog と共有する（バイナリでもそのまま通る）。
+//
+// フロー（put-catalog の鏡映・書込前検査だけバイナリ向けに差し替え）:
+//   validate（存在・非空・gzip マジック整合）→ sha256（転送物）＋ sourceDigest（.gz は非圧縮 .db の
+//   sha256・素の .db は sha256 と同値）→ (--dry-run はここまで) → PUT（単発・CAS）→ write receipt →
+//   verify（read-back サイズ照合）→ verify receipt。exit 0/1/2/3 は put-catalog と同一規約。
+
+async function pushSnapshot(options, backend) {
+  const filePath = resolve(expandHome(options.file));
+  // 書込前検査（バイナリ向け）: (a) 存在・非空 (b) キー文法（parse 済み）(c) .gz キー↔gzip マジック整合。
+  const st = await fsp.stat(filePath).catch(() => null);
+  if (!st) throw usageError(`file not found: ${filePath}`);
+  if (!st.isFile()) throw usageError(`not a regular file: ${filePath}`);
+  if (st.size === 0) throw usageError(`file is empty: ${filePath}`);
+
+  // .db/.db.gz の取り違え防止: .gz キーなのに gzip マジック(1f 8b)でない／逆＝非 .gz キーなのに gzip 内容。
+  const isGzKey = /\.gz$/i.test(options.key);
+  const looksGz = await fileLooksGzip(filePath);
+  if (isGzKey && !looksGz) {
+    throw usageError(`--key ends in .gz but ${filePath} is not gzip (missing 1f 8b magic). Refusing to push a mislabeled snapshot.`);
+  }
+  if (!isGzKey && looksGz) {
+    throw usageError(`${filePath} is gzip (1f 8b magic) but --key does not end in .gz. Refusing to push a mislabeled snapshot.`);
+  }
+
+  // sha256=転送物（PUT するバイト＝.gz なら圧縮後）。sourceDigest=非圧縮 .db の sha256（DC が
+  // generation.sourceDigest に転記）。.gz はストリーム gunzip→sha256（メモリ定数）・壊れた gz は exit 2。
+  const sha256 = await sha256File(filePath);
+  const bytes = st.size;
+  const sourceDigest = isGzKey ? await gunzipSha256(filePath) : sha256;
+
+  const jobId = `push-snapshot-${timestampTag()}-${process.pid}`;
+  const target = backend.parse(options);
+  const shareRoot = backend.shareRoot(target);
+  const storeKind = backend.storeKind;
+  const env = buildPushEnv({ ...options, store: backend.store });
+
+  const baseExtras = () => ({ shareRoot, objectKey: options.key, sha256, bytes, sourceDigest, storeKind });
+
+  if (options.dryRun) {
+    // 検査のみ通過。PUT しない＝dest 未作成。write receipt を 1 行だけ返す。
+    emitReceipt("write", jobId, 1, 0, false, { ...baseExtras(), dryRun: true });
+    return;
+  }
+
+  // ── PUT（単一オブジェクト・CAS・マーカー類を一切作らない）──
+  // precondition 失敗（412/409）は backend が preconditionError(exit 3) を投げる。それ以外の失敗は exit 1。
+  const cond = { ifMatch: options.ifMatch, ifNoneMatch: options.ifNoneMatch };
+  const putResult = await backend.put(target, options.key, filePath, cond, env);
+  const etag = putResult && putResult.etag ? putResult.etag : undefined;
+  emitReceipt("write", jobId, 1, 0, false, etag ? { ...baseExtras(), etag } : baseExtras());
+
+  // ── verify: read-back で存在＋サイズ照合（put-catalog と同流儀・sha256 読み戻し照合はしない）──
+  let verified = false;
+  let observed = null;
+  try {
+    observed = await backend.stat(target, options.key, env);
+  } catch (error) {
+    console.error(`verify read-back failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (observed && Number(observed.bytes) === bytes) {
+    verified = true;
+  } else {
+    console.error(`verify failed: ${options.key} (expected ${bytes} bytes, got ${observed ? observed.bytes : "missing"})`);
+  }
+  const verifyEtag = (observed && observed.etag) || etag;
+  emitReceipt("verify", jobId, 1, verified ? 0 : 1, verified,
+    verifyEtag ? { ...baseExtras(), etag: verifyEtag } : baseExtras());
+  if (!verified) process.exitCode = 1;
+}
+
+// snapshot ファイルの先頭 2 バイトが gzip マジック(1f 8b)かを見る（.db/.db.gz 取り違え防止・push-snapshot）。
+async function fileLooksGzip(path) {
+  const fh = await fsp.open(path, "r");
+  try {
+    const buf = Buffer.alloc(2);
+    const { bytesRead } = await fh.read(buf, 0, 2, 0);
+    return bytesRead >= 2 && buf[0] === 0x1f && buf[1] === 0x8b;
+  } finally {
+    await fh.close();
+  }
+}
+
+// .gz を node:zlib ストリームで gunzip しながら非圧縮バイトの sha256 を計算する（メモリ定数）。
+// 壊れた gz（展開失敗）は usageError(exit 2) に写像する（取り違え・破損の書込前拒否・push-snapshot）。
+function gunzipSha256(path) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const hash = createHash("sha256");
+    const rs = fs.createReadStream(path);
+    const gunzip = zlib.createGunzip();
+    rs.on("error", rejectPromise);
+    gunzip.on("error", (e) => rejectPromise(usageError(`--key ends in .gz but the file is not a valid gzip stream (gunzip failed: ${e.message}).`)));
+    gunzip.on("data", (chunk) => hash.update(chunk));
+    gunzip.on("end", () => resolvePromise(hash.digest("hex")));
+    rs.pipe(gunzip);
+  });
+}
+
+// ── pull（取り戻し・read-only・spec §9.2）────────────────────────────────────
+//
+// 目次 share-catalog.json を GET → 版 fail-closed ＋ schema 核検証 → scope（--dataset）→
+// SI-1 読み手版（dereference するキーだけ検証）→ unchanged 判定（--since-generation / index sha
+// キャッシュ）→ 選択 DL（1 オブジェクト＝1 GET・sha256 照合・.gz は展開）→ materialize（実体→
+// dataset.json→runs→**最後に目次**・§3.4 の鏡映）→ verify（read-back）。ストアへ write/delete は
+// 一切呼ばない。「更新中」（sha256 不一致）は RETRY_MS 待って目次から丸ごと再読（プロセス全体で1回）。
+//
+// 各 pull backend の面: store / scheme / sub / storeKind / parseFrom(o) / shareRootStr(t) /
+//   get(t, relKey, destTmp, env, options) … 1 オブジェクトを destTmp へ GET（notFound は e.notFound）
+
+const DATASET_ID_RE = /^ds-[0-9a-f]{12}$/;
+
+function parsePullArgs(argv, backend) {
+  const label = backend.sub;
+  const spec = {
+    "--from": "value", "--out": "value",
+    "--dataset": "value", "--since-generation": "value", "--dry-run": "flag",
+  };
+  // 認証フラグは put-catalog と同名・同 envVar（secret は argv でなく env / fetch URL query 経由）。
+  if (backend.store === "azure") spec["--sas"] = "value";
+  if (backend.store === "s3") {
+    spec["--access-key-id"] = "value"; spec["--secret-access-key"] = "value";
+    spec["--profile"] = "value"; spec["--region"] = "value";
+  }
+  if (backend.store === "gcs") spec["--gcp-credentials"] = "value";
+  // --dataset / --since-generation は反復可（配列へ集約）。
+  const o = parseArgv(argv, spec, label, new Set(["--dataset", "--since-generation"]));
+
+  // --from（shareRoot）/ --out（ローカル dir）。読み書き方向の構造的防止（archive pull 先例）:
+  // from は必ずリモート(scheme 一致)・out は必ずローカル(scheme 無し)。
+  if (backend.store === "local") {
+    const from = normalizeLocalDest(o.from ?? "");
+    if (!from) throw usageError(`${label} requires --from <folder|network-share path>.`);
+    o.from = from;
+  } else {
+    if (!o.from) throw usageError(`${label} requires --from ${backend.scheme}…`);
+    if (!o.from.startsWith(backend.scheme)) throw usageError(`shareRoot (--from) must start with "${backend.scheme}".`);
+  }
+  if (!o.out) throw usageError(`${label} requires --out <local-dir>.`);
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(o.out)) throw usageError(`${label}: --out must be a local directory (no scheme).`);
+  // Azure は [?#] 付き URL を拒否（SAS 混入防止・put-catalog と同基準）。
+  if (backend.store === "azure") parseAzureTo(o.from);
+
+  const datasets = o.dataset || [];
+  for (const id of datasets) {
+    if (!DATASET_ID_RE.test(id)) throw usageError(`--dataset "${id}" is not a valid datasetId (^ds-[0-9a-f]{12}$).`);
+  }
+  const sinceGenerations = o["since-generation"] || [];
+  for (const k of sinceGenerations) {
+    if (!REL_KEY_RE.test(k) || !/^datasets\//.test(k)) {
+      throw usageError(`--since-generation "${k}" must be a shareRoot relKey under datasets/ (spec §2/§9.2.2).`);
+    }
+  }
+
+  const out = { from: o.from, out: o.out, datasets, sinceGenerations, dryRun: Boolean(o["dry-run"]) };
+  if (backend.store === "azure") out.sas = o.sas || process.env.AZURE_STORAGE_SAS_TOKEN || "";
+  if (backend.store === "s3") Object.assign(out, s3CredsFromArgs(o, label));
+  if (backend.store === "gcs") out.gcpCredentials = o["gcp-credentials"] || "";
+  return out;
+}
+
+async function pullShare(options, backend) {
+  const jobId = `pull-${timestampTag()}-${process.pid}`;
+  const storeKind = backend.storeKind;
+  const target = backend.parseFrom(options);
+  const shareRoot = backend.shareRootStr(target);
+  const env = buildPushEnv({ ...options, store: backend.store });
+  const sourceRoot = backend.store === "local" ? target.root : null;
+
+  // ── dry-run: 目次だけ取得・検証し、--out へ一切書かず計画（wouldDownload）を read 相 1 行で返す ──
+  if (options.dryRun) {
+    const dir = await fsp.mkdtemp(join(tmpdir(), "irepo-share-pull-"));
+    const temps = new Set();
+    try {
+      const cat = await loadCatalog(backend, target, options, env, dir, temps);
+      const selected = selectDatasets(cat.obj, options.datasets);
+      for (const k of collectDereferencedKeys(selected, cat.obj)) {
+        assertReaderKeySafe(k, resolve(options.out), sourceRoot);
+      }
+      const datasets = selected.map((d) => ({
+        datasetId: d.datasetId, class: d.class,
+        ...(d.class === "snapshot" && d.generation
+          ? { generation: { key: d.generation.key, sha256: d.generation.sha256, snapshotAt: d.generation.snapshotAt } }
+          : {}),
+        wouldDownload: dereferencedKeysForDataset(d),
+      }));
+      emitReceipt("read", jobId, 0, 0, false, {
+        shareRoot, storeKind, out: resolve(options.out), dryRun: true, unchanged: false,
+        catalog: { sha256: cat.sha256, generatedAt: cat.obj.generatedAt, writerId: cat.obj.writerId },
+        datasets, runs: { months: monthsOf(cat.obj) },
+      });
+    } finally {
+      await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+    return;
+  }
+
+  const out = resolve(options.out);
+  await fsp.mkdir(out, { recursive: true });
+  const temps = new Set();
+  let reread = false;
+
+  // 1 回の取得試行（目次 GET から目次 materialize まで）。「更新中」は目次から丸ごと再読して 1 回だけ再試行。
+  async function attempt() {
+    // 直前の（更新中で中断した）試行の temp を掃除してから新しい目次で組み直す。
+    for (const t of temps) await fsp.rm(t, { force: true }).catch(() => {});
+    temps.clear();
+
+    // ① 目次 GET（既知キー・list 不使用）／② 版 fail-closed ＋ schema 核検証（loadCatalog 内）
+    const cat = await loadCatalog(backend, target, options, env, out, temps);
+    // ③ scope（--dataset。目次に無い id は exit 1）
+    const selected = selectDatasets(cat.obj, options.datasets);
+    // ④ SI-1 読み手版（dereference するキーだけ・違反は exit 1）
+    for (const k of collectDereferencedKeys(selected, cat.obj)) {
+      assertReaderKeySafe(k, out, sourceRoot);
+    }
+    // ⑤ unchanged 判定
+    const since = new Set(options.sinceGenerations || []);
+    const plan = selected.map((d) => planDataset(d, out, since));
+    const months = monthsOf(cat.obj);
+
+    let materialized = 0;
+    try {
+      // ⑥⑦ 実体（snapshot .db[.gz]）→ dataset.json → runs → 目次（最後）の順で DL・照合・原子配置。
+      for (const p of plan) {
+        if (p.class !== "snapshot" || !p.needEntity) continue;
+        const g = p.ds.generation;
+        const gzTmp = await fetchToTemp(backend, target, g.key, join(out, g.key), options, env, temps);
+        const gotSha = await sha256File(gzTmp);
+        // snapshot は generation.sha256 = **転送物（.gz）に対して**照合する（判断確定④・§4.3）。
+        if (gotSha !== g.sha256) throw updatingError(g.key, g.sha256, gotSha);
+        // 展開後 .db（landedKey）の rename 先も realpath 検査（.gz キーと同一ディレクトリだが多層防御）。
+        await assertContainedReal(out, p.landedDest, `SI-1(reader): key '${p.landedKey}'`);
+        await fsp.mkdir(dirname(p.landedDest), { recursive: true });
+        if (p.isGz) {
+          // .gz バイト照合後 node:zlib ストリーム展開 → .db のみ着地（.gz 非残置・DC 再水和期待）。
+          const dbTmp = tmpFor(p.landedDest); temps.add(dbTmp);
+          await gunzipFile(gzTmp, dbTmp);
+          await fsp.rename(dbTmp, p.landedDest); temps.delete(dbTmp);
+          await fsp.rm(gzTmp, { force: true }); temps.delete(gzTmp);
+        } else {
+          await fsp.rename(gzTmp, p.landedDest); temps.delete(gzTmp);
+        }
+        materialized++;
+      }
+      for (const p of plan) {
+        if (!p.needIndex) continue; // 着地済み sha 一致はキャッシュ扱いで skip
+        const tmp = await fetchToTemp(backend, target, p.ds.path, p.indexDest, options, env, temps);
+        const gotSha = await sha256File(tmp);
+        if (gotSha !== p.ds.sha256) throw updatingError(p.ds.path, p.ds.sha256, gotSha);
+        await fsp.rename(tmp, p.indexDest); temps.delete(tmp);
+        materialized++;
+      }
+      for (const m of months) {
+        // runs は sha 無し（§ receipt objects 側にはあるが目次には無い）ので常に GET し NDJSON 構造検証。
+        const key = `runs/${m}.ndjson`;
+        const dest = join(out, key);
+        const tmp = await fetchToTemp(backend, target, key, dest, options, env, temps);
+        const text = await fsp.readFile(tmp, "utf8");
+        if (!validateRunsNdjson(text)) throw updatingError(key, "valid share-run NDJSON", "malformed NDJSON");
+        await fsp.rename(tmp, dest); temps.delete(tmp);
+        materialized++;
+      }
+      // ⑦ 最後に目次を確定（コミットマーカー・§3.4）。ここまで来て初めて share-catalog.json が着地する。
+      const catDest = join(out, "share-catalog.json");
+      await assertContainedReal(out, catDest, "SI-1(reader): key 'share-catalog.json'");
+      await fsp.rename(cat.tmp, catDest); temps.delete(cat.tmp);
+      materialized++;
+    } catch (e) {
+      if (e && e.updating) {
+        if (!reread) {
+          reread = true;
+          console.error(`${PLUGIN}: object appears to be updating (${e.updatingKey}); re-reading catalog after ${PULL_RETRY_MS}ms (spec §3.4/§7.3).`);
+          await sleep(PULL_RETRY_MS);
+          return attempt();
+        }
+        throw storeError(
+          `sha256 mismatch after re-read: ${e.updatingKey} (expected ${e.expected}, got ${e.actual}). ` +
+          "aborting without writing share-catalog.json (spec §3.4/§7.3).",
+        );
+      }
+      throw e;
+    }
+    return { cat, plan, months, materialized };
+  }
+
+  let result;
+  try {
+    result = await attempt();
+  } finally {
+    // *.tmp-* を残さない（原子性・smoke j）。rename 済みは既に temps から外れている。
+    for (const t of temps) await fsp.rm(t, { force: true }).catch(() => {});
+    temps.clear();
+  }
+
+  // トップ unchanged: scope 内に snapshot が 1 つ以上あり全て unchanged なら true（§3.4-⑤）。
+  const snaps = result.plan.filter((p) => p.class === "snapshot");
+  const topUnchanged = snaps.length > 0 && snaps.every((p) => p.unchanged);
+  const baseExtras = {
+    shareRoot, storeKind, out, unchanged: topUnchanged,
+    catalog: { sha256: result.cat.sha256, generatedAt: result.cat.obj.generatedAt, writerId: result.cat.obj.writerId },
+    datasets: result.plan.map(datasetReceiptEntry),
+    runs: { months: result.months },
+  };
+
+  // read 相（materialize 完了・verified:false）→ verify 相（read-back 後・verified:true）の 2 相。
+  emitReceipt("read", jobId, result.materialized, 0, false, baseExtras);
+  const problems = await verifyReadBack(result.plan);
+  const verified = problems.length === 0;
+  if (!verified) for (const m of problems) console.error(`${PLUGIN}: verify failed: ${m}`);
+  emitReceipt("verify", jobId, result.materialized, verified ? 0 : problems.length, verified, baseExtras);
+  if (!verified) process.exitCode = 1;
+}
+
+// 目次 share-catalog.json を dir 直下の temp へ GET し、parse ＋ 版 fail-closed ＋ schema 核検証する。
+// 目次は commit marker（§3.4）ゆえ、正常フローでは呼び出し側が最後にこの temp を rename して確定する。
+async function loadCatalog(backend, target, options, env, dir, temps) {
+  await fsp.mkdir(dir, { recursive: true });
+  const finalName = join(dir, "share-catalog.json");
+  const tmp = tmpFor(finalName);
+  temps.add(tmp);
+  try {
+    await backend.get(target, "share-catalog.json", tmp, env, options);
+  } catch (e) {
+    if (e && e.notFound) throw storeError("share-catalog.json not found in shareRoot (spec §7.1 — known key missing).");
+    throw storeError(`failed to GET share-catalog.json: ${scrubMsg(e && e.message)}`);
+  }
+  const text = await fsp.readFile(tmp, "utf8");
+  let obj;
+  try { obj = JSON.parse(text); } catch { throw storeError("share-catalog.json is not valid JSON (contract violation §3/§9.3)."); }
+  validateShareCatalog(obj);
+  const sha256 = await sha256File(tmp);
+  return { tmp, obj, sha256 };
+}
+
+// schema 核検証（§9.2.3-②）: 版 fail-closed（shareApi "1"）・recordType=share-catalog・writerId 必須（SI-7）・
+// datasets[]・runs.months(^\d{4}-\d{2}$)・エントリ核（datasetId/class 閉語彙/path/sha256）・snapshot なら
+// generation{key,sha256,bytes}。未知フィールド/語彙は stderr 警告のみ（fail-open）。取得目次への SI-1/SI-5
+// 全文字列スキャン（put の findPortabilityViolations/findSecretViolations）は掛けない（読み手は自分が
+// dereference するキーだけを assertReaderKeySafe で検証する・過剰拒否回避・§9.2.3）。
+function validateShareCatalog(cat) {
+  const warn = (m) => console.error(`${PLUGIN}: warning: ${m} (fail-open・spec §0.1/§9.2)`);
+  if (!cat || typeof cat !== "object" || Array.isArray(cat)) throw storeError("share-catalog.json is not a JSON object.");
+  if (!Array.isArray(cat.shareApi) || !cat.shareApi.includes("1")) {
+    throw storeError(`share-catalog does not declare shareApi:["1"] (version fail-closed §0.1/§9.3). got ${JSON.stringify(cat.shareApi)}`);
+  }
+  if (cat.recordType !== "share-catalog") {
+    throw storeError(`unexpected recordType ${JSON.stringify(cat.recordType)} for share-catalog.json (expected "share-catalog").`);
+  }
+  if (typeof cat.writerId !== "string" || !/^w-[0-9a-f]{8,}$/.test(cat.writerId)) {
+    throw storeError(`missing/invalid writerId in share-catalog (SI-7・§6.3). got ${JSON.stringify(cat.writerId)}`);
+  }
+  if (!Array.isArray(cat.datasets)) throw storeError("share-catalog.datasets must be an array.");
+  // runs は schema 核（share-catalog.schema.json が runs{shardPattern, months} を required にしている）。
+  // 欠落・months 非配列は「壊れた目次」として fail-closed で exit 1（旧実装の silent skip をやめる）。
+  // fail-open（§0.1）は**未知フィールドの寛容化**の話であって、必須構造そのものの欠落には適用しない。
+  // months が空配列 [] は「シャード無し」を意味する正常値。
+  if (cat.runs == null || typeof cat.runs !== "object" || Array.isArray(cat.runs)) {
+    throw storeError(`share-catalog.runs is missing or not an object (schema 核 required {shardPattern, months}・§9.2.3). got ${JSON.stringify(cat.runs)}`);
+  }
+  if (cat.runs.shardPattern !== "runs/<YYYY-MM>.ndjson") warn(`unexpected runs.shardPattern ${JSON.stringify(cat.runs.shardPattern)}`);
+  if (!Array.isArray(cat.runs.months)) {
+    throw storeError(`share-catalog.runs.months must be an array (schema 核・§9.2.3). got ${JSON.stringify(cat.runs.months)}`);
+  }
+  for (const m of cat.runs.months) if (!/^\d{4}-\d{2}$/.test(m)) throw storeError(`runs.months entry is not YYYY-MM: ${JSON.stringify(m)}`);
+  for (const d of cat.datasets) {
+    if (!d || typeof d !== "object" || Array.isArray(d)) throw storeError("datasets[] entry is not an object.");
+    if (typeof d.datasetId !== "string") throw storeError("datasets[] entry missing datasetId.");
+    if (d.class !== "snapshot" && d.class !== "bundle") {
+      throw storeError(`dataset ${d.datasetId} class not in {snapshot,bundle}: ${JSON.stringify(d.class)}`);
+    }
+    if (typeof d.path !== "string" || typeof d.sha256 !== "string") {
+      throw storeError(`dataset ${d.datasetId} missing path/sha256.`);
+    }
+    if (d.class === "snapshot") {
+      const g = d.generation;
+      if (!g || typeof g !== "object" || typeof g.key !== "string" || typeof g.sha256 !== "string" || typeof g.bytes !== "number") {
+        throw storeError(`snapshot dataset ${d.datasetId} missing generation{key,sha256,bytes} (§4.2).`);
+      }
+    }
+  }
+}
+
+// SI-1 読み手版（§9.2.3-④）: dereference する 1 キーに (a) REL_KEY_RE 一致 (b) 絶対 URL/先頭 /・.. 拒否
+// (c) join(out,key) 後の out containment。pull-local は source 側 join(shareRoot,key) containment も。
+// 違反は exit 1（ストア汚染・引数で直らない）。
+function assertReaderKeySafe(key, out, sourceRoot) {
+  if (typeof key !== "string" || !REL_KEY_RE.test(key)) {
+    throw storeError(`SI-1(reader): catalog names an invalid shareRoot relative key: ${JSON.stringify(key)} (spec §3.2/§9.2.3).`);
+  }
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(key) || key.startsWith("/") || /(^|\/)\.\.(\/|$)/.test(key)) {
+    throw storeError(`SI-1(reader): catalog key escapes shareRoot: ${key} (spec §3.2/§9.2.3).`);
+  }
+  assertContained(out, join(out, key), `SI-1(reader): key '${key}'`);
+  if (sourceRoot != null) assertContained(sourceRoot, join(sourceRoot, key), `SI-1(reader): source key '${key}'`);
+}
+
+function assertContained(root, dest, what) {
+  const rel = relative(root, resolve(dest));
+  if (rel !== "" && (rel.startsWith("..") || isAbsolute(rel))) {
+    throw storeError(`${what} escapes ${root} (${dest}).`);
+  }
+}
+
+// SI-1 読み手版（realpath・§9.2.3-④/§10 SI-1）: assertContained の resolve/relative は字句比較だけで
+// symlink を辿らないため、これだけでは containment を迂回できる — --out 配下に外側を指す symlink
+// ディレクトリ（例 out/datasets → /tmp/elsewhere）が仕込まれていると、字句上は out 配下でも実体は
+// 外側へ書ける（pull-local は shareRoot 側の symlink で外側「読み」も成立する）。そこで書込・コピー・
+// temp→rename の直前に realpath ベースで検査する: target の「存在する最深の祖先」を realpath で解決し
+// （＝symlink を辿った実パス）、そこへ未作成の tail を字句連結した実効パスが base の realpath 配下に
+// あることを relative で確認する。字句検査（assertContained/assertReaderKeySafe）と多層で併用する。
+// 違反は exit 1（ストア汚染・引数で直らない・§9.2.5）。
+async function assertContainedReal(baseDir, targetPath, what) {
+  const baseReal = await fsp.realpath(baseDir); // base は必ず存在する（呼び出し前に mkdir 済み）
+  const target = resolve(targetPath);
+  // target 自体は未作成でよい。親を辿って「存在する最深の祖先」を見つけ、その realpath を取る。
+  let existing = target;
+  const tail = [];
+  for (;;) {
+    try { await fsp.stat(existing); break; } catch {
+      const parent = dirname(existing);
+      if (parent === existing) break; // ルート到達（通常あり得ない）
+      tail.unshift(basename(existing));
+      existing = parent;
+    }
+  }
+  const anchorReal = await fsp.realpath(existing);
+  const resolved = tail.length ? join(anchorReal, ...tail) : anchorReal;
+  const rel = relative(baseReal, resolved);
+  if (rel !== "" && (rel.startsWith("..") || isAbsolute(rel))) {
+    throw storeError(`${what} escapes ${baseDir} via symlink (realpath ${resolved}).`);
+  }
+}
+
+function selectDatasets(cat, ids) {
+  const all = Array.isArray(cat.datasets) ? cat.datasets : [];
+  if (!ids || ids.length === 0) return all;
+  const byId = new Map(all.map((d) => [d.datasetId, d]));
+  const sel = [];
+  for (const id of ids) {
+    const d = byId.get(id);
+    if (!d) throw storeError(`--dataset ${id} is not present in share-catalog.json (spec §9.2.5).`);
+    sel.push(d);
+  }
+  return sel;
+}
+
+function monthsOf(cat) {
+  return cat.runs && Array.isArray(cat.runs.months) ? cat.runs.months.slice() : [];
+}
+
+// SI-1 読み手版で検証する「dereference する全キー」（§9.2.3-④）: path・generation.key・
+// lastBatch.manifestKey・runs 導出キー。
+function collectDereferencedKeys(selected, cat) {
+  const keys = [];
+  for (const d of selected) {
+    if (typeof d.path === "string") keys.push(d.path);
+    if (d.class === "snapshot" && d.generation && typeof d.generation.key === "string") keys.push(d.generation.key);
+    if (d.class === "bundle" && d.lastBatch && typeof d.lastBatch.manifestKey === "string") keys.push(d.lastBatch.manifestKey);
+  }
+  for (const m of monthsOf(cat)) keys.push(`runs/${m}.ndjson`);
+  return keys;
+}
+
+function dereferencedKeysForDataset(d) {
+  const keys = [];
+  if (typeof d.path === "string") keys.push(d.path);
+  if (d.class === "snapshot" && d.generation && typeof d.generation.key === "string") keys.push(d.generation.key);
+  if (d.class === "bundle" && d.lastBatch && typeof d.lastBatch.manifestKey === "string") keys.push(d.lastBatch.manifestKey);
+  return keys;
+}
+
+// 各データセットの DL 要否と着地先を先に決める（§9.2.3-⑤ unchanged 判定）。
+function planDataset(d, out, since) {
+  const p = { ds: d, class: d.class, datasetId: d.datasetId };
+  p.indexDest = join(out, d.path);
+  // index（dataset.json）は着地済み sha256 が目次記載と一致すれば DL skip（キャッシュ）。
+  p.needIndex = !cacheHit(p.indexDest, d.sha256);
+  if (d.class === "snapshot" && d.generation) {
+    const g = d.generation;
+    p.isGz = /\.gz$/i.test(g.key);
+    p.landedKey = p.isGz ? g.key.replace(/\.gz$/i, "") : g.key;
+    p.landedDest = join(out, p.landedKey);
+    // generation.key が --since-generation と文字列一致 ＋ 着地 .db 実在 → snapshot DL skip・unchanged。
+    // .db 不在なら安全側で DL する。
+    const landed = fs.existsSync(p.landedDest) && safeSize(p.landedDest) > 0;
+    p.unchanged = since.has(g.key) && landed;
+    p.needEntity = !p.unchanged;
+  } else {
+    // bundle は実体を materialize しない（landedPath=dataset.json・receipt に note）。
+    p.isGz = false;
+    p.landedDest = p.indexDest;
+    p.unchanged = false;
+    p.needEntity = false;
+  }
+  return p;
+}
+
+function datasetReceiptEntry(p) {
+  const d = p.ds;
+  if (p.class === "snapshot" && d.generation) {
+    const g = d.generation;
+    return {
+      datasetId: d.datasetId, class: "snapshot",
+      generation: { key: g.key, sha256: g.sha256, snapshotAt: g.snapshotAt },
+      landedPath: p.landedDest, bytes: g.bytes, unchanged: p.unchanged,
+    };
+  }
+  // bundle: 実体は materialize せず、landedPath は dataset.json・note で明示（§ receipt）。
+  return { datasetId: d.datasetId, class: d.class, landedPath: p.indexDest, note: "bundle-not-materialized", unchanged: false };
+}
+
+// verify 相（read-back・§9.2.3-⑧）: index=sha256 再計算一致・snapshot=.db 実在+size>0＋sourceDigest
+// あれば展開後 .db の sha256 一致。問題の列を返す（空＝verified:true）。
+async function verifyReadBack(plan) {
+  const problems = [];
+  for (const p of plan) {
+    if (!fs.existsSync(p.indexDest)) { problems.push(`dataset.json missing: ${p.indexDest}`); continue; }
+    if (await sha256File(p.indexDest) !== p.ds.sha256) problems.push(`dataset.json sha256 mismatch: ${p.indexDest}`);
+    if (p.class === "snapshot" && p.ds.generation) {
+      const s = await fsp.stat(p.landedDest).catch(() => null);
+      if (!s || s.size <= 0) { problems.push(`snapshot .db missing/empty: ${p.landedDest}`); continue; }
+      const src = p.ds.generation.sourceDigest;
+      if (src && await sha256File(p.landedDest) !== src) problems.push(`snapshot .db sourceDigest mismatch: ${p.landedDest}`);
+    }
+  }
+  return problems;
+}
+
+// runs シャードの NDJSON 構造検証（§9.2.3）: 空でない全行が JSON オブジェクトで parse でき、
+// 各行 shareApi ["1"]（版 fail-closed）・recordType share-run であること。空シャードは許容。
+function validateRunsNdjson(text) {
+  const lines = String(text).split(/\r?\n/).filter((l) => l.trim() !== "");
+  for (const line of lines) {
+    let o;
+    try { o = JSON.parse(line); } catch { return false; }
+    if (!o || typeof o !== "object" || Array.isArray(o)) return false;
+    if (!Array.isArray(o.shareApi) || !o.shareApi.includes("1")) return false;
+    if (o.recordType !== "share-run") return false;
+  }
+  return true;
+}
+
+async function fetchToTemp(backend, target, key, finalDest, options, env, temps) {
+  // temp は dirname(finalDest) 直下に作る＝ここが最初の実 fs 書込。symlink 迂回を realpath で封じてから mkdir。
+  await assertContainedReal(resolve(options.out), finalDest, `SI-1(reader): key '${key}'`);
+  await fsp.mkdir(dirname(finalDest), { recursive: true });
+  const tmp = tmpFor(finalDest);
+  temps.add(tmp);
+  try {
+    await backend.get(target, key, tmp, env, options);
+  } catch (e) {
+    if (e && e.notFound) {
+      throw storeError(`object named by catalog not found in store: ${key} (spec §3.4 — catalog points at a missing object).`);
+    }
+    throw storeError(`failed to GET ${key}: ${scrubMsg(e && e.message)}`);
+  }
+  return tmp;
+}
+
+function tmpFor(dest) {
+  return `${dest}.tmp-${process.pid}-${Date.now()}-${randomBytes(4).toString("hex")}`;
+}
+
+// .gz を node:zlib ストリームで展開する（.db のみ着地・.gz 非残置・§4.3）。
+function gunzipFile(srcGz, destDb) {
+  return pipeline(fs.createReadStream(srcGz), zlib.createGunzip(), fs.createWriteStream(destDb));
+}
+
+function updatingError(key, expected, actual) {
+  return Object.assign(new Error(`updating: ${key}`), { updating: true, updatingKey: key, expected, actual });
+}
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+function cacheHit(dest, sha) {
+  try { return fs.existsSync(dest) && sha256FileSync(dest) === sha; } catch { return false; }
+}
+function sha256FileSync(path) { return createHash("sha256").update(fs.readFileSync(path)).digest("hex"); }
+function safeSize(path) { try { return fs.statSync(path).size; } catch { return 0; } }
+// SAS の先頭 ? は除去（fetch URL の query として自分で ? を付す）。secret はここ以外に出さない。
+function normalizeSas(sas) { return typeof sas === "string" ? sas.replace(/^\?/, "") : ""; }
+// エラー表示から secret を落とす: URL の query（SAS/sig 断片）を全消去し、userinfo をマスクする（§8.1/SI-5）。
+function dropQuery(u) { return String(u).replace(/\?.*$/s, ""); }
+function scrubMsg(s) { return String(s == null ? "" : s).replace(/(\/\/)[^/@\s]*@/g, "$1****@").replace(/\?\S*/g, "?<redacted>"); }
+function isNotFoundErr(error) {
+  const t = `${(error && error.stderr) || ""} ${(error && error.message) || ""}`;
+  return /NoSuchKey|NoSuchBucket|Not ?Found|\b404\b|does not exist|no url matched|no such object/i.test(t);
+}
+
+// ── pull backends（1 オブジェクト GET・read-only）──────────────────────────────
+
+const AZURE_PULL = {
+  store: "azure", scheme: "https://", sub: "pull-azure", storeKind: "azure-share",
+  parseFrom(o) {
+    const t = parseAzureTo(o.from); // [?#] は exit 2（SAS 混入防止）。{account,container,prefix}
+    t.base = t.prefix
+      ? `https://${t.account}.blob.core.windows.net/${t.container}/${t.prefix}`
+      : `https://${t.account}.blob.core.windows.net/${t.container}`;
+    return t;
+  },
+  shareRootStr(t) { return t.base; },
+  // 内蔵 fetch 直 GET（elastic の fetch 流儀・§7.2）。SAS は URL query に付す（先頭 ? 除去）・
+  // 未指定は匿名 GET。secret は receipt・エラーに出さない（表示は URL の query を落とす）。
+  async get(t, relKey, destTmp, _env, options) {
+    const url = joinUri(t.base, relKey);
+    const sas = normalizeSas(options && options.sas);
+    const full = sas ? `${url}?${sas}` : url;
+    let res;
+    try {
+      // redirect:"manual"＝3xx を自動追従しない（shareRoot 外への取得を封じる芽）。timeout＝無限待ち回避。
+      // エラーメッセージにも SAS を出さない（dropQuery/scrubMsg を通す・SI-5・§8.1）。
+      res = await fetch(full, { redirect: "manual", signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+    } catch (e) {
+      throw storeError(`GET ${dropQuery(url)} failed: ${scrubMsg(e && e.message)}`);
+    }
+    if (res.status === 404) { const e = new Error(`not found: ${relKey}`); e.notFound = true; throw e; }
+    // 3xx は「予期しないリダイレクト（shareRoot 外取得の芽）」として拒否（redirect:"manual" ゆえ res 側に出る）。
+    if (res.status >= 300 && res.status < 400) {
+      throw storeError(`GET ${dropQuery(url)} → unexpected redirect HTTP ${res.status} (shareRoot 外取得の芽・§7.1/§9.2）`);
+    }
+    if (!res.ok) throw storeError(`GET ${dropQuery(url)} → HTTP ${res.status}`);
+    if (res.body) await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(destTmp));
+    else await fsp.writeFile(destTmp, Buffer.from(await res.arrayBuffer()));
+  },
+};
+
+const S3_PULL = {
+  store: "s3", scheme: "s3://", sub: "pull-s3", storeKind: "s3-share",
+  parseFrom(o) {
+    const m = /^s3:\/\/([^/]+)(?:\/(.*))?$/.exec(String(o.from).replace(/\/+$/, ""));
+    if (!m) throw usageError(`unexpected S3 shareRoot: ${o.from}`);
+    return { bucket: m[1], prefix: m[2] || "" };
+  },
+  shareRootStr(t) { return t.prefix ? `s3://${t.bucket}/${t.prefix}` : `s3://${t.bucket}`; },
+  // 1 オブジェクト取得: aws s3api get-object（out へ書込 API は呼ばない）。
+  async get(t, relKey, destTmp, env) {
+    try {
+      await runCommand("aws",
+        ["s3api", "get-object", "--bucket", t.bucket, "--key", joinKey(t.prefix, relKey), destTmp],
+        { env, captureStdout: true, captureStderr: true });
+    } catch (e) { if (isNotFoundErr(e)) e.notFound = true; throw e; }
+  },
+};
+
+const GCS_PULL = {
+  store: "gcs", scheme: "gs://", sub: "pull-gcs", storeKind: "gcs-share",
+  parseFrom(o) { return { uri: String(o.from).replace(/\/+$/, "") }; },
+  shareRootStr(t) { return t.uri; },
+  // 1 オブジェクト取得: gcloud storage cp <uri> <dest>（rsync/再帰は使わない＝列挙不要）。
+  async get(t, relKey, destTmp, env) {
+    const uri = joinUri(t.uri, relKey);
+    try {
+      await runCommand("gcloud", ["storage", "cp", uri, destTmp], { env, captureStdout: true, captureStderr: true });
+    } catch (e) { if (isNotFoundErr(e)) e.notFound = true; throw e; }
+  },
+};
+
+const LOCAL_PULL = {
+  store: "local", scheme: "", sub: "pull-local", storeKind: "dir-share",
+  parseFrom(o) { return { root: resolve(normalizeLocalDest(o.from)) }; },
+  shareRootStr(t) { return t.root; },
+  async get(t, relKey, destTmp) {
+    const src = join(t.root, relKey);
+    assertContained(t.root, src, `pull-local: source key '${relKey}'`); // shareRoot 脱出防止（字句・多層防御）
+    // shareRoot 配下に外側を指す symlink が仕込まれても「外側読み」させない（realpath 検査・SI-1 読み手版）。
+    await assertContainedReal(t.root, src, `pull-local: source key '${relKey}'`);
+    const s = await fsp.stat(src).catch(() => null);
+    if (!s || !s.isFile()) { const e = new Error(`not found in shareRoot: ${relKey}`); e.notFound = true; throw e; }
+    await fsp.copyFile(src, destTmp);
+  },
+};
+
+// ── receipts（SCHEMA.md §6・sink なので provenance 非搭載）─────────────────
+
+function emitReceipt(phase, jobId, count, failedCount, verified, extras) {
+  process.stdout.write(JSON.stringify({
+    schemaVersion: "1.0", recordType: "receipt", plugin: PLUGIN,
+    producedBy: { plugin: PLUGIN, version: VERSION },
+    phase, jobId, count, failedCount, verified,
+    ...extras,
+  }) + "\n");
+}
+
+// ── backends（1 オブジェクト PUT + read-back verify）──────────────────────────
+//
+// 各 backend の面:
+//   store / scheme / sub / storeKind
+//   parse(options) … --to を解析した target を返す
+//   shareRoot(target) … receipt の shareRoot（正規 URI）
+//   objectUri(target, key) … 表示用の宛先 URI
+//   put(target, key, file, cond, env) … 1 オブジェクトを PUT（precondition 失敗は preconditionError）
+//   stat(target, key, env) … read-back の {bytes, etag?}
+
+// スキーム非依存のスラッシュ結合（s3:// / gs:// / https:// すべてに使える）。
+function joinUri(prefix, child) {
+  return `${prefix.replace(/\/+$/, "")}/${child.replace(/^\/+/, "")}`;
+}
+// s3api 用: bucket と分離した後の prefix と relKey を結合（先頭/末尾スラッシュを畳む）。
+function joinKey(prefix, key) {
+  const p = String(prefix || "").replace(/^\/+|\/+$/g, "");
+  return p ? `${p}/${key}` : key;
+}
+function stripQuotes(s) {
+  return typeof s === "string" ? s.replace(/^"+|"+$/g, "") : s;
+}
+
+const S3_BACKEND = {
+  store: "s3", scheme: "s3://", sub: "put-catalog-s3", storeKind: "s3-share",
+  parse(options) {
+    const m = /^s3:\/\/([^/]+)(?:\/(.*))?$/.exec(String(options.to).replace(/\/+$/, ""));
+    if (!m) throw usageError(`unexpected S3 shareRoot: ${options.to}`);
+    return { bucket: m[1], prefix: (m[2] || "") };
+  },
+  shareRoot(t) { return t.prefix ? `s3://${t.bucket}/${t.prefix}` : `s3://${t.bucket}`; },
+  objectUri(t, key) { return `s3://${t.bucket}/${joinKey(t.prefix, key)}`; },
+  async put(t, key, file, cond, env) {
+    const objKey = joinKey(t.prefix, key);
+    const args = ["s3api", "put-object", "--bucket", t.bucket, "--key", objKey,
+      "--body", file, "--output", "json"];
+    if (cond.ifNoneMatch) args.push("--if-none-match", "*");
+    else if (cond.ifMatch) args.push("--if-match", cond.ifMatch);
+    const r = await runCommandCas("aws", args, cond, env);
+    let etag;
+    try { etag = stripQuotes(JSON.parse(r.stdout || "{}").ETag); } catch { /* etag 取得失敗は非致命 */ }
+    return { etag };
+  },
+  async stat(t, key, env) {
+    const objKey = joinKey(t.prefix, key);
+    const r = await runCommand("aws",
+      ["s3api", "head-object", "--bucket", t.bucket, "--key", objKey, "--output", "json"],
+      { env, captureStdout: true });
+    const j = r.stdout.trim() ? JSON.parse(r.stdout) : {};
+    return { bytes: Number(j.ContentLength), etag: stripQuotes(j.ETag) };
+  },
+};
+
+const GCS_BACKEND = {
+  store: "gcs", scheme: "gs://", sub: "put-catalog-gcs", storeKind: "gcs-share",
+  parse(options) { return { uri: String(options.to).replace(/\/+$/, "") }; },
+  shareRoot(t) { return t.uri; },
+  objectUri(t, key) { return joinUri(t.uri, key); },
+  async put(t, key, file, cond, env) {
+    const uri = joinUri(t.uri, key);
+    const args = ["storage", "cp", file, uri];
+    // --if-none-match（新規のみ作成）は generation 0 に写像（spec §6.1 対応表）。
+    if (cond.ifNoneMatch) args.push("--if-generation-match", "0");
+    else if (cond.ifMatch) args.push("--if-generation-match", cond.ifMatch);
+    await runCommandCas("gcloud", args, cond, env);
+    // generation を etag 相当として取得（将来の --if-match 入力値）。
+    // 【TOCTOU 注記】この etag は cp 完了 **後** の objects describe で読むため best-effort である:
+    // cp→describe の間に他 writer が同キーを書くと、ここで返る generation は **他者の generation**
+    // になり得る（それを次回 --if-match に使うと lost update を招く）。CAS 前は目次を読み直すこと。
+    let etag;
+    try { etag = (await this.stat(t, key, env)).etag; } catch { /* 非致命 */ }
+    return { etag };
+  },
+  async stat(t, key, env) {
+    const uri = joinUri(t.uri, key);
+    const r = await runCommand("gcloud",
+      ["storage", "objects", "describe", uri, "--format=json"],
+      { env, captureStdout: true });
+    const j = r.stdout.trim() ? JSON.parse(r.stdout) : {};
+    return { bytes: Number(j.size), etag: j.generation != null ? String(j.generation) : undefined };
+  },
+};
+
+const AZURE_BACKEND = {
+  store: "azure", scheme: "https://", sub: "put-catalog-azure", storeKind: "azure-share",
+  parse(options) { return parseAzureTo(options.to); },
+  shareRoot(t) { return t.prefix ? `https://${t.account}.blob.core.windows.net/${t.container}/${t.prefix}` : `https://${t.account}.blob.core.windows.net/${t.container}`; },
+  objectUri(t, key) { return this.shareRoot(t) + "/" + key; },
+  blobName(t, key) { return t.prefix ? `${t.prefix}/${key}` : key; },
+  async put(t, key, file, cond, env) {
+    const name = this.blobName(t, key);
+    const args = ["storage", "blob", "upload", "--account-name", t.account,
+      "--container-name", t.container, "--name", name, "--file", file, "--output", "json"];
+    // 新規のみ作成は --if-none-match '*'（--overwrite は付けない）。差し替えは --overwrite（＋任意 --if-match）。
+    if (cond.ifNoneMatch) args.push("--if-none-match", "*");
+    else { args.push("--overwrite"); if (cond.ifMatch) args.push("--if-match", cond.ifMatch); }
+    // --if-none-match '*' 敗北は az では 409 BlobAlreadyExists で返る（412 ではない）。runCommandCas /
+    // isPreconditionFailure がこれを exit 3 へ写像する。実 Azure での文言確定は DC 切替時に実測（上記注記）。
+    const r = await runCommandCas("az", args, cond, env);
+    let etag;
+    try { etag = stripQuotes(JSON.parse(r.stdout || "{}").etag); } catch { /* 非致命 */ }
+    return { etag };
+  },
+  async stat(t, key, env) {
+    const name = this.blobName(t, key);
+    const r = await runCommand("az",
+      ["storage", "blob", "show", "--account-name", t.account, "--container-name", t.container,
+        "--name", name, "--output", "json"],
+      { env, captureStdout: true });
+    const j = r.stdout.trim() ? JSON.parse(r.stdout) : {};
+    const props = j.properties || {};
+    return { bytes: Number(props.contentLength), etag: stripQuotes(props.etag || j.etag) };
+  },
+};
+
+// put-catalog-local: 外部 CLI 不要・Node fs。--if-none-match のみ意味を持つ。
+// etag は無い（dir-share）。越境ガードは relKey 文法（.. / 先頭 / を禁止）で保証済みだが、
+// 結合後も --to 配下に収まることを path.relative で多層防御する（upload と同流儀）。
+//
+// 【原子化】目次はコミットマーカー意味論（spec §3.4）を担う — 目次が着地した瞬間に
+// 「その版が有効」と読み手（pull/ls）へ宣言する。ゆえに local backend は torn read（部分書き
+// された不完全な目次を並行 reader が読む）と TOCTOU（existsSync→copyFile の隙間で並行 writer が
+// 両方成功する）を許さず、**同一ディレクトリ temp に書き切ってから原子的に確定する**:
+//   - 通常 PUT（無条件上書き）: temp→fsp.rename（同一 FS 内で原子的置換・torn read 不可）。
+//   - --if-none-match: temp→fs.link（既存があれば EEXIST で失敗＝原子的な if-none-match。
+//     link 対象は書込済みの完成ファイルなので着地物は常に完全）。link は Windows でも動く。
+//     ハードリンク非対応 FS（SMB 等・ENOTSUP/EPERM/EXDEV/ENOSYS）では排他 create（open "wx" の
+//     O_EXCL）へフォールバックする — 存在検査の原子性は維持し、書込中の部分内容は §3.4 の
+//     sha256 照合（更新中→再読）で吸収する。詳細は exclusiveCreateLocal。
+// copyFile は最終パスへ直書きするため上記いずれも満たせない（部分書き・TOCTOU）ので使わない。
+// 【non-applicability】placement（i-repo-upload）の in-place 上書き規範は placement/1 固有であり、
+// 目次のコミットマーカー意味論を持たない実体ファイル向け — ここ（gemba-share 目次）には適用しない。
+const LOCAL_BACKEND = {
+  store: "local", scheme: "", sub: "put-catalog-local", storeKind: "dir-share",
+  parse(options) { return { root: resolve(normalizeLocalDest(options.to)) }; },
+  shareRoot(t) { return t.root; },
+  objectUri(t, key) { return join(t.root, key); },
+  destPath(t, key) {
+    const dest = join(t.root, key);
+    const rel = relative(t.root, resolve(dest));
+    if (rel !== "" && (rel.startsWith("..") || isAbsolute(rel))) {
+      throw usageError(`put-catalog-local: resolved key escapes --to (${dest}).`);
+    }
+    return dest;
+  },
+  async put(t, key, file, cond, _env) {
+    const dest = this.destPath(t, key);
+    await fsp.mkdir(dirname(dest), { recursive: true });
+    // 同一ディレクトリ temp（同一 FS を保証＝rename/link が原子的）。まず内容を書き切る。
+    const tmp = `${dest}.tmp-${process.pid}-${Date.now()}-${randomBytes(4).toString("hex")}`;
+    await fsp.copyFile(file, tmp);
+    try {
+      if (cond.ifNoneMatch) {
+        // 原子的 if-none-match: link は既存 dest があると EEXIST で失敗する（TOCTOU 無し）。
+        // link は着地物が完成ファイル（tmp は書込済み）ゆえ torn read も起こさない第一選択。
+        try {
+          await fsp.link(tmp, dest);
+        } catch (error) {
+          if (error && error.code === "EEXIST") {
+            throw preconditionError(`object already exists (--if-none-match): ${dest}`);
+          }
+          // SMB 等ハードリンク非対応 FS（spec §9.1.2 が明示的に許すネットワーク共有）では
+          // link が ENOTSUP/EPERM/EXDEV/ENOSYS で落ちる。ここで再 throw すると EEXIST でも成功でも
+          // ない exit 1 になり CAS 呼び出し側が「既存(3)/新規(0)」を誤判定するため、排他 create へ回す。
+          if (error && ["ENOTSUP", "EPERM", "EXDEV", "ENOSYS"].includes(error.code)) {
+            await exclusiveCreateLocal(dest, file);
+          } else {
+            throw error;
+          }
+        }
+      } else {
+        // 原子的置換: rename は同一 FS 内で原子的（目次の torn read を防ぐ）。
+        await fsp.rename(tmp, dest);
+      }
+    } finally {
+      // rename 成功時は tmp は消費済み（存在しない）。link 成功/失敗時と rename 失敗時は掃除する。
+      await fsp.rm(tmp, { force: true }).catch(() => {});
+    }
+    return { etag: undefined };
+  },
+  async stat(t, key, _env) {
+    const dest = this.destPath(t, key);
+    const s = await fsp.stat(dest).catch(() => null);
+    if (!s || !s.isFile()) return null;
+    return { bytes: s.size, etag: undefined };
+  },
+};
+
+// ハードリンク非対応 FS 向けの排他 create フォールバック（LOCAL_BACKEND.put が ENOTSUP 等で使う）。
+// O_EXCL（"wx"）は SMB/NTFS の CREATE_NEW にマップされ、存在検査は原子のまま（TOCTOU 無し）。
+// 存在すれば open 段階で EEXIST → preconditionError(exit 3)。link と違い直書きゆえ書込中は
+// dest に部分内容が見え得るが、読み手は spec §3.4 の sha256 照合で「更新中」扱い（再読）にする
+// 規範でこれを吸収する。書込失敗時は中途半端な dest を掃除する。
+// 本体は stream（pipeline）で流す: push-snapshot が数 GB の .db/.db.gz をこの経路
+// （dir-share の SMB/EXDEV/EPERM 典型）に通すため、全量メモリ読込は OOM リスク（#148 R1）。
+async function exclusiveCreateLocal(dest, srcFile) {
+  let handle;
+  try {
+    handle = await fsp.open(dest, "wx"); // 原子的な排他 create（既存なら EEXIST）。
+  } catch (error) {
+    if (error && error.code === "EEXIST") {
+      throw preconditionError(`object already exists (--if-none-match): ${dest}`);
+    }
+    throw error;
+  }
+  try {
+    // 定数メモリ: src を read stream で開き、排他 create 済み handle の write stream へ流す。
+    await pipeline(fs.createReadStream(srcFile), handle.createWriteStream());
+  } catch (error) {
+    await handle.close().catch(() => {});
+    await fsp.rm(dest, { force: true }).catch(() => {}); // 部分内容を残さない。
+    throw error;
+  }
+  await handle.close();
+}
+
+// ── 子プロセス（spec 構築は lib/spawn.js・spawn 部は upload runCommand の移植）──
+
+const INSTALL_HINTS = {
+  aws: "Install the AWS CLI v2 to use put-catalog-s3.",
+  gcloud: "Install the Google Cloud SDK (gcloud) to use put-catalog-gcs.",
+  az: "Install the Azure CLI (az) to use put-catalog-azure.",
+};
+
+function runCommand(command, args, options) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    let spec;
+    try {
+      // Windows では cmd.exe argv を明示構築し、メタ文字を含む引数は throw する（spawn.js 契約）。
+      spec = spawnSpec(command, args);
+    } catch (error) {
+      rejectPromise(error);
+      return;
+    }
+    const child = spawn(spec.bin, spec.argv, {
+      env: options.env,
+      ...spec.extra,
+      // 非 capture 時は子の stdout を我々の stderr(fd 2) へ逃がす — 転送進捗などの
+      // おしゃべりが stdout の機械可読 receipt を汚さないように。stderr は precondition 検知
+      // のため capture する（captureStderr）／しない場合は inherit。
+      stdio: ["inherit", options.captureStdout ? "pipe" : 2, options.captureStderr ? "pipe" : "inherit"],
+    });
+    let stdout = "";
+    let stderr = "";
+    if (options.captureStdout && child.stdout) {
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+    }
+    if (options.captureStderr && child.stderr) {
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+    }
+    child.on("error", (error) => {
+      if (error.code === "ENOENT") {
+        rejectPromise(new Error(
+          `Required command not found: ${command}\n` +
+          (INSTALL_HINTS[command] ?? `Make sure "${command}" is on PATH.`),
+        ));
+        return;
+      }
+      rejectPromise(error);
+    });
+    // "close"（"exit" でなく）: stdout パイプのドレイン完了後に発火する。
+    child.on("close", (code, signal) => {
+      if (options.captureStderr && stderr) process.stderr.write(stderr); // 捕捉した stderr も人へ見せる
+      if (signal) return rejectPromise(new Error(`${command} exited from signal ${signal}.`));
+      if ((code ?? 0) !== 0) {
+        const err = new Error(`${command} ${args.join(" ")} failed with exit code ${code}.\n${stderr.trim()}`);
+        err.stderr = stderr;
+        err.code = code;
+        return rejectPromise(err);
+      }
+      resolvePromise({ stdout, stderr });
+    });
+  });
+}
+
+// PUT 実行ラッパ: stderr を捕捉し、precondition 失敗（412/PreconditionFailed/409 等）を検出したら
+// preconditionError(exit 3) に変換する（store 横断のトークン一致・CAS リトライが機械判別する面）。
+//
+// **precondition→exit 3 への変換は CAS フラグ（--if-match / --if-none-match）を明示したときだけ行う**
+// （cond.ifMatch || cond.ifNoneMatch）。無条件 PUT（CAS フラグ無し）の失敗に precondition 判定を
+// かけると、stderr にたまたま 412/409/"is not met" 等を含む無関係なエラー（別レイヤの HTTP 応答・
+// 権限エラーの巻き添えなど）が exit 3 へ誤分類され、呼び出し側の CAS read-merge-write リトライを
+// 誤って誘発しかねない。無条件 PUT の失敗は常に通常エラー（exit 1）に落とす。
+async function runCommandCas(command, args, cond, env) {
+  try {
+    return await runCommand(command, args, { env, captureStdout: true, captureStderr: true });
+  } catch (error) {
+    const casRequested = Boolean((cond && cond.ifMatch) || (cond && cond.ifNoneMatch));
+    if (casRequested && isPreconditionFailure(error)) {
+      throw preconditionError(`${command} conditional write rejected (CAS precondition failed).`);
+    }
+    throw error;
+  }
+}
+
+// store 別の precondition 失敗メッセージを保守的に判定する:
+//   S3    … "PreconditionFailed" / "At least one of the pre-conditions you specified did not hold" / 412
+//   GCS   … "pre-condition" / "conditionNotMet" / 412 / "conditional request failed"
+//   Azure … --if-match 敗北 = "ConditionNotMet" / "target condition ... is not met" / 412。
+//           ただし **--if-none-match（create-only）敗北は 409 BlobAlreadyExists
+//           （"The specified blob already exists"）であって 412 ではない** — az が If-None-Match:'*' の
+//           衝突をこの形で返すため、409 / BlobAlreadyExists / "already exists" も precondition と判定する
+//           （これを拾わないと create-only 衝突が通常エラー exit 1 に落ちて CAS 判別が壊れる）。
+// 注意: 実 Azure（および S3/GCS）への転送は本開発環境では実測不可（クラウド CLI/資格情報が無い）。
+// 上記トークンは各 vendor CLI のエラー文言の文献・過去実装に基づく保守的スーパーセットであり、
+// **DC 切替時に実 Azure で create-only 衝突の stderr 文言を実測して確定すること**（回帰の恐れ）。
+function isPreconditionFailure(error) {
+  const t = `${(error && error.stderr) || ""} ${(error && error.message) || ""}`;
+  return /pre-?condition|conditionnotmet|blobalreadyexists|already exists|\b409\b|\b412\b|conditional request failed|condition specified using http conditional header|is not met/i.test(t);
+}
+
+function commandExists(command, args) {
+  return runCommand(command, args, { env: process.env, captureStdout: true })
+    .then(() => true)
+    .catch(() => false);
+}
+
+// ── small helpers ───────────────────────────────────────────────────────────
+
+/** sha256 をストリームで逐次計算する（大きな NDJSON でもメモリ一定）。 */
+function sha256File(path) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const hash = createHash("sha256");
+    const stream = fs.createReadStream(path);
+    stream.on("error", rejectPromise);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("end", () => resolvePromise(hash.digest("hex")));
+  });
+}
+
+function expandHome(value) {
+  if (value === "~") return homedir();
+  if (value.startsWith(`~${sep}`) || value.startsWith("~/")) return join(homedir(), value.slice(2));
+  return value;
+}
+
+function timestampTag(date = new Date()) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}T` +
+    `${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
