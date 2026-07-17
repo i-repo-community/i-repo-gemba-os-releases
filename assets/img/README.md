@@ -6,7 +6,6 @@
 - `screen-overview.png`    … 概要（ダッシュボード）
 - `screen-connections.png` … 接続先テンプレート
 - `screen-flows.png`       … フロー作成
-- `screen-runs.png`        … 実行状況
 - `screen-reports.png`     … データ確認
 - `screen-cleanup.png`     … クリーンアップ設定
 - `screen-gemba.png`       … 現場蓄積データ
