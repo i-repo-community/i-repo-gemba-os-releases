@@ -82,7 +82,46 @@
  *   i-repo share push-snapshot-gcs   <file.db[.gz]> --to gs://bucket/prefix --key … [options]
  *   i-repo share push-snapshot-azure <file.db[.gz]> --to https://<acct>.blob.core.windows.net/<container>/<p> --key … [options]
  *   i-repo share push-snapshot-local <file.db[.gz]> --to <folder|network-share> --key … [options]
+ *   i-repo share issue-ticket-s3    --to s3://bucket/prefix --endpoint <url> --dataset ds-… --issued-to <id> --expires <n|ISO> [options]
+ *   i-repo share issue-ticket-gcs   --to gs://bucket/prefix --endpoint … --reader-service-account <email> [options]
+ *   i-repo share issue-ticket-azure --to https://<acct>.blob.core.windows.net/<container>/<p> --endpoint … [options]
+ *   i-repo share issue-ticket-local --to <folder|network-share> --endpoint … [options]
+ *   i-repo share revoke-ticket-s3    --to s3://bucket/prefix --jti <uuid> [--list-only] [--reason <r>] [options]
+ *   i-repo share revoke-ticket-gcs   --to gs://bucket/prefix --jti <uuid> [--credential-ref <keyId> --reader-service-account <email>] [options]
+ *   i-repo share revoke-ticket-azure --to https://<acct>.blob.core.windows.net/<container>/<p> --jti <uuid> [options]
+ *   i-repo share revoke-ticket-local --to <folder|network-share> --jti <uuid> [options]
+ *   i-repo share show-pubkey [--kid k-…]
+ *   i-repo share rotate-key
  * push-snapshot は実装済み（#147・実体 PUT＋verify まで）。ls / get は本弾では未実装（spec §11 の Phase 3）。
+ *
+ * 【issue-ticket 系（issue-ticket-{s3,gcs,azure,local}・show-pubkey・rotate-key・spec §9.7・#472）の設計要点】
+ *   - **発行台帳モデル（1 チケット = 1 read-only 資格）**: jti を主キーに、ストア別に read-only 資格を
+ *     mint（gcs=SA 鍵・azure=SAS）または既存資格をフォールバック（s3=readonly-key・azure=既存 SAS・local=none）し、
+ *     クレーム（sub/iat/exp/jti/endpoint/endpointFp/store/credential/scope）を EdDSA(Ed25519) で署名して
+ *     `gemba-share://v1/<JWS>` を発行する。ストア別の mint 可否・失効可否は receipt の `revocation` で正直に申告する
+ *     （azure=expiry-only・gcs=individual・s3=shared-credential・local=none）。失効（revoke-ticket）は PR (b)。
+ *   - **チケット URI・credential 実値は receipt・ログ・エラーに一切出さない**（SI-5・check-share SH19）。
+ *     チケット原文は stdout **最終行**の専用 NDJSON レコード（recordType:"share-ticket"）でのみ返す。receipt は
+ *     非 secret メタ（jti/kid/expiresAt/scope/credentialKind/credentialRef?/revocation/publicKeyFingerprint 等）のみ。
+ *   - **鍵の保管**: `~/.i-repo/share/keys/<kid>.json`（EdDSA 秘密鍵・0600）・`keys/current.json`（現行 kid）・
+ *     `issued/<jti>.json`（非 secret 発行台帳・revoke が読む）。書込は src/config/scoped-store.ts:168-205 の流儀を
+ *     自己完結コピー（mkdir 0o700・temp 0o600→rename・chmod 失敗は非致命/Windows no-op）。プラグインは src/ を
+ *     import できない（ゼロ依存）ため複製＋正本注記。署名（signJws/signData）は check-share.mjs:292-311 の逐語
+ *     コピー（発行 alg は EdDSA 固定）。endpointFp 正規化は check-share.mjs:97-121（正本 docs/SCHEMA.md §2.5a）の逐語コピー。
+ *   - **公開鍵の shareRoot 配置**: `keys/<kid>.json`（recordType:"share-key"・公開鍵 JWK のみ）を --if-none-match で
+ *     冪等 PUT する（既存は read-back バイト一致で skip・不一致は fail-closed）。真正性は帯域外ピンのみが根拠（§5.4 自己参照封じは不変）。--no-publish-key で省略可。
+ *
+ * 【revoke-ticket 系（revoke-ticket-{s3,gcs,azure,local}・pull --ticket-jti・spec §9.8/§9.2.2・#472 PR (b)）の設計要点】
+ *   - **真の失効は credential 側**（不変）。gcs のみ実失効（`gcloud iam service-accounts keys delete <keyId> --iam-account <sa>`）。
+ *     s3/azure/local は資格側操作なし（s3=共有資格・azure=exp＋協調・local=資格概念なし）。receipt に `revocation` と
+ *     `credentialRevoked:true|false` を正直に載せる。keyId/SA は発行台帳 issued/<jti>.json（PR (a)）から解決し、`--credential-ref`・
+ *     `--reader-service-account` で上書き可。
+ *   - **協調的失効リスト revoked.json**（shareRoot 直下・recordType:"share-revocations"）: jti を CAS マージ PUT する
+ *     （GET→etag→jti 和集合マージ〔同一 jti は revokedAt min 勝ち・同刻 kid 辞書順＝決定的〕→ --if-match/--if-none-match PUT・
+ *     bounded read-merge-write リトライ 3 回・3 敗 exit 3・local は temp→rename）。**強制の本体ではなく補助**（§5.5）。
+ *   - **pull --ticket-jti**（任意）: 目次 GET 直後に revoked.json を GET し、jti 掲載なら **materialize 前に exit 1**（out 未 commit）。
+ *     404→続行（fail-open）・parse 不能/版違い→ stderr 警告のみ続行（強制の本体は資格無効化）。
+ *   - secret 衛生（SI-5）: revoked.json・receipt・エラーに credential 実値/チケット URI を載せない（scrubMsg/dropQuery 流儀）。
  */
 "use strict";
 
@@ -91,7 +130,7 @@ const fsp = require("node:fs/promises");
 const zlib = require("node:zlib");
 const { pipeline } = require("node:stream/promises");
 const { Readable } = require("node:stream");
-const { createHash, randomBytes } = require("node:crypto");
+const { createHash, randomBytes, randomUUID, generateKeyPairSync, sign: cryptoSign } = require("node:crypto");
 const { spawn } = require("node:child_process");
 const { homedir, tmpdir } = require("node:os");
 const { join, dirname, basename, resolve, relative, isAbsolute, sep } = require("node:path");
@@ -100,12 +139,21 @@ const { join, dirname, basename, resolve, relative, isAbsolute, sep } = require(
 const { spawnSpec } = require("./lib/spawn.js");
 
 const PLUGIN = "i-repo-share";
-const VERSION = "0.3.0";
+const VERSION = "0.5.0";
 const PLUGIN_API = "1";
 
 const PUT_SUBS = ["put-catalog-s3", "put-catalog-gcs", "put-catalog-azure", "put-catalog-local"];
 const PUSH_SNAP_SUBS = ["push-snapshot-s3", "push-snapshot-gcs", "push-snapshot-azure", "push-snapshot-local"];
 const PULL_SUBS = ["pull-azure", "pull-s3", "pull-gcs", "pull-local"];
+// issue-ticket-*（発行台帳モデル・spec §9.7・DC epic #472）: read-only 資格を mint（可能なストアのみ）
+// し、gemba-share://v1/<JWS> を EdDSA で署名発行する egress verb。put-catalog の PUT backend を流用して
+// keys/<kid>.json を shareRoot へ配置する（--no-publish-key で省略可）。show-pubkey / rotate-key は
+// ローカル完結（外部ストア・CLI 不要）。revoke-ticket・pull --ticket-jti は PR (b)（本弾では出さない）。
+const ISSUE_SUBS = ["issue-ticket-s3", "issue-ticket-gcs", "issue-ticket-azure", "issue-ticket-local"];
+// revoke-ticket-*（協調的失効・spec §9.8・DC epic #472 PR (b)）: --jti の資格を無効化（gcs のみ実失効）し、
+// shareRoot の revoked.json（協調的失効リスト）を CAS マージ PUT する destructive verb。真の失効は credential
+// 側であり revoked.json は補助（fail-open・強制の本体ではない）。pull-* の --ticket-jti が読む。
+const REVOKE_SUBS = ["revoke-ticket-s3", "revoke-ticket-gcs", "revoke-ticket-azure", "revoke-ticket-local"];
 
 // 「更新中」（目次 sha256 ≠ 取得実体）と判断したときに、目次から丸ごと再読するまでの待ち時間
 // （§3.4/§7.3）。既定 1500ms・テストは IREPO_SHARE_PULL_RETRY_MS=10 で短縮する。schema には載せない
@@ -133,8 +181,11 @@ const SNAPSHOT_KEY_RE = /^datasets\/ds-[0-9a-f]{12}\/snapshot-\d{8}T\d{6}Z(-[0-9
 // ── 予約フラグ: --plugin-schema は API 検査より先に応答する（docs/PLUGINS.md）──
 const arg0 = process.argv[2];
 if (arg0 === "--plugin-schema") {
-  console.log(JSON.stringify({
-    pluginApi: [PLUGIN_API], schemaVersions: ["1.0"], recordTypes: [],
+  // スキーマ JSON は 22 サブコマンドで 60KB を超え、パイプバッファ（macOS ~64KB）を上回る。console.log は
+  // パイプへの非同期書込なので、直後の process.exit(0) が未フラッシュ分を切り捨てる（spawnSync 経由で JSON が
+  // 途中欠落する回帰）。fs.writeSync(1,…) で**同期的に全量書き切って**から exit する（部分書きはループで吸収）。
+  const schemaJson = JSON.stringify({
+    pluginApi: [PLUGIN_API], schemaVersions: ["1.0"], recordTypes: ["share-ticket"],
     name: PLUGIN, version: VERSION,
     description: "gemba-share の目次系オブジェクト（share-catalog.json / dataset.json / runs/<YYYY-MM>.ndjson）を shareRoot へ clean に PUT する egress verb（put-catalog-*）、snapshot 実体（バイナリ .db/.db.gz）を世代キーへ clean に単発 PUT する egress verb（push-snapshot-*）、目次を辿って着地実体をローカルへ取り戻す read-only な pull verb（pull-*）。put/push はどちらも 1 オブジェクトを 1 キーへ置くだけで archive push と違い bundle レイアウト・着地 receipt・manifests を一切作らない。put-catalog は SI-1（ローカル絶対パス非混入）と SI-5（secret 非混入）を書込前に強制し、push-snapshot は generation 前進を行わず（put-catalog で owner が行う・#147）sourceDigest（非圧縮 .db の sha256）を receipt に併記する。pull は列挙なしで目次が教える相対キーを 1 個ずつ GET し、ストアへ書込・削除を一切しない（.db.gz は展開して .db のみ着地）",
     phases: ["write", "verify", "read"],
@@ -176,6 +227,36 @@ if (arg0 === "--plugin-schema") {
         description: "GCS shareRoot（--from）の目次を辿り、相対キーだけを gcloud storage cp で 1 個ずつ <out> へ取り戻す（列挙不要・read-only・要 gcloud CLI）" },
       { name: "pull-local", input: ["none"], mode: "read", output: ["files"], destructive: false,
         description: "フォルダ/ネットワーク共有 shareRoot（--from）の目次を辿り、相対キーだけを fs コピーで <out> へ取り戻す（列挙不要・read-only・外部CLI不要）" },
+      // issue-ticket-*（発行台帳モデル・spec §9.7・#472）: read-only 資格を mint（可能なストアのみ）し
+      // gemba-share://v1/<JWS> を EdDSA 署名発行する egress verb。チケット原文は stdout 最終行の share-ticket
+      // レコードでのみ返し、receipt・ログ・エラーには一切出さない（SI-5）。keys/<kid>.json を shareRoot へ配置する
+      // （--no-publish-key で省略可）。GUI 配信フォームには出ない host-managed verb（input:none）。破壊性なし
+      // （既存の資格・目次・実体を壊さない。新規 mint と keys の冪等 PUT のみ）。
+      { name: "issue-ticket-s3", input: ["none"], destructive: false,
+        description: "S3 shareRoot（--to）向けの読み取りチケットを発行（mint なし＝--reader-access-key-id/--reader-secret-access-key 必須の readonly-key・個別失効不可＝shared-credential）。EdDSA 署名・keys/<kid>.json を配置・要 aws CLI" },
+      { name: "issue-ticket-gcs", input: ["none"], destructive: false,
+        description: "GCS shareRoot（--to）向けの読み取りチケットを発行（1 チケット=1 SA 鍵を mint＝--reader-service-account 必須の gcp-sa-key・個別失効可＝individual）。EdDSA 署名・keys/<kid>.json を配置・要 gcloud CLI" },
+      { name: "issue-ticket-azure", input: ["none"], destructive: false,
+        description: "Azure Blob shareRoot（--to）向けの読み取りチケットを発行（container SAS を mint＝期限実強制の sas・失効は expiry-only／--reader-sas 指定時は mint せず封入＝shared-credential）。EdDSA 署名・keys/<kid>.json を配置・要 az CLI" },
+      { name: "issue-ticket-local", input: ["none"], destructive: false,
+        description: "フォルダ/ネットワーク共有 shareRoot（--to）向けの読み取りチケットを発行（資格概念なし＝credential kind none・失効 none）。EdDSA 署名・keys/<kid>.json を配置・外部CLI不要" },
+      // show-pubkey / rotate-key: ローカル完結（外部ストア・CLI 不要）。show-pubkey は帯域外ピン用に公開鍵 JWK＋
+      // 指紋を stdout の records として出す（mode:read）。rotate-key は新 kid 世代を生成し current を切替える。
+      { name: "show-pubkey", input: ["none"], mode: "read", output: ["records"], destructive: false,
+        description: "現行（または --kid 指定）の署名公開鍵 JWK と sha256 指紋を stdout に 1 行の JSON で表示（帯域外ピン用・ローカル完結・~/.i-repo/share/keys/）" },
+      { name: "rotate-key", input: ["none"], destructive: false,
+        description: "新しい kid 世代の Ed25519 鍵ペアを生成し current を切替える（旧鍵ファイルは残す・ローカル完結）。以降の issue-ticket は新 kid で署名する" },
+      // revoke-ticket-*（協調的失効・spec §9.8・#472 PR (b)）: --jti の資格を無効化（gcs のみ実失効）し
+      // shareRoot の revoked.json を CAS マージ PUT する。**破壊的**（destructive:true）: 資格を消し得る／目次系とは別の
+      // revoked.json を書き換える。GUI 配信フォームには出ない host-managed verb（input:none）。
+      { name: "revoke-ticket-s3", input: ["none"], destructive: true,
+        description: "S3 shareRoot（--to）で --jti のチケットを失効する。S3 は資格側の個別失効手段が無い（shared-credential）ため revoked.json（協調的失効リスト）に jti を CAS 追記するのみ・要 aws CLI" },
+      { name: "revoke-ticket-gcs", input: ["none"], destructive: true,
+        description: "GCS shareRoot（--to）で --jti のチケットを失効する。SA 鍵を実削除（gcloud iam service-accounts keys delete・individual）し revoked.json にも jti を CAS 追記・要 gcloud CLI" },
+      { name: "revoke-ticket-azure", input: ["none"], destructive: true,
+        description: "Azure Blob shareRoot（--to）で --jti のチケットを失効する。SAS の個別失効は不可（expiry-only）ため revoked.json に jti を CAS 追記するのみ・要 az CLI" },
+      { name: "revoke-ticket-local", input: ["none"], destructive: true,
+        description: "フォルダ/ネットワーク共有 shareRoot（--to）で --jti のチケットを失効する。資格概念なし（none）ため revoked.json（temp→rename）に jti を追記するのみ・外部CLI不要" },
     ],
     params: [
       // --to（shareRoot）: backend ごとに形が違うので個別宣言。{flow} 等のトークン展開はしない
@@ -320,6 +401,12 @@ if (arg0 === "--plugin-schema") {
           description: "既知の generation.key（relKey 文法＋^datasets/）。目次の generation.key がこれと文字列一致し着地 .db が実在すれば snapshot DL を skip し unchanged:true。反復可" },
         { name: "--dry-run", type: "boolean", subcommand: sub, label: "Dry run",
           description: "目次の取得・検証（版 fail-closed・schema 核・SI-1 読み手版）だけ行い、--out へ一切書かず read receipt（dryRun:true・datasets[].wouldDownload）を 1 行返す" },
+        // --ticket-jti（任意・協調的失効チェック・spec §9.2.2/§9.8・#472 PR (b)）: 目次 GET 直後に
+        // shareRoot の revoked.json を GET し、この jti が掲載されていれば materialize 前に exit 1 で中断する
+        // （out 未 commit）。404→続行（fail-open）・parse 不能/版違い→ stderr 警告のみ続行（強制の本体は資格側の失効）。
+        { name: "--ticket-jti", type: "string", subcommand: sub, filter: false,
+          label: "協調的失効チェックの jti（任意）", placeholder: "<uuid>",
+          description: "自分が使うチケットの jti（UUID）。shareRoot の revoked.json にこの jti が掲載されていれば pull を materialize 前に exit 1 で中断する。revoked.json 不在/破損/版違いは fail-open で続行（強制の本体は credential 側の失効・spec §9.2.2/§5.5）" },
       ]),
       // pull-azure 認証: SAS（put-catalog と同名・同 envVar）。未指定＝匿名 GET。fetch 直 GET なので
       // az CLI・接続文字列は使わない（connection-string は宣言しない）。
@@ -343,10 +430,152 @@ if (arg0 === "--plugin-schema") {
       { name: "--gcp-credentials", type: "string", subcommand: "pull-gcs", envVar: "GOOGLE_APPLICATION_CREDENTIALS",
         label: "GCP サービスアカウント鍵のパス（任意・無人用）",
         description: "サービスアカウント鍵 JSON のファイルパス。env GOOGLE_APPLICATION_CREDENTIALS で受け、gcloud 用に CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE へも複写して無人化" },
+
+      // ── issue-ticket-*（発行台帳モデル・spec §9.7・#472）の引数 ──
+      // --to（shareRoot・発行先ストアの接続情報＝チケット store.uri になる）は backend ごとに形が違うので個別宣言。
+      { name: "--to", type: "string", required: true, subcommand: "issue-ticket-s3",
+        label: "S3 shareRoot", placeholder: "s3://bucket/gemba-share/<endpointFp12>",
+        description: "発行先 S3 shareRoot（チケットの store.uri になる。keys/<kid>.json をこの直下へ配置する）" },
+      { name: "--to", type: "string", required: true, subcommand: "issue-ticket-gcs",
+        label: "GCS shareRoot", placeholder: "gs://bucket/gemba-share/<endpointFp12>",
+        description: "発行先 GCS shareRoot（チケットの store.uri になる。keys/<kid>.json をこの直下へ配置する）" },
+      { name: "--to", type: "string", required: true, subcommand: "issue-ticket-azure",
+        label: "Azure Blob shareRoot", placeholder: "https://<account>.blob.core.windows.net/<container>/<prefix>",
+        description: "発行先 Azure Blob shareRoot（blob endpoint URL・SAS を URL に含めない）。チケットの store.uri になる。keys/<kid>.json をこの直下へ配置する" },
+      { name: "--to", type: "string", required: true, subcommand: "issue-ticket-local",
+        label: "保存先フォルダ/ファイルサーバー",
+        placeholder: "/Volumes/share/gemba-share ・ \\\\server\\share ・ D:\\gemba-share",
+        description: "発行先ローカル/ネットワーク共有 shareRoot パス（チケットの store.uri になる。keys/<kid>.json をこの直下へ配置する）" },
+      // 共通クレーム系（4 サブコマンド共通）。secret は無い（チケット原文だけが secret）。
+      ...ISSUE_SUBS.flatMap((sub) => [
+        { name: "--endpoint", type: "string", required: true, subcommand: sub,
+          label: "テナント endpoint（必須）", placeholder: "https://host/ConMasWeb/Rests/APIExecute.aspx",
+          description: "strip_userinfo 済み i-Reporter endpoint。チケットの endpoint クレームになり、docs/SCHEMA.md §2.5a 規則で endpointFp を再計算して封入する（検証側の整合ピン・SI-6）" },
+        { name: "--endpoint-fp", type: "string", subcommand: sub, filter: false,
+          label: "endpointFp（任意・照合用）", placeholder: "<64hex>",
+          description: "既知の endpointFp（^[0-9a-f]{64}$）。指定時は --endpoint から再計算した値と照合し、不一致なら exit 2（取り違え防止）。省略時は再計算値をそのまま採る" },
+        { name: "--dataset", type: "string", required: true, subcommand: sub,
+          label: "共有スコープの datasetId（必須・反復可）", placeholder: "ds-3f8a2b91c04d",
+          description: "チケット scope.datasetIds に載せる datasetId（^ds-[0-9a-f]{12}$）。反復指定で複数。明示必須（省略＝全許可にしない・spec §5.2）" },
+        { name: "--visibility", type: "select", choices: ["own", "all"], default: "own", subcommand: sub, filter: false,
+          label: "見せ分け（既定 own）",
+          description: "チケット scope.visibility（own | all・既定 own）。group は予約語彙で v1 では発行しない（spec §8.2）" },
+        { name: "--issued-to", type: "string", required: true, subcommand: sub,
+          label: "発行先識別子（必須）", placeholder: "reader-acme-ops",
+          description: "チケット sub クレーム（発行先の識別子）。receipt の issuedTo・発行台帳にも載る（非 secret）" },
+        { name: "--expires", type: "string", required: true, subcommand: sub,
+          label: "有効期限（必須）", placeholder: "7d ・ 36h ・ 2026-08-01T00:00:00Z",
+          description: "チケット exp。相対（^\\d+(h|d|w)$＝iat+n）または完全 ISO 8601 日時（Z/オフセット付き）。裸の YYYY-MM-DD は exit 2（…T00:00:00Z 形式で指定する）。azure は mint する SAS の --expiry にも焼く（実強制）" },
+        { name: "--no-publish-key", type: "boolean", subcommand: sub, filter: false,
+          label: "公開鍵を配置しない",
+          description: "keys/<kid>.json（公開鍵 JWK）の shareRoot 配置を省略する。真正性は帯域外ピンのみが根拠なので配置は利便置き場に過ぎない（spec §5.4 自己参照封じ）。ストア側 CLI/資格が無い発行にも使える" },
+        { name: "--dry-run", type: "boolean", subcommand: sub, label: "Dry run",
+          description: "検査（引数・--expires 文法・endpointFp 照合・鍵解決）だけ行い write receipt（dryRun:true）を 1 行返す。mint も keys の PUT もせず、チケットも発行しない（share-ticket 行を出さない）" },
+      ]),
+      // issue-ticket-s3: 発行者認証（put-catalog-s3 と同名・同 envVar）＋ reader 資格（mint なし＝必須）。
+      { name: "--access-key-id", type: "string", subcommand: "issue-ticket-s3", envVar: "AWS_ACCESS_KEY_ID",
+        label: "発行者 AWS アクセスキーID（任意・keys 配置用）",
+        description: "keys/<kid>.json を S3 へ配置するための発行者 IAM アクセスキーID。値は環境変数 AWS_ACCESS_KEY_ID で aws に渡す（--no-publish-key 時は不要）" },
+      { name: "--secret-access-key", type: "string", subcommand: "issue-ticket-s3", secret: true, envVar: "AWS_SECRET_ACCESS_KEY",
+        label: "発行者 AWS シークレットアクセスキー（任意・keys 配置用）",
+        description: "発行者 IAM シークレットアクセスキー。値は argv に出さず環境変数 AWS_SECRET_ACCESS_KEY で aws に渡す（--no-publish-key 時は不要）" },
+      { name: "--profile", type: "string", subcommand: "issue-ticket-s3", envVar: "AWS_PROFILE",
+        label: "発行者 AWS プロファイル（任意）",
+        description: "keys 配置用の named profile（~/.aws 構成）。値は環境変数 AWS_PROFILE で aws に渡す" },
+      { name: "--region", type: "string", subcommand: "issue-ticket-s3", envVar: "AWS_REGION",
+        label: "AWS リージョン（任意・チケット store.region になる）",
+        description: "リージョン。keys 配置の aws にも渡し、チケット store.region にも載せる" },
+      { name: "--reader-access-key-id", type: "string", required: true, subcommand: "issue-ticket-s3", envVar: "IREPO_READER_AWS_ACCESS_KEY_ID",
+        label: "読み手 AWS アクセスキーID（必須・チケットに封入）",
+        description: "チケットに封入する read-only の IAM アクセスキーID。S3 は 1 コマンドで作れて 1 コマンドで消せる mint 手段が無いため既存の read-only 資格を封入する（個別失効不可＝revocation:shared-credential）。値は env IREPO_READER_AWS_ACCESS_KEY_ID でも可" },
+      { name: "--reader-secret-access-key", type: "string", required: true, subcommand: "issue-ticket-s3", secret: true, envVar: "IREPO_READER_AWS_SECRET_ACCESS_KEY",
+        label: "読み手 AWS シークレットアクセスキー（必須・チケットに封入）",
+        description: "チケットに封入する read-only の IAM シークレットアクセスキー。値は argv に出さず環境変数 IREPO_READER_AWS_SECRET_ACCESS_KEY で受ける。チケット原文以外（receipt・ログ・エラー）には一切出さない（SI-5）" },
+      // issue-ticket-gcs: 発行者認証（put-catalog-gcs と同名）＋ mint 先 SA（必須）。
+      { name: "--gcp-credentials", type: "string", subcommand: "issue-ticket-gcs", envVar: "GOOGLE_APPLICATION_CREDENTIALS",
+        label: "発行者 GCP サービスアカウント鍵のパス（任意）",
+        description: "SA 鍵 mint（gcloud iam service-accounts keys create）と keys 配置のための発行者資格。roles/iam.serviceAccountKeyAdmin が要る。env GOOGLE_APPLICATION_CREDENTIALS で受け CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE へ複写して無人化" },
+      { name: "--reader-service-account", type: "string", required: true, subcommand: "issue-ticket-gcs",
+        label: "読み手サービスアカウント（必須・mint 先）",
+        description: "1 チケット=1 SA 鍵を作る対象の read-only サービスアカウント email。gcloud iam service-accounts keys create の --iam-account に渡す（argv・非 secret）。SA あたり user-managed 鍵は 10 本上限。失効は個別に可（revocation:individual・PR (b) の revoke-ticket で keys delete）" },
+      // issue-ticket-azure: 発行者認証（put-catalog-azure と同名）＋ 任意の reader-sas フォールバック。
+      { name: "--connection-string", type: "string", subcommand: "issue-ticket-azure", secret: true, envVar: "AZURE_STORAGE_CONNECTION_STRING",
+        label: "発行者 接続文字列（任意）",
+        description: "SAS mint（az storage container generate-sas）と keys 配置のための発行者資格。値は argv ではなく環境変数で az に渡す（未指定時は az login＋listKeys）" },
+      { name: "--sas", type: "string", subcommand: "issue-ticket-azure", secret: true, envVar: "AZURE_STORAGE_SAS_TOKEN",
+        label: "発行者 SAS トークン（任意・keys 配置用）",
+        description: "keys/<kid>.json を配置するための発行者 SAS。値は argv ではなく環境変数で az に渡す（SAS mint 自体は account key を要すため generate-sas は --connection-string か az login を使う）" },
+      { name: "--reader-sas", type: "string", subcommand: "issue-ticket-azure", secret: true, envVar: "IREPO_READER_SAS_TOKEN",
+        label: "読み手 SAS（任意・指定時は mint せず封入）",
+        description: "指定するとコンテナ SAS を mint せず、この既存 read-only SAS をそのままチケットに封入する（revocation:shared-credential）。未指定なら az storage container generate-sas で期限付き読み取り SAS を mint する（revocation:expiry-only）。値は env IREPO_READER_SAS_TOKEN でも可。チケット原文以外には出さない（SI-5）" },
+      // show-pubkey: 現行 or --kid 指定の公開鍵を表示（ローカル完結）。
+      { name: "--kid", type: "string", subcommand: "show-pubkey", filter: false,
+        label: "鍵世代 kid（任意・既定は現行）", placeholder: "k-20260718-a1b2",
+        description: "表示する鍵世代の kid（既定は keys/current.json の現行 kid）。指定 kid の鍵ファイルが無ければ exit 2" },
+
+      // ── revoke-ticket-*（協調的失効・spec §9.8・#472 PR (b)）の引数 ──
+      // --to（shareRoot・revoked.json を CAS 更新する対象）は backend ごとに形が違うので個別宣言。
+      { name: "--to", type: "string", required: true, subcommand: "revoke-ticket-s3",
+        label: "S3 shareRoot", placeholder: "s3://bucket/gemba-share/<endpointFp12>",
+        description: "対象 S3 shareRoot（この直下の revoked.json に jti を CAS 追記する）" },
+      { name: "--to", type: "string", required: true, subcommand: "revoke-ticket-gcs",
+        label: "GCS shareRoot", placeholder: "gs://bucket/gemba-share/<endpointFp12>",
+        description: "対象 GCS shareRoot（この直下の revoked.json に jti を CAS 追記する）" },
+      { name: "--to", type: "string", required: true, subcommand: "revoke-ticket-azure",
+        label: "Azure Blob shareRoot", placeholder: "https://<account>.blob.core.windows.net/<container>/<prefix>",
+        description: "対象 Azure Blob shareRoot（blob endpoint URL・SAS を URL に含めない）。この直下の revoked.json に jti を CAS 追記する" },
+      { name: "--to", type: "string", required: true, subcommand: "revoke-ticket-local",
+        label: "保存先フォルダ/ファイルサーバー",
+        placeholder: "/Volumes/share/gemba-share ・ \\\\server\\share ・ D:\\gemba-share",
+        description: "対象ローカル/ネットワーク共有 shareRoot パス（この直下の revoked.json に jti を追記する・temp→rename）" },
+      // 共通（4 サブコマンド共通）。--jti 必須・--credential-ref/--reason/--list-only 任意。
+      ...REVOKE_SUBS.flatMap((sub) => [
+        { name: "--jti", type: "string", required: true, subcommand: sub, filter: false,
+          label: "失効するチケットの jti（必須）", placeholder: "<uuid>",
+          description: "失効するチケットの jti（UUID）。発行台帳 issued/<jti>.json から credentialRef/kid/revocation を解決し、revoked.json に追記する。UUID 文法違反は exit 2" },
+        { name: "--credential-ref", type: "string", subcommand: sub, filter: false,
+          label: "資格参照の上書き（任意）", placeholder: "<gcs keyId 等>",
+          description: "資格の非 secret 参照（gcs=SA 鍵の keyId）を台帳から解決せず明示上書きする。別ホストで発行したチケットを失効する場合など台帳が手元に無いときに使う" },
+        { name: "--reason", type: "string", subcommand: sub, filter: false,
+          label: "失効理由（任意）",
+          description: "revoked.json の当該 jti に記録する失効理由（非 secret・監査用）。credential 実値やチケット URI を書かないこと" },
+        { name: "--list-only", type: "boolean", subcommand: sub, filter: false,
+          label: "revoked.json 追記のみ（資格は無効化しない）",
+          description: "credential 側の実失効（gcs の鍵削除）を行わず、revoked.json への jti 追記だけを行う（協調的失効リストのみ更新）。receipt の credentialRevoked は false になる" },
+      ]),
+      // revoke-ticket-gcs: 実失効の対象 SA（台帳に無い場合の上書き）＋発行者認証（issue と同名）。
+      { name: "--reader-service-account", type: "string", subcommand: "revoke-ticket-gcs",
+        label: "読み手サービスアカウント（任意・台帳上書き）",
+        description: "SA 鍵を削除する対象の read-only サービスアカウント email（gcloud iam service-accounts keys delete の --iam-account）。既定は発行台帳 issued/<jti>.json の serviceAccount。台帳が手元に無いときに指定する" },
+      { name: "--gcp-credentials", type: "string", subcommand: "revoke-ticket-gcs", envVar: "GOOGLE_APPLICATION_CREDENTIALS",
+        label: "発行者 GCP サービスアカウント鍵のパス（任意）",
+        description: "SA 鍵削除（roles/iam.serviceAccountKeyAdmin）と revoked.json PUT のための発行者資格。env GOOGLE_APPLICATION_CREDENTIALS で受け CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE へ複写して無人化" },
+      // revoke-ticket-s3: revoked.json PUT のための発行者認証（put-catalog-s3 と同名・同 envVar）。
+      { name: "--access-key-id", type: "string", subcommand: "revoke-ticket-s3", envVar: "AWS_ACCESS_KEY_ID",
+        label: "発行者 AWS アクセスキーID（任意）",
+        description: "revoked.json の GET/PUT に使う発行者 IAM アクセスキーID。値は環境変数 AWS_ACCESS_KEY_ID で aws に渡す" },
+      { name: "--secret-access-key", type: "string", subcommand: "revoke-ticket-s3", secret: true, envVar: "AWS_SECRET_ACCESS_KEY",
+        label: "発行者 AWS シークレットアクセスキー（任意）",
+        description: "発行者 IAM シークレットアクセスキー。値は argv に出さず環境変数 AWS_SECRET_ACCESS_KEY で aws に渡す" },
+      { name: "--profile", type: "string", subcommand: "revoke-ticket-s3", envVar: "AWS_PROFILE",
+        label: "発行者 AWS プロファイル（任意）",
+        description: "named profile（~/.aws 構成）。値は環境変数 AWS_PROFILE で aws に渡す" },
+      { name: "--region", type: "string", subcommand: "revoke-ticket-s3", envVar: "AWS_REGION",
+        label: "AWS リージョン（任意）",
+        description: "リージョン。値は環境変数 AWS_REGION で aws に渡す" },
+      // revoke-ticket-azure: revoked.json PUT のための発行者認証（put-catalog-azure と同名・同 envVar）。
+      { name: "--connection-string", type: "string", subcommand: "revoke-ticket-azure", secret: true, envVar: "AZURE_STORAGE_CONNECTION_STRING",
+        label: "発行者 接続文字列（任意）",
+        description: "revoked.json の GET/PUT のための発行者資格。値は argv ではなく環境変数で az に渡す（未指定時は az login）" },
+      { name: "--sas", type: "string", subcommand: "revoke-ticket-azure", secret: true, envVar: "AZURE_STORAGE_SAS_TOKEN",
+        label: "発行者 SAS トークン（任意）",
+        description: "revoked.json の GET/PUT のための発行者 SAS。値は argv ではなく環境変数で az に渡す" },
     ],
     // dataset ブロックは宣言しない: これは gemba-adc の dataset ではない（gemba-share の
     // 存在は spec/gemba-share が正本）。report-delete 型＝カタログに載らない fail-open 追加。
-  }));
+  }) + "\n";
+  const buf = Buffer.from(schemaJson);
+  for (let off = 0; off < buf.length;) off += fs.writeSync(1, buf, off, buf.length - off);
   process.exit(0);
 }
 
@@ -390,21 +619,21 @@ async function healthcheck() {
   // （local は Node fs のみ・pull-azure は内蔵 fetch）なので全体 ok は常に true。
   const checks = [];
   checks.push({
-    name: "aws-cli", ok: await commandExists("aws", ["--version"]), severity: "required-for:put-catalog-s3,push-snapshot-s3,pull-s3",
-    hint: "Install AWS CLI v2 to use put-catalog-s3 / push-snapshot-s3 / pull-s3",
+    name: "aws-cli", ok: await commandExists("aws", ["--version"]), severity: "required-for:put-catalog-s3,push-snapshot-s3,pull-s3,issue-ticket-s3,revoke-ticket-s3",
+    hint: "Install AWS CLI v2 to use put-catalog-s3 / push-snapshot-s3 / pull-s3 / issue-ticket-s3 / revoke-ticket-s3 (revoke-ticket-s3 uses aws only to CAS-update revoked.json)",
   });
   checks.push({
-    name: "gcloud-cli", ok: await commandExists("gcloud", ["--version"]), severity: "required-for:put-catalog-gcs,push-snapshot-gcs,pull-gcs",
-    hint: "Install Google Cloud SDK (gcloud) to use put-catalog-gcs / push-snapshot-gcs / pull-gcs",
+    name: "gcloud-cli", ok: await commandExists("gcloud", ["--version"]), severity: "required-for:put-catalog-gcs,push-snapshot-gcs,pull-gcs,issue-ticket-gcs,revoke-ticket-gcs",
+    hint: "Install Google Cloud SDK (gcloud) to use put-catalog-gcs / push-snapshot-gcs / pull-gcs / issue-ticket-gcs / revoke-ticket-gcs (revoke-ticket-gcs deletes the SA key and updates revoked.json)",
   });
-  // az CLI は put-catalog-azure / push-snapshot-azure 専用（pull-azure は az でなく内蔵 fetch を使うため az を要さない）。
+  // az CLI は put-catalog-azure / push-snapshot-azure / issue-ticket-azure / revoke-ticket-azure 専用（pull-azure は az でなく内蔵 fetch を使うため az を要さない）。
   checks.push({
-    name: "az-cli", ok: await commandExists("az", ["--version"]), severity: "required-for:put-catalog-azure,push-snapshot-azure",
-    hint: "Install Azure CLI (az) to use put-catalog-azure / push-snapshot-azure",
+    name: "az-cli", ok: await commandExists("az", ["--version"]), severity: "required-for:put-catalog-azure,push-snapshot-azure,issue-ticket-azure,revoke-ticket-azure",
+    hint: "Install Azure CLI (az) to use put-catalog-azure / push-snapshot-azure / issue-ticket-azure / revoke-ticket-azure (revoke-ticket-azure CAS-updates revoked.json)",
   });
   checks.push({
-    name: "local-fs", ok: true, severity: "required-for:put-catalog-local,push-snapshot-local,pull-local",
-    hint: "No external CLI needed (uses Node fs)",
+    name: "local-fs", ok: true, severity: "required-for:put-catalog-local,push-snapshot-local,pull-local,issue-ticket-local,revoke-ticket-local,show-pubkey,rotate-key",
+    hint: "No external CLI needed (uses Node fs; show-pubkey / rotate-key are fully local)",
   });
   // pull-azure は素の HTTPS 直 GET（elastic の fetch 流儀・§7.2）。Node 内蔵 fetch（>=18）が要る。
   const fetchOk = typeof fetch === "function";
@@ -433,6 +662,16 @@ async function main() {
   if (command === "pull-s3") return pullShare(parsePullArgs(rest, S3_PULL), S3_PULL);
   if (command === "pull-gcs") return pullShare(parsePullArgs(rest, GCS_PULL), GCS_PULL);
   if (command === "pull-local") return pullShare(parsePullArgs(rest, LOCAL_PULL), LOCAL_PULL);
+  if (command === "issue-ticket-s3") return issueTicket(parseIssueArgs(rest, S3_BACKEND), S3_BACKEND);
+  if (command === "issue-ticket-gcs") return issueTicket(parseIssueArgs(rest, GCS_BACKEND), GCS_BACKEND);
+  if (command === "issue-ticket-azure") return issueTicket(parseIssueArgs(rest, AZURE_BACKEND), AZURE_BACKEND);
+  if (command === "issue-ticket-local") return issueTicket(parseIssueArgs(rest, LOCAL_BACKEND), LOCAL_BACKEND);
+  if (command === "show-pubkey") return showPubkey(parseShowPubkeyArgs(rest));
+  if (command === "rotate-key") return rotateKey(parseRotateKeyArgs(rest));
+  if (command === "revoke-ticket-s3") return revokeTicket(parseRevokeArgs(rest, S3_BACKEND), S3_BACKEND);
+  if (command === "revoke-ticket-gcs") return revokeTicket(parseRevokeArgs(rest, GCS_BACKEND), GCS_BACKEND);
+  if (command === "revoke-ticket-azure") return revokeTicket(parseRevokeArgs(rest, AZURE_BACKEND), AZURE_BACKEND);
+  if (command === "revoke-ticket-local") return revokeTicket(parseRevokeArgs(rest, LOCAL_BACKEND), LOCAL_BACKEND);
   usage();
   process.exitCode = command === undefined || command === "--help" || command === "-h" ? 0 : 2;
 }
@@ -460,6 +699,23 @@ function usage() {
   ${PLUGIN} pull-gcs   --from gs://bucket/prefix --out <dir> [options]
       [--gcp-credentials <service-account-key.json path>]
   ${PLUGIN} pull-local --from <folder|network-share path> --out <dir> [options]
+  ${PLUGIN} issue-ticket-s3    --to s3://bucket/prefix --endpoint <url> --dataset ds-… --issued-to <id> --expires <n|ISO> [options]
+      --reader-access-key-id <id> (env IREPO_READER_AWS_ACCESS_KEY_ID) --reader-secret-access-key (env IREPO_READER_AWS_SECRET_ACCESS_KEY)
+      [--access-key-id <id> --secret-access-key <key> | --profile <name>] [--region <r>]
+  ${PLUGIN} issue-ticket-gcs   --to gs://bucket/prefix --endpoint <url> --reader-service-account <email> --dataset ds-… --issued-to <id> --expires <n|ISO> [options]
+      [--gcp-credentials <service-account-key.json path>]
+  ${PLUGIN} issue-ticket-azure --to https://<account>.blob.core.windows.net/<container>/<prefix> --endpoint <url> --dataset ds-… --issued-to <id> --expires <n|ISO> [options]
+      [--reader-sas <token> (env IREPO_READER_SAS_TOKEN)] [--connection-string <cs> | --sas <token>]
+  ${PLUGIN} issue-ticket-local --to <folder|network-share path> --endpoint <url> --dataset ds-… --issued-to <id> --expires <n|ISO> [options]
+  ${PLUGIN} revoke-ticket-s3    --to s3://bucket/prefix --jti <uuid> [--list-only] [--reason <r>] [options]
+      [--access-key-id <id> --secret-access-key <key> | --profile <name>] [--region <r>]
+  ${PLUGIN} revoke-ticket-gcs   --to gs://bucket/prefix --jti <uuid> [--credential-ref <keyId> --reader-service-account <email>] [options]
+      [--gcp-credentials <service-account-key.json path>]
+  ${PLUGIN} revoke-ticket-azure --to https://<account>.blob.core.windows.net/<container>/<prefix> --jti <uuid> [options]
+      [--connection-string <cs> | --sas <token>]
+  ${PLUGIN} revoke-ticket-local --to <folder|network-share path> --jti <uuid> [options]
+  ${PLUGIN} show-pubkey [--kid k-…]
+  ${PLUGIN} rotate-key
   put-catalog Options:
       --key <relKey>       shareRoot 相対の書込キー（既定 share-catalog.json・spec §2 relKey 文法で検証）
       --if-match <v>       CAS: 現在の版が一致するときだけ差し替え（S3 ETag/GCS generation/Azure ETag。local 非対応）
@@ -474,7 +730,37 @@ function usage() {
   pull Options:
       --dataset <id>       取り戻す datasetId（^ds-[0-9a-f]{12}$・反復可・空=全件・目次に無い id は exit 1）
       --since-generation <key>  基準 generation.key（反復可）。一致＋着地 .db 実在で snapshot DL skip（unchanged）
+      --ticket-jti <uuid>  協調的失効チェック（任意）。revoked.json に掲載なら materialize 前に exit 1（fail-open）
       --dry-run            目次の取得・検証だけ行い read receipt(dryRun:true・wouldDownload)を返す（--out へ書かない）
+  revoke-ticket Options:
+      --jti <uuid>         失効するチケットの jti（必須・UUID）。台帳 issued/<jti>.json から資格参照を解決
+      --credential-ref <r> 資格参照の上書き（任意・gcs=keyId。台帳が手元に無いとき）
+      --reader-service-account <email>  gcs 実失効の対象 SA（任意・台帳上書き）
+      --reason <r>         失効理由（任意・非 secret・revoked.json に記録）
+      --list-only          資格の実失効をせず revoked.json への追記のみ（credentialRevoked:false）
+  issue-ticket Options:
+      --endpoint <url>     テナント endpoint（必須・チケット endpoint／再計算 endpointFp）
+      --endpoint-fp <hex>  既知 endpointFp（任意・再計算値と照合・不一致 exit 2）
+      --dataset <id>       scope.datasetIds（必須・反復可・^ds-[0-9a-f]{12}$）
+      --visibility <v>     own | all（既定 own）
+      --issued-to <id>     チケット sub（必須）
+      --expires <spec>     exp（必須・^\\d+(h|d|w)$＝iat+n または完全 ISO 8601。裸 YYYY-MM-DD は exit 2）
+      --no-publish-key     keys/<kid>.json を shareRoot へ置かない（真正性は帯域外ピンのみ）
+      --dry-run            検査だけ行い write receipt(dryRun:true)を返す（mint/PUT/発行なし）
+  show-pubkey Options:
+      --kid <k->          表示する鍵世代（既定は現行 keys/current.json）
+  issue-ticket mints a read-only credential where possible (gcs=SA key, azure=SAS) or falls back
+  to a supplied reader credential (s3=readonly-key, azure=--reader-sas, local=none), signs the
+  claims with EdDSA (Ed25519), and prints the ticket ONLY on the final stdout line as a
+  share-ticket record. The ticket URI and credential values NEVER appear in receipts/logs/errors
+  (SI-5). keys/<kid>.json (public key) is placed idempotently under <--to> unless --no-publish-key.
+  Per-store mint/revocation is reported honestly in the receipt's revocation field. Signing keys
+  live under ~/.i-repo/share/ (0600). show-pubkey / rotate-key are fully local.
+  revoke-ticket revokes a ticket by --jti: the real revocation is credential-side (gcs deletes the
+  minted SA key; s3/azure/local have no per-ticket credential op), and it CAS-merges the jti into
+  shareRoot/revoked.json (the cooperative revocation list read by pull --ticket-jti). The receipt
+  reports revocation and credentialRevoked. Credential values / ticket URIs are NEVER written to
+  revoked.json / receipts / errors (SI-5). revoked.json CAS retries up to 3 times, else exit 3.
   put-catalog places EXACTLY ONE index-class object (<file>) at <--to>/<--key>. No bundle
   layout, no receipts/, no manifests. SI-1 (no local absolute paths) and SI-5 (no secrets)
   are enforced BEFORE writing — violations are rejected (exit 2) without touching the store.
@@ -1042,12 +1328,14 @@ function gunzipSha256(path) {
 //   get(t, relKey, destTmp, env, options) … 1 オブジェクトを destTmp へ GET（notFound は e.notFound）
 
 const DATASET_ID_RE = /^ds-[0-9a-f]{12}$/;
+// jti は randomUUID() 生成の UUID v4（issue-ticket・revoke-ticket・pull --ticket-jti で共通に検証する）。
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function parsePullArgs(argv, backend) {
   const label = backend.sub;
   const spec = {
     "--from": "value", "--out": "value",
-    "--dataset": "value", "--since-generation": "value", "--dry-run": "flag",
+    "--dataset": "value", "--since-generation": "value", "--ticket-jti": "value", "--dry-run": "flag",
   };
   // 認証フラグは put-catalog と同名・同 envVar（secret は argv でなく env / fetch URL query 経由）。
   if (backend.store === "azure") spec["--sas"] = "value";
@@ -1084,12 +1372,49 @@ function parsePullArgs(argv, backend) {
       throw usageError(`--since-generation "${k}" must be a shareRoot relKey under datasets/ (spec §2/§9.2.2).`);
     }
   }
+  // --ticket-jti（協調的失効チェック・任意）: UUID 文法を検査（違反は exit 2）。
+  const ticketJti = o["ticket-jti"];
+  if (ticketJti !== undefined && !UUID_RE.test(ticketJti)) {
+    throw usageError(`--ticket-jti "${ticketJti}" is not a valid UUID (spec §9.2.2).`);
+  }
 
-  const out = { from: o.from, out: o.out, datasets, sinceGenerations, dryRun: Boolean(o["dry-run"]) };
+  const out = { from: o.from, out: o.out, datasets, sinceGenerations, ticketJti, dryRun: Boolean(o["dry-run"]) };
   if (backend.store === "azure") out.sas = o.sas || process.env.AZURE_STORAGE_SAS_TOKEN || "";
   if (backend.store === "s3") Object.assign(out, s3CredsFromArgs(o, label));
   if (backend.store === "gcs") out.gcpCredentials = o["gcp-credentials"] || "";
   return out;
+}
+
+// pull --ticket-jti（協調的失効チェック・spec §9.2.2・#472 PR (b)）: 目次 GET 直後に shareRoot の
+// revoked.json を GET し、この jti が掲載されていれば materialize 前に exit 1（out 未 commit）で中断する。
+// 404（notFound）→ 続行（fail-open）。parse 不能・版違い（shareApi に "1" が無い）→ stderr 警告のみ続行
+// （強制の本体は credential 側の失効・§5.5）。GET は pull backend（fetch/aws/gcloud/fs）と同経路。
+// secret 非露出（SI-5）: 失敗表示は scrubMsg で query/userinfo を落とす。
+async function enforceTicketNotRevoked(backend, target, options, env) {
+  const dir = await fsp.mkdtemp(join(tmpdir(), "irepo-share-revchk-"));
+  const tmp = join(dir, "revoked.json");
+  try {
+    try {
+      await backend.get(target, "revoked.json", tmp, env, options);
+    } catch (e) {
+      if (e && e.notFound) return; // 404 → fail-open（続行）
+      console.error(`${PLUGIN}: warning: could not fetch revoked.json (${scrubMsg(e && e.message)}); continuing (fail-open・spec §9.2.2).`);
+      return;
+    }
+    let obj;
+    try { obj = JSON.parse(await fsp.readFile(tmp, "utf8")); }
+    catch { console.error(`${PLUGIN}: warning: revoked.json is not valid JSON; continuing (fail-open・spec §9.2.2).`); return; }
+    if (!obj || typeof obj !== "object" || Array.isArray(obj) || !Array.isArray(obj.shareApi) || !obj.shareApi.includes("1")) {
+      console.error(`${PLUGIN}: warning: revoked.json has unsupported/absent shareApi:["1"]; continuing (fail-open・spec §9.2.2).`);
+      return;
+    }
+    const list = Array.isArray(obj.revoked) ? obj.revoked : [];
+    if (list.some((r) => r && r.jti === options.ticketJti)) {
+      throw storeError(`ticket jti ${options.ticketJti} is revoked (listed in revoked.json) — aborting pull before materialize (spec §9.2.2 / §10 SI-9).`);
+    }
+  } finally {
+    await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 async function pullShare(options, backend) {
@@ -1106,6 +1431,8 @@ async function pullShare(options, backend) {
     const temps = new Set();
     try {
       const cat = await loadCatalog(backend, target, options, env, dir, temps);
+      // --ticket-jti（協調的失効チェック・目次 GET 直後）: revoked 掲載なら exit 1（out 未 commit・§9.2.2）。
+      if (options.ticketJti) await enforceTicketNotRevoked(backend, target, options, env);
       const selected = selectDatasets(cat.obj, options.datasets);
       for (const k of collectDereferencedKeys(selected, cat.obj)) {
         assertReaderKeySafe(k, resolve(options.out), sourceRoot);
@@ -1141,6 +1468,10 @@ async function pullShare(options, backend) {
 
     // ① 目次 GET（既知キー・list 不使用）／② 版 fail-closed ＋ schema 核検証（loadCatalog 内）
     const cat = await loadCatalog(backend, target, options, env, out, temps);
+    // ①' --ticket-jti（協調的失効チェック・**目次 GET 直後**・§9.2.2）: revoked 掲載なら materialize 前に
+    // exit 1（out 未 commit）。**attempt ごとに再実行する**（更新中の再試行は 1500ms 待機してから目次を
+    // 再 GET する — その待機窓中に失効が着地し得るため、再 GET のたびに再チェックする。read-only・冪等）。
+    if (options.ticketJti) await enforceTicketNotRevoked(backend, target, options, env);
     // ③ scope（--dataset。目次に無い id は exit 1）
     const selected = selectDatasets(cat.obj, options.datasets);
     // ④ SI-1 読み手版（dereference するキーだけ・違反は exit 1）
@@ -1611,6 +1942,779 @@ function emitReceipt(phase, jobId, count, failedCount, verified, extras) {
     phase, jobId, count, failedCount, verified,
     ...extras,
   }) + "\n");
+}
+
+// ── issue-ticket / show-pubkey / rotate-key（発行台帳モデル・spec §9.7・#472）────────
+//
+// 「1 チケット = 1 read-only 資格」の台帳型。jti を主キーに、ストア別に read-only 資格を mint
+// （gcs=SA 鍵・azure=SAS）または既存資格をフォールバック（s3=readonly-key・azure=既存 SAS・local=none）し、
+// クレームを EdDSA(Ed25519) で署名して gemba-share://v1/<JWS> を発行する。ストア別の mint 可否・失効可否は
+// receipt の revocation で正直に申告する。チケット URI・credential 実値は receipt・ログ・エラーに一切出さず
+// （SI-5・check-share SH19）、チケット原文は stdout 最終行の share-ticket レコードでのみ返す。
+//
+// 鍵の保管（~/.i-repo/share/）: keys/<kid>.json（EdDSA 秘密鍵・0600）・keys/current.json（現行 kid）・
+// issued/<jti>.json（非 secret 発行台帳・PR (b) の revoke が読む）。
+
+// 鍵ストアのルート。IREPO_HOME があればそれを優先（テスト・可搬性）、なければ homedir()。
+function shareHome() { return join(process.env.IREPO_HOME || homedir(), ".i-repo", "share"); }
+function keysDir() { return join(shareHome(), "keys"); }
+function issuedDir() { return join(shareHome(), "issued"); }
+
+// 【正本注記】secret JSON の原子書込（mkdir 0o700・temp 0o600→rename・chmod 失敗は非致命/Windows no-op）は
+// src/config/scoped-store.ts:168-205（writeJsonFile）が正本。プラグインはゼロ依存・単体コピー配布ゆえ src/ を
+// import できないため流儀を複製する（判定を変えるときは両方を直す）。
+function writeSecretJsonSync(filePath, data) {
+  const dir = dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const tmpPath = `${filePath}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+    try { fs.chmodSync(tmpPath, 0o600); } catch { /* 権限是正の失敗で書込を失敗扱いにしない（Windows no-op） */ }
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    try { fs.unlinkSync(tmpPath); } catch { /* 中途半端な tmp を残さない（無ければ何もしない） */ }
+    throw err;
+  }
+  try { fs.chmodSync(dir, 0o700); } catch { /* ディレクトリ権限是正の失敗も書込を失敗扱いにしない */ }
+}
+
+// kid: k-<YYYYMMDD(UTC)>-<4hex>。ts プレフィックスで世代の見分けがつく（辞書順は要件ではない）。
+function newKid(date = new Date()) {
+  const pad = (n) => String(n).padStart(2, "0");
+  const ymd = `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}`;
+  return `k-${ymd}-${randomBytes(2).toString("hex")}`;
+}
+
+// 新しい Ed25519 鍵世代を生成し keys/<kid>.json（秘密鍵含む・0600）と keys/current.json を書く。返値は kid。
+// kid=日付+4hex は同日に複数回 rotate すると衝突し得る（16bit 空間）。衝突時に既存の鍵世代を新鍵で
+// 上書きすると、その kid で発行済みのチケットが検証不能になる。ゆえに **ローカル keys/<kid>.json が
+// 非存在になるまで再生成する**（上限つき・レビュー指摘 P2-1）。
+function generateKeyGeneration() {
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  let kid = newKid();
+  for (let attempt = 0; fs.existsSync(join(keysDir(), `${kid}.json`)); attempt++) {
+    if (attempt >= 64) throw new Error("failed to allocate a unique kid (keys/<kid>.json already exists after 64 attempts).");
+    kid = newKid();
+  }
+  const rec = {
+    kid, alg: "EdDSA", createdAt: new Date().toISOString(),
+    privateKeyPem: privateKey.export({ type: "pkcs8", format: "pem" }),
+    publicKeyJwk: publicKey.export({ format: "jwk" }), // {kty:"OKP",crv:"Ed25519",x:"…"}
+  };
+  writeSecretJsonSync(join(keysDir(), `${kid}.json`), rec);
+  writeSecretJsonSync(join(keysDir(), "current.json"), { kid });
+  return kid;
+}
+
+function readCurrentKid() {
+  try { return JSON.parse(fs.readFileSync(join(keysDir(), "current.json"), "utf8")).kid || null; } catch { return null; }
+}
+// 現行 kid を返す。未生成（初回 issue）や鍵ファイル欠落なら新世代を生成する。
+function ensureCurrentKid() {
+  const kid = readCurrentKid();
+  if (kid && fs.existsSync(join(keysDir(), `${kid}.json`))) return kid;
+  return generateKeyGeneration();
+}
+function loadKeyRecord(kid) {
+  const p = join(keysDir(), `${kid}.json`);
+  try { return JSON.parse(fs.readFileSync(p, "utf8")); }
+  catch { throw usageError(`signing key not found for kid ${kid} at ${p}. Run "${PLUGIN} rotate-key" or issue a ticket first.`); }
+}
+
+// 公開鍵指紋（帯域外ピン用）: raw 32byte Ed25519 公開鍵（JWK x を base64url decode）の sha256 hex。
+function publicKeyFingerprint(publicKeyJwk) {
+  const raw = Buffer.from(publicKeyJwk.x, "base64url");
+  return createHash("sha256").update(raw).digest("hex");
+}
+
+// ── JWS compact（発行 alg は EdDSA 固定）──────────────────────────────────────
+// 【正本注記】署名 signJws/signData は scripts/check-share.mjs:292-311（適合ハーネス）の逐語コピー。
+// ゼロ依存・単体コピー配布ゆえ import できない。ハーネスは EdDSA/ES256 の両検証を持つが、**発行側は
+// EdDSA(Ed25519) 固定**（推奨 alg・spec §5.1）で署名する。
+const b64urlJson = (o) => Buffer.from(JSON.stringify(o), "utf8").toString("base64url");
+function signData(alg, data, privateKey) {
+  if (alg === "EdDSA") return cryptoSign(null, data, privateKey); // Ed25519（algorithm=null）
+  throw usageError(`unsupported sign alg ${alg} (issuer signs EdDSA only)`);
+}
+function signJws(header, payload, privateKey) {
+  const signingInput = `${b64urlJson(header)}.${b64urlJson(payload)}`;
+  const sig = signData(header.alg, Buffer.from(signingInput, "utf8"), privateKey);
+  return `${signingInput}.${sig.toString("base64url")}`;
+}
+
+// ── endpointFp 再計算（正本 docs/SCHEMA.md §2.5a）─────────────────────────────
+// 【正本注記】normalizeEndpoint/fingerprintEndpoint は scripts/check-share.mjs:97-121 の逐語コピー
+// （そちらも src/config/endpoint-fingerprint.ts の移植）。gemba-share は endpointFp を再定義しない
+// （spec §1.2）。ゼロ依存ゆえ import できないための自己完結コピーであり、判定は正本に一致させる。
+function normalizeEndpoint(raw) {
+  const lowered = String(raw).trim().toLowerCase();
+  if (lowered === "") return "";
+  const schemeIdx = lowered.indexOf("://");
+  const scheme = schemeIdx >= 0 ? lowered.slice(0, schemeIdx) : undefined;
+  const rest = schemeIdx >= 0 ? lowered.slice(schemeIdx + 3) : lowered;
+  const slashIdx = rest.indexOf("/");
+  const authority = slashIdx >= 0 ? rest.slice(0, slashIdx) : rest;
+  const rawPath = slashIdx >= 0 ? rest.slice(slashIdx + 1) : undefined;
+  const atIdx = authority.lastIndexOf("@");
+  let hostPort = atIdx >= 0 ? authority.slice(atIdx + 1) : authority;
+  if (scheme === "https" && hostPort.endsWith(":443")) hostPort = hostPort.slice(0, -4);
+  else if (scheme === "http" && hostPort.endsWith(":80")) hostPort = hostPort.slice(0, -3);
+  let path;
+  if (rawPath !== undefined) { const t = rawPath.replace(/\/+$/, ""); path = t === "" ? undefined : t; }
+  let out = "";
+  if (scheme !== undefined) out += `${scheme}://`;
+  out += hostPort;
+  if (path !== undefined) out += `/${path}`;
+  return out;
+}
+function fingerprintEndpoint(url) {
+  const n = normalizeEndpoint(url);
+  return n === "" ? "" : createHash("sha256").update(n, "utf8").digest("hex");
+}
+// endpoint の authority 部（最初の `/` より前・**scheme の有無を問わず**）に userinfo（`@`）を含むか。
+// normalizeEndpoint と同じ authority 切り出し（`://` の有無で分岐）を使い、正本と判定を揃える
+// （scheme なし `user:pass@host/x` も authority に `@` を持つので検出できる・レビュー指摘 2巡目 P2）。
+function endpointHasUserinfo(raw) {
+  const lowered = String(raw).trim().toLowerCase();
+  if (lowered === "") return false;
+  const schemeIdx = lowered.indexOf("://");
+  const rest = schemeIdx >= 0 ? lowered.slice(schemeIdx + 3) : lowered;
+  const slashIdx = rest.indexOf("/");
+  const authority = slashIdx >= 0 ? rest.slice(0, slashIdx) : rest;
+  return authority.includes("@");
+}
+
+// --expires のパース（spec §9.7）: 相対 ^\d+(h|d|w)$（exp=iat+n）or 完全 ISO 8601 日時（Z/オフセット付き）。
+// 裸の YYYY-MM-DD は exit 2（…T00:00:00Z 形式を案内）。exp<=iat は呼び出し側で exit 2。返値は epoch 秒。
+const ISO_DATETIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2}|Z)$/;
+function parseExpires(spec, iat) {
+  const rel = /^(\d+)(h|d|w)$/.exec(spec);
+  if (rel) {
+    const n = Number(rel[1]);
+    if (n <= 0) throw usageError(`--expires "${spec}" must be a positive duration.`);
+    const mult = rel[2] === "h" ? 3600 : rel[2] === "d" ? 86400 : 604800;
+    return iat + n * mult;
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(spec)) {
+    throw usageError(`--expires "${spec}" is a bare date. Use a full ISO 8601 datetime with Z/offset, e.g. ${spec}T00:00:00Z (spec §9.7).`);
+  }
+  if (ISO_DATETIME_RE.test(spec)) {
+    const ms = Date.parse(spec);
+    if (Number.isNaN(ms)) throw usageError(`--expires "${spec}" is not a valid ISO 8601 datetime.`);
+    return Math.floor(ms / 1000);
+  }
+  throw usageError(`--expires "${spec}" is invalid. Use <n>(h|d|w) (e.g. 7d) or a full ISO 8601 datetime with Z/offset.`);
+}
+
+function parseIssueArgs(argv, backend) {
+  const label = `issue-ticket-${backend.store}`;
+  const spec = {
+    "--to": "value", "--endpoint": "value", "--endpoint-fp": "value",
+    "--dataset": "value", "--visibility": "value", "--issued-to": "value",
+    "--expires": "value", "--no-publish-key": "flag", "--dry-run": "flag",
+  };
+  // 発行者認証（keys 配置用）＋ reader 資格（mint 有無で分岐）。secret は argv でなく env 併用。
+  if (backend.store === "s3") {
+    spec["--access-key-id"] = "value"; spec["--secret-access-key"] = "value";
+    spec["--profile"] = "value"; spec["--region"] = "value";
+    spec["--reader-access-key-id"] = "value"; spec["--reader-secret-access-key"] = "value";
+  }
+  if (backend.store === "gcs") { spec["--gcp-credentials"] = "value"; spec["--reader-service-account"] = "value"; }
+  if (backend.store === "azure") { spec["--connection-string"] = "value"; spec["--sas"] = "value"; spec["--reader-sas"] = "value"; }
+  const o = parseArgv(argv, spec, label, new Set(["--dataset"]));
+  if (o._.length !== 0) throw usageError(`${label} takes no positional arguments (got ${o._.length}).`);
+
+  // --to（backend 別・put-catalog と同基準）
+  if (backend.store === "local") {
+    const to = normalizeLocalDest(o.to ?? "");
+    if (!to) throw usageError(`${label} requires --to <folder|network-share path>.`);
+    o.to = to;
+  } else {
+    if (!o.to) throw usageError(`${label} requires --to ${backend.scheme}…`);
+    if (!o.to.startsWith(backend.scheme)) throw usageError(`shareRoot must start with "${backend.scheme}".`);
+  }
+  if (backend.store === "azure") parseAzureTo(o.to); // [?#] は exit 2（SAS 混入防止）
+
+  // --endpoint 必須・endpointFp 再計算（任意の --endpoint-fp と照合）
+  const endpoint = o.endpoint;
+  if (!endpoint) throw usageError(`${label} requires --endpoint <url>.`);
+  // spec §5.2 は endpoint を「strip_userinfo 済み」で必須とする。authority 部（scheme の有無を問わず
+  // 最初の `/` より前）に userinfo（`@`）を含む endpoint は silent strip せず exit 2 で拒否し、発行者に
+  // strip 済み URL を渡させる（意図確認を優先・レビュー指摘 P2-5／2巡目 P2 で scheme なしバイパスも封鎖）。
+  if (endpointHasUserinfo(endpoint)) {
+    throw usageError(`--endpoint must not contain userinfo (user:pass@). Pass a strip_userinfo'd URL like https://host/path (spec §5.2). endpointFp は host/path のみから計算する。`);
+  }
+  const endpointFp = fingerprintEndpoint(endpoint);
+  if (!/^[0-9a-f]{64}$/.test(endpointFp)) {
+    throw usageError(`--endpoint "${endpoint}" did not produce a valid endpointFp (empty or invalid endpoint).`);
+  }
+  if (o["endpoint-fp"] !== undefined && o["endpoint-fp"] !== endpointFp) {
+    throw usageError(`--endpoint-fp does not match the fingerprint recomputed from --endpoint (spec §9.7 / SI-6). Verify you passed the right endpoint.`);
+  }
+
+  // --dataset 必須・反復可・文法検査
+  const datasets = o.dataset || [];
+  if (datasets.length === 0) throw usageError(`${label} requires at least one --dataset ds-<12hex> (scope.datasetIds is mandatory・spec §5.2).`);
+  for (const id of datasets) {
+    if (!DATASET_ID_RE.test(id)) throw usageError(`--dataset "${id}" is not a valid datasetId (^ds-[0-9a-f]{12}$).`);
+  }
+
+  const visibility = o.visibility ?? "own";
+  if (visibility !== "own" && visibility !== "all") throw usageError(`--visibility must be "own" or "all" (got ${JSON.stringify(visibility)}).`);
+  if (!o["issued-to"]) throw usageError(`${label} requires --issued-to <id>.`);
+  if (o.expires === undefined) throw usageError(`${label} requires --expires <n(h|d|w)|ISO8601>.`);
+
+  const out = {
+    store: backend.store, to: o.to, endpoint, endpointFp, datasets, visibility,
+    issuedTo: o["issued-to"], expiresSpec: o.expires,
+    noPublishKey: Boolean(o["no-publish-key"]), dryRun: Boolean(o["dry-run"]),
+  };
+  if (backend.store === "s3") {
+    Object.assign(out, s3CredsFromArgs(o, label)); // 発行者（keys PUT）用の IAM/profile
+    out.readerAccessKeyId = o["reader-access-key-id"] || process.env.IREPO_READER_AWS_ACCESS_KEY_ID || "";
+    out.readerSecretAccessKey = o["reader-secret-access-key"] || process.env.IREPO_READER_AWS_SECRET_ACCESS_KEY || "";
+    if (!out.readerAccessKeyId || !out.readerSecretAccessKey) {
+      throw usageError(`${label} requires --reader-access-key-id and --reader-secret-access-key (S3 has no per-ticket mint; a read-only credential is embedded). The secret may be supplied via IREPO_READER_AWS_SECRET_ACCESS_KEY.`);
+    }
+  }
+  if (backend.store === "gcs") {
+    out.gcpCredentials = o["gcp-credentials"] || "";
+    out.readerServiceAccount = o["reader-service-account"] || "";
+    if (!out.readerServiceAccount) throw usageError(`${label} requires --reader-service-account <email> (the SA the per-ticket key is minted for).`);
+  }
+  if (backend.store === "azure") {
+    out.connectionString = o["connection-string"] || process.env.AZURE_STORAGE_CONNECTION_STRING || "";
+    out.sas = o.sas || process.env.AZURE_STORAGE_SAS_TOKEN || "";
+    out.readerSas = o["reader-sas"] || process.env.IREPO_READER_SAS_TOKEN || "";
+  }
+  return out;
+}
+
+// ストア別の read-only 資格を mint（可能なストアのみ）またはフォールバックする。返値:
+//   { credential, credentialKind, credentialRef?, credentialExpiresAt|null, revocation }
+// credential はチケット payload に封入する実値（secret）。credentialKind/credentialRef/revocation は
+// receipt・台帳に載る**非 secret**メタ。実クラウド mint（gcs/azure）は本環境で実測不可 → DC 切替時に実測確定。
+async function mintCredential(options, backend, env, expiresAt) {
+  if (options.store === "local") {
+    return { credential: { kind: "none" }, credentialKind: "none", credentialExpiresAt: null, revocation: "none" };
+  }
+  if (options.store === "s3") {
+    // S3 は「1 コマンドで作れて 1 コマンドで消せる」mint 手段が無い（presign=per-object・STS≤36h・
+    // IAM 鍵 2 本上限・per-ticket IAM user は重装備）ので、既存 read-only 資格を封入する（個別失効不可）。
+    return {
+      credential: { kind: "readonly-key", accessKeyId: options.readerAccessKeyId, secretAccessKey: options.readerSecretAccessKey },
+      credentialKind: "readonly-key", credentialRef: options.readerAccessKeyId, credentialExpiresAt: null, revocation: "shared-credential",
+    };
+  }
+  if (options.store === "azure") {
+    if (options.readerSas) {
+      // 既存 SAS のフォールバック（mint しない）。個別失効不可＝shared-credential。
+      return { credential: { kind: "sas", token: normalizeSas(options.readerSas) }, credentialKind: "sas", credentialExpiresAt: null, revocation: "shared-credential" };
+    }
+    // container SAS を mint（期限は実強制）。署名には account key（--connection-string or az login）が要る。
+    // az の datetime パーサはミリ秒付き（…​.000Z）を受けないことがあるので、--expiry からミリ秒を落とす
+    // （…Z の秒精度に丸める・レビュー指摘 P2-3）。
+    const t = parseAzureTo(options.to);
+    const sasExpiry = expiresAt.replace(/\.\d{3}Z$/, "Z");
+    const args = ["storage", "container", "generate-sas", "--account-name", t.account, "--name", t.container,
+      "--permissions", "r", "--expiry", sasExpiry, "--https-only", "--output", "tsv"];
+    let token;
+    try {
+      const r = await runCommand("az", args, { env, captureStdout: true, captureStderr: true });
+      token = (r.stdout || "").trim();
+    } catch (e) {
+      throw storeError(`azure SAS mint failed: ${scrubMsg(e && e.message)}`);
+    }
+    if (!token) throw storeError("azure SAS mint returned an empty token (check issuer auth: --connection-string or az login).");
+    return { credential: { kind: "sas", token: normalizeSas(token) }, credentialKind: "sas", credentialExpiresAt: expiresAt, revocation: "expiry-only" };
+  }
+  if (options.store === "gcs") {
+    // 1 チケット = 1 SA 鍵を mint（gcloud iam service-accounts keys create）。keyId（private_key_id）を
+    // credentialRef に、鍵 JSON を base64 で封入（tmp は即削除）。個別失効可（revocation:individual・PR (b)）。
+    // SA あたり user-managed 鍵は 10 本上限。
+    const dir = await fsp.mkdtemp(join(tmpdir(), "irepo-gcs-key-"));
+    const tmpFile = join(dir, "key.json");
+    try {
+      await runCommand("gcloud",
+        ["iam", "service-accounts", "keys", "create", tmpFile, "--iam-account", options.readerServiceAccount, "--quiet"],
+        { env, captureStdout: true, captureStderr: true });
+      const keyJson = await fsp.readFile(tmpFile, "utf8");
+      const keyObj = JSON.parse(keyJson);
+      return {
+        credential: { kind: "gcp-sa-key", keyJsonB64: Buffer.from(keyJson, "utf8").toString("base64") },
+        credentialKind: "gcp-sa-key", credentialRef: keyObj.private_key_id, credentialExpiresAt: null, revocation: "individual",
+        // revoke-ticket-gcs が keys delete の --iam-account に使うため SA email を台帳へ残す（非 secret）。
+        serviceAccount: options.readerServiceAccount,
+      };
+    } catch (e) {
+      throw storeError(`gcs SA key mint failed: ${scrubMsg(e && e.message)}`);
+    } finally {
+      await fsp.rm(dir, { recursive: true, force: true }).catch(() => {}); // 鍵 temp を即削除（ディスク残置しない）
+    }
+  }
+  throw usageError(`unsupported store for issue-ticket: ${options.store}`);
+}
+
+// チケット store クレーム（§5.2）。local は kind:"dir"（ticket.schema.json 追加語彙）。
+function storeClaim(options, backend, target) {
+  const uri = backend.shareRoot(target);
+  if (options.store === "local") return { kind: "dir", uri };
+  const claim = { kind: options.store, uri };
+  if (options.store === "s3" && options.region) claim.region = options.region;
+  return claim;
+}
+
+// shareRoot key object（公開鍵のみ・§3）。同一 kid なら決定的に同一バイト（createdAt は鍵ファイル固定）
+// ＝再発行で --if-none-match 冪等 skip が効く。
+function shareKeyObject(keyRec) {
+  return {
+    shareApi: ["1"], schemaVersion: "1.0", recordType: "share-key", contract: "gemba-share/1.0",
+    kid: keyRec.kid, alg: "EdDSA",
+    publicKeyJwk: { kty: keyRec.publicKeyJwk.kty, crv: keyRec.publicKeyJwk.crv, x: keyRec.publicKeyJwk.x },
+    createdAt: keyRec.createdAt,
+  };
+}
+
+// 1 オブジェクトを read-back し、**その取得バイトに紐づく etag と一緒に**返す（notFound は null）。
+// put backend は get を持たないので store 別に GET する（pull と同経路・発行者資格）。返値 {bytes, etag}。
+//
+// 【P1 レビュー対応: etag と bytes を単一操作に束ねる（CAS の TOCTOU＝lost update 防止）】
+// 以前は GET（本関数）→ 別呼び出しの backend.stat で etag、の二段構えだったため、その隙間に別 writer が
+// 更新すると「旧リスト＋新 etag」になり If-Match が通って介在 writer の失効を上書き消去し得た。方式:
+//   - s3    : `aws s3api get-object` の**応答 JSON の ETag**（本体 DL と同一応答）を採る。
+//   - azure : `az storage blob download --output json` の**応答 etag**（本体 DL と同一応答）を採る。
+//   - gcs   : `gcloud storage cp` は generation を返さないので **stat→cp→stat で generation 安定を確認**し、
+//             前後一致したときだけ etag=generation とする（不一致なら etag=undefined＝呼び出し側が CAS 中断/再試行）。
+//   - local : etag 無し（dir-share は CAS せず temp→rename・単一 writer 前提）。
+// 実クラウド（s3/gcs/azure）の read-back は本環境で実測不可 → DC 切替時に応答形を確定する。
+async function readBackObject(backend, target, key, env) {
+  if (backend.store === "local") {
+    const dest = join(target.root, key);
+    const s = await fsp.stat(dest).catch(() => null);
+    if (!s || !s.isFile()) return null;
+    return { bytes: await fsp.readFile(dest), etag: undefined };
+  }
+  const dir = await fsp.mkdtemp(join(tmpdir(), "irepo-share-readback-"));
+  const tmp = join(dir, "obj");
+  try {
+    if (backend.store === "s3") {
+      let r;
+      try {
+        r = await runCommand("aws", ["s3api", "get-object", "--bucket", target.bucket, "--key", joinKey(target.prefix, key), tmp, "--output", "json"],
+          { env, captureStdout: true, captureStderr: true });
+      } catch (e) { if (isNotFoundErr(e)) return null; throw e; }
+      let etag; try { etag = stripQuotes(JSON.parse(r.stdout || "{}").ETag); } catch { /* etag 取得失敗は etag=undefined */ }
+      return { bytes: await fsp.readFile(tmp), etag };
+    }
+    if (backend.store === "gcs") {
+      // cp は generation を返さない → stat(前)→cp→stat(後) で generation 安定を確認（TOCTOU 窓を検知）。
+      const gen1 = await backend.stat(target, key, env).then((s) => s && s.etag).catch(() => null);
+      try {
+        await runCommand("gcloud", ["storage", "cp", joinUri(target.uri, key), tmp], { env, captureStdout: true, captureStderr: true });
+      } catch (e) { if (isNotFoundErr(e)) return null; throw e; }
+      const gen2 = await backend.stat(target, key, env).then((s) => s && s.etag).catch(() => null);
+      return { bytes: await fsp.readFile(tmp), etag: (gen1 && gen1 === gen2) ? gen1 : undefined };
+    }
+    if (backend.store === "azure") {
+      const name = backend.blobName(target, key);
+      let r;
+      try {
+        r = await runCommand("az", ["storage", "blob", "download", "--account-name", target.account,
+          "--container-name", target.container, "--name", name, "--file", tmp, "--output", "json"],
+          { env, captureStdout: true, captureStderr: true });
+      } catch (e) { if (isNotFoundErr(e)) return null; throw e; }
+      let etag; try { const j = JSON.parse(r.stdout || "{}"); etag = stripQuotes((j.properties && j.properties.etag) || j.etag); } catch { /* etag=undefined */ }
+      return { bytes: await fsp.readFile(tmp), etag };
+    }
+    return null;
+  } finally {
+    await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+// keys/<kid>.json を shareRoot へ冪等 PUT（--if-none-match）。既存衝突時は **read-back して手元の鍵と
+// バイト一致**を確認し、一致すれば skip（同一 kid の再発行＝冪等）。同一と確認できなければ **fail-closed
+// （exit 1・明示エラー）** で公開鍵の上書きを拒否する（別の公開鍵でもサイズは一致し得るためサイズ比較は
+// 使わない・帯域外ピンの根拠を壊さない・§5.4・レビュー指摘 P1）。返値は keyPublished=true。
+async function publishKeyObject(backend, target, keyObjKey, keyObj, env, kid) {
+  const dir = await fsp.mkdtemp(join(tmpdir(), "irepo-share-key-"));
+  const tmp = join(dir, "key.json");
+  const localBytes = Buffer.from(JSON.stringify(keyObj) + "\n");
+  await fsp.writeFile(tmp, localBytes);
+  try {
+    try {
+      await backend.put(target, keyObjKey, tmp, { ifNoneMatch: true }, env);
+    } catch (e) {
+      if (e && e.exitCode === 3) {
+        const existing = await readBackObject(backend, target, keyObjKey, env).catch(() => null);
+        if (existing && existing.bytes.equals(localBytes)) return true; // 冪等 skip（既存＝バイト一致）
+        throw storeError(
+          `shareRoot の keys/${kid}.json が手元の署名鍵と一致しない — 公開鍵の上書きを拒否する（spec §5.4）。` +
+          "署名鍵が変わったなら rotate-key で新しい kid を使うこと（keys/<kid>.json already exists with a different public key; refusing to overwrite).",
+        );
+      }
+      throw storeError(`failed to publish keys/${kid}.json: ${scrubMsg(e && e.message)}`);
+    }
+    return true;
+  } finally {
+    await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+// receipt/台帳の非 secret credential メタ（credential 実値は載せない・キー名 credential/secretAccessKey は使わない）。
+function credentialMeta(minted) {
+  return {
+    credentialKind: minted.credentialKind,
+    ...(minted.credentialRef ? { credentialRef: minted.credentialRef } : {}),
+    ...(minted.credentialExpiresAt ? { credentialExpiresAt: minted.credentialExpiresAt } : {}),
+    revocation: minted.revocation,
+  };
+}
+
+async function issueTicket(options, backend) {
+  const jobId = `issue-${timestampTag()}-${process.pid}`;
+  const target = backend.parse(options);
+  const shareRoot = backend.shareRoot(target);
+  const storeKind = backend.storeKind;
+
+  // 鍵世代を解決（初回・rotate 後は generateKeyGeneration が current を作る）。dry-run でも鍵解決は行う。
+  const kid = ensureCurrentKid();
+  const keyRec = loadKeyRecord(kid);
+  const publicKeyFp = publicKeyFingerprint(keyRec.publicKeyJwk);
+  const keyObjectKey = `keys/${kid}.json`;
+
+  // iat/exp（--expires 文法違反・過去は exit 2）。
+  const iat = Math.floor(Date.now() / 1000);
+  const exp = parseExpires(options.expiresSpec, iat);
+  if (exp <= iat) throw usageError(`--expires resolves to a time at or before now (exp=${exp} <= iat=${iat}). Choose a future expiry.`);
+  const expiresAt = new Date(exp * 1000).toISOString();
+
+  const scope = { datasetIds: options.datasets, visibility: options.visibility };
+  const baseExtras = {
+    shareRoot, storeKind, kid, issuedTo: options.issuedTo, expiresAt,
+    scope, endpointFp: options.endpointFp, keyObjectKey, publicKeyFingerprint: publicKeyFp,
+  };
+
+  if (options.dryRun) {
+    // 検査のみ通過（引数・--expires・endpointFp 照合・鍵解決）。mint も PUT も発行もしない。write 1 行のみ。
+    emitReceipt("write", jobId, 1, 0, false, { ...baseExtras, dryRun: true, keyPublished: false });
+    return;
+  }
+
+  const env = buildPushEnv({ ...options, store: backend.store });
+
+  // ① read-only 資格を mint / フォールバック。
+  const minted = await mintCredential(options, backend, env, expiresAt);
+
+  // ② クレームを組み EdDSA(Ed25519) 署名して gemba-share://v1/<JWS> を作る。
+  const jti = randomUUID();
+  const claims = {
+    sub: options.issuedTo, iat, exp, jti,
+    endpoint: options.endpoint, endpointFp: options.endpointFp,
+    store: storeClaim(options, backend, target),
+    credential: minted.credential,
+    scope,
+  };
+  const header = { alg: "EdDSA", typ: "gemba-share-ticket+jwt", kid };
+  const ticket = `gemba-share://v1/${signJws(header, claims, keyRec.privateKeyPem)}`;
+
+  const metaExtras = { ...baseExtras, jti, ...credentialMeta(minted) };
+
+  // ③ 公開鍵 keys/<kid>.json を shareRoot へ冪等 PUT（--no-publish-key で省略）。
+  let keyPublished = false;
+  if (!options.noPublishKey) keyPublished = await publishKeyObject(backend, target, keyObjectKey, shareKeyObject(keyRec), env, kid);
+
+  // write 相 receipt（verified:false）。
+  emitReceipt("write", jobId, 1, 0, false, { ...metaExtras, keyPublished });
+
+  // ④ verify 相: keyPublished なら read-back で存在確認、そうでなければ mint+sign 成功で verified:true。
+  let verified = true;
+  if (keyPublished) {
+    let observed = null;
+    try { observed = await backend.stat(target, keyObjectKey, env); }
+    catch (error) { console.error(`verify read-back failed: ${scrubMsg(error && error.message)}`); }
+    verified = Boolean(observed && Number(observed.bytes) > 0);
+    if (!verified) console.error(`verify failed: ${keyObjectKey} not found after publish`);
+  }
+  emitReceipt("verify", jobId, 1, verified ? 0 : 1, verified, { ...metaExtras, keyPublished });
+  if (!verified) { process.exitCode = 1; return; }
+
+  // ⑤ 発行台帳 issued/<jti>.json（非 secret・0600・PR (b) の revoke が読む）。gcs は SA email も残す
+  // （revoke-ticket-gcs の keys delete --iam-account 解決用）。
+  writeSecretJsonSync(join(issuedDir(), `${jti}.json`), {
+    schemaVersion: "1.0", recordType: "share-issued", jti, kid, store: options.store,
+    shareRoot, ...credentialMeta(minted),
+    ...(minted.serviceAccount ? { serviceAccount: minted.serviceAccount } : {}),
+    sub: options.issuedTo, iat, exp, expiresAt,
+    scope, issuedAt: new Date().toISOString(),
+  });
+
+  // ⑥ verified:true 確定後にのみ、チケット原文を stdout 最終行の専用レコードで返す（SI-5・spec §9.7）。
+  process.stdout.write(JSON.stringify({
+    schemaVersion: "1.0", recordType: "share-ticket", jti, kid, expiresAt, ticket,
+  }) + "\n");
+}
+
+function parseShowPubkeyArgs(argv) {
+  const o = parseArgv(argv, { "--kid": "value" }, "show-pubkey");
+  if (o._.length !== 0) throw usageError("show-pubkey takes no positional arguments.");
+  return { kid: o.kid };
+}
+// 現行（または --kid 指定）の公開鍵 JWK＋指紋を stdout に 1 行の JSON で返す（帯域外ピン用・ローカル完結）。
+function showPubkey(options) {
+  const kid = options.kid || readCurrentKid();
+  if (!kid) throw usageError(`no signing key found under ${keysDir()}. Run "${PLUGIN} rotate-key" or issue a ticket first.`);
+  const keyRec = loadKeyRecord(kid);
+  process.stdout.write(JSON.stringify({
+    schemaVersion: "1.0", recordType: "share-pubkey", kid, alg: "EdDSA",
+    publicKeyJwk: { kty: keyRec.publicKeyJwk.kty, crv: keyRec.publicKeyJwk.crv, x: keyRec.publicKeyJwk.x },
+    publicKeyFingerprint: publicKeyFingerprint(keyRec.publicKeyJwk), createdAt: keyRec.createdAt,
+  }) + "\n");
+}
+
+function parseRotateKeyArgs(argv) {
+  const o = parseArgv(argv, {}, "rotate-key");
+  if (o._.length !== 0) throw usageError("rotate-key takes no positional arguments.");
+  return {};
+}
+// 新しい kid 世代を生成し current を切替える（旧鍵ファイルは残す）。以降の issue は新 kid で署名する。
+function rotateKey() {
+  const kid = generateKeyGeneration();
+  const keyRec = loadKeyRecord(kid);
+  process.stdout.write(JSON.stringify({
+    schemaVersion: "1.0", recordType: "share-key-rotated", kid, alg: "EdDSA",
+    createdAt: keyRec.createdAt, publicKeyFingerprint: publicKeyFingerprint(keyRec.publicKeyJwk),
+  }) + "\n");
+}
+
+// ── revoke-ticket / revoked.json CAS（協調的失効・spec §9.8・#472 PR (b)）──────────
+//
+// 真の失効は credential 側（gcs のみ実失効＝SA 鍵削除）。s3/azure/local は資格側操作なし。あわせて
+// shareRoot の revoked.json（協調的失効リスト・recordType:"share-revocations"）に jti を CAS マージ PUT する
+// （補助＝fail-open で pull --ticket-jti が読む・強制の本体ではない・§5.5）。
+
+// 発行台帳 issued/<jti>.json（PR (a) が書く・非 secret）を読む。無ければ null（別ホスト発行など）。
+function loadIssuedLedger(jti) {
+  try { return JSON.parse(fs.readFileSync(join(issuedDir(), `${jti}.json`), "utf8")); } catch { return null; }
+}
+// 台帳が無いときのストア別 revocation 既定（§9.7.3 マトリクス）。
+function defaultRevocationFor(store) {
+  return store === "gcs" ? "individual" : store === "azure" ? "expiry-only" : store === "s3" ? "shared-credential" : "none";
+}
+
+// revoked.json を GET（**書込側は fail-closed**: 版・型が不正なら storeError で中断し盲目上書きしない）。
+// etag は read-back と**同一操作で束ねて**取得する（readBackObject・P1 レビュー対応: TOCTOU で lost update を防ぐ）。
+// 返値 {exists, obj, etag}。etag は object store のみ（local は CAS せず temp→rename）。
+// 【P2-2 レビュー対応: 型検証を深める】shareApi だけでなく recordType:"share-revocations" と revoked が配列である
+// ことも検査する（無関係オブジェクトを「既存リスト」として受理し上書きする穴を塞ぐ・§9.8.3-1）。
+async function loadRevoked(backend, target, env) {
+  const res = await readBackObject(backend, target, "revoked.json", env);
+  if (!res) return { exists: false, obj: null, etag: undefined };
+  let obj;
+  try { obj = JSON.parse(res.bytes.toString("utf8")); }
+  catch { throw storeError("revoked.json in shareRoot is not valid JSON (contract violation §9.8)."); }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) throw storeError("revoked.json is not a JSON object (§9.8).");
+  if (!Array.isArray(obj.shareApi) || !obj.shareApi.includes("1")) {
+    throw storeError(`revoked.json does not declare shareApi:["1"] (version fail-closed §0.1-4). got ${JSON.stringify(obj.shareApi)}`);
+  }
+  if (obj.recordType !== "share-revocations") {
+    throw storeError(`revoked.json recordType is not "share-revocations" (type fail-closed §9.8.3). got ${JSON.stringify(obj.recordType)}`);
+  }
+  if (!Array.isArray(obj.revoked)) {
+    throw storeError(`revoked.json .revoked is not an array (type fail-closed §9.8.3). got ${JSON.stringify(typeof obj.revoked)}`);
+  }
+  return { exists: true, obj, etag: res.etag };
+}
+
+// jti 和集合マージ（決定的・§6.2）: 同一 jti は revokedAt が **min（最初の失効）** 勝ち、同刻は kid 辞書順で
+// 小さい方。出力は jti 辞書順に整列（入力順非依存＝A→B と B→A で同一）。
+// 【P2-3 レビュー対応: 全順序化】revokedAt 同刻・kid 同一でも reason 違い等で後勝ちの入力順依存が残らないよう、
+// タイブレークを kid → reason → 正準 JSON まで連鎖させ**全順序**にする（どちらを採っても決定的）。
+function pickEarlierRevocation(x, y) {
+  const ix = Date.parse(x.revokedAt), iy = Date.parse(y.revokedAt);
+  if (ix < iy) return x;
+  if (iy < ix) return y;
+  const kx = x.kid || "", ky = y.kid || "";
+  if (kx !== ky) return kx < ky ? x : y;
+  const rx = x.reason || "", ry = y.reason || "";
+  if (rx !== ry) return rx < ry ? x : y;
+  return canonicalJson(x) <= canonicalJson(y) ? x : y; // 最終タイブレーク（正準 JSON 辞書順・全順序）
+}
+// 正準 JSON（キー辞書順・決定的マージのタイブレーク用）。ゼロ依存・node 内蔵のみ。
+function canonicalJson(v) {
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(",")}]`;
+  if (v && typeof v === "object") return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson(v[k])}`).join(",")}}`;
+  return JSON.stringify(v);
+}
+function mergeRevocations(a, b) {
+  const byJti = new Map();
+  for (const r of [...a, ...b]) {
+    if (!r || typeof r.jti !== "string") continue;
+    const prev = byJti.get(r.jti);
+    if (!prev || pickEarlierRevocation(r, prev) === r) byJti.set(r.jti, r);
+  }
+  return [...byJti.values()].sort((x, y) => (x.jti < y.jti ? -1 : x.jti > y.jti ? 1 : 0));
+}
+
+// JSON オブジェクトを temp（同一 dir）に書いて backend.put に渡す（revoked.json の CAS PUT 用）。
+async function putJsonObject(backend, target, key, obj, cond, env) {
+  const dir = await fsp.mkdtemp(join(tmpdir(), "irepo-share-put-"));
+  const tmp = join(dir, "obj.json");
+  await fsp.writeFile(tmp, JSON.stringify(obj) + "\n");
+  try {
+    return await backend.put(target, key, tmp, cond, env);
+  } finally {
+    await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+// revoked.json の CAS マージ PUT（**bounded read-merge-write リトライ 3 回・3 敗 exit 3**・§4/§9.8）。
+// 新規は --if-none-match、既存は --if-match <etag>（object store）。local は etag が無いので read-merge-write
+// を temp→rename（unconditional・単一 writer 前提・§6.3）。precondition 敗北（exit 3）は再読して再試行。
+async function putRevokedCas(backend, target, entry, env) {
+  const RETRIES = 3;
+  let lastErr;
+  for (let attempt = 0; attempt < RETRIES; attempt++) {
+    const current = await loadRevoked(backend, target, env);
+    let obj, cond;
+    if (!current.exists) {
+      obj = {
+        shareApi: ["1"], schemaVersion: "1.0", recordType: "share-revocations", contract: "gemba-share/1.0",
+        updatedAt: new Date().toISOString(), revoked: [entry],
+      };
+      cond = { ifNoneMatch: true };
+    } else {
+      const base = current.obj;
+      const merged = mergeRevocations(Array.isArray(base.revoked) ? base.revoked : [], [entry]);
+      obj = {
+        ...base, shareApi: ["1"], schemaVersion: "1.0", recordType: "share-revocations", contract: "gemba-share/1.0",
+        updatedAt: new Date().toISOString(), revoked: merged,
+      };
+      if (backend.store === "local") {
+        cond = {}; // local は etag が無い → unconditional（temp→rename・単一 writer 前提・§6.3）。
+      } else if (current.etag) {
+        cond = { ifMatch: current.etag };
+      } else {
+        // 【P2-1 レビュー対応】既存があるのに etag が取れない（stat 一時失敗・gcs generation 不安定）→
+        // 無条件 PUT すると盲目上書き（介在 writer の失効消去）になる。CAS せず再試行し、リトライ枠を
+        // 使い切っても取れなければ **exit 1 で中断**（盲目上書きしない）。
+        lastErr = storeError("could not obtain a stable etag for existing revoked.json — refusing to overwrite blindly (spec §9.8.3・CAS lost-update guard).");
+        continue;
+      }
+    }
+    try {
+      const putRes = await putJsonObject(backend, target, "revoked.json", obj, cond, env);
+      return { etag: putRes && putRes.etag, count: obj.revoked.length };
+    } catch (e) {
+      if (e && e.exitCode === 3) { lastErr = e; continue; } // CAS 敗北 → 再読して再試行
+      throw e;
+    }
+  }
+  // リトライ枠を使い切った: 最後の失敗要因の exit code を保つ（etag 不取得＝exit 1・CAS 敗北＝exit 3）。
+  if (lastErr) throw lastErr;
+  throw preconditionError(`revoked.json CAS failed after ${RETRIES} attempts (concurrent writers on shareRoot).`);
+}
+
+function parseRevokeArgs(argv, backend) {
+  const label = `revoke-ticket-${backend.store}`;
+  const spec = { "--to": "value", "--jti": "value", "--credential-ref": "value", "--reason": "value", "--list-only": "flag" };
+  if (backend.store === "s3") {
+    spec["--access-key-id"] = "value"; spec["--secret-access-key"] = "value";
+    spec["--profile"] = "value"; spec["--region"] = "value";
+  }
+  if (backend.store === "gcs") { spec["--gcp-credentials"] = "value"; spec["--reader-service-account"] = "value"; }
+  if (backend.store === "azure") { spec["--connection-string"] = "value"; spec["--sas"] = "value"; }
+  const o = parseArgv(argv, spec, label);
+  if (o._.length !== 0) throw usageError(`${label} takes no positional arguments (got ${o._.length}).`);
+
+  if (backend.store === "local") {
+    const to = normalizeLocalDest(o.to ?? "");
+    if (!to) throw usageError(`${label} requires --to <folder|network-share path>.`);
+    o.to = to;
+  } else {
+    if (!o.to) throw usageError(`${label} requires --to ${backend.scheme}…`);
+    if (!o.to.startsWith(backend.scheme)) throw usageError(`shareRoot must start with "${backend.scheme}".`);
+  }
+  if (backend.store === "azure") parseAzureTo(o.to); // [?#] は exit 2（SAS 混入防止）
+
+  if (!o.jti) throw usageError(`${label} requires --jti <uuid>.`);
+  if (!UUID_RE.test(o.jti)) throw usageError(`--jti "${o.jti}" is not a valid UUID.`);
+  // --reason に secret（チケット URI）を書かせない（SI-5・防御的）。
+  if (o.reason && o.reason.includes("gemba-share://")) {
+    throw usageError("--reason must not contain a ticket URI (gemba-share://) — it is recorded in revoked.json (SI-5).");
+  }
+
+  const out = {
+    store: backend.store, to: o.to, jti: o.jti,
+    credentialRef: o["credential-ref"], reason: o.reason, listOnly: Boolean(o["list-only"]),
+  };
+  if (backend.store === "s3") Object.assign(out, s3CredsFromArgs(o, label));
+  if (backend.store === "gcs") {
+    out.gcpCredentials = o["gcp-credentials"] || "";
+    out.readerServiceAccount = o["reader-service-account"] || "";
+  }
+  if (backend.store === "azure") {
+    out.connectionString = o["connection-string"] || process.env.AZURE_STORAGE_CONNECTION_STRING || "";
+    out.sas = o.sas || process.env.AZURE_STORAGE_SAS_TOKEN || "";
+  }
+  return out;
+}
+
+async function revokeTicket(options, backend) {
+  const jobId = `revoke-${timestampTag()}-${process.pid}`;
+  const target = backend.parse(options);
+  const shareRoot = backend.shareRoot(target);
+  const storeKind = backend.storeKind;
+  const env = buildPushEnv({ ...options, store: backend.store });
+
+  // 発行台帳から資格参照を解決（--credential-ref / --reader-service-account で上書き可）。
+  const ledger = loadIssuedLedger(options.jti);
+  const revocation = (ledger && ledger.revocation) || defaultRevocationFor(backend.store);
+  const kid = ledger ? ledger.kid : undefined;
+  const credentialRef = options.credentialRef || (ledger && ledger.credentialRef) || undefined;
+  const serviceAccount = options.readerServiceAccount || (ledger && ledger.serviceAccount) || undefined;
+
+  // ① credential 側の実失効（gcs の individual のみ・--list-only はスキップ）。s3/azure/local は資格側操作なし。
+  let credentialRevoked = false;
+  if (!options.listOnly && backend.store === "gcs" && revocation === "individual") {
+    if (!credentialRef) {
+      throw usageError(`revoke-ticket-gcs requires the SA key id — pass --credential-ref <keyId> (or run where the issue ledger ~/.i-repo/share/issued/${options.jti}.json exists).`);
+    }
+    if (!serviceAccount) {
+      throw usageError("revoke-ticket-gcs requires the reader service account — pass --reader-service-account <email> (or run where the issue ledger has serviceAccount).");
+    }
+    try {
+      await runCommand("gcloud", ["iam", "service-accounts", "keys", "delete", credentialRef, "--iam-account", serviceAccount, "--quiet"],
+        { env, captureStdout: true, captureStderr: true });
+      credentialRevoked = true;
+    } catch (e) {
+      throw storeError(`gcs SA key delete failed: ${scrubMsg(e && e.message)}`);
+    }
+  }
+
+  // ② 協調的失効リスト revoked.json を CAS マージ PUT（bounded retry 3・3 敗 exit 3）。
+  const revokedAt = new Date().toISOString();
+  const entry = { jti: options.jti, revokedAt, ...(kid ? { kid } : {}), ...(options.reason ? { reason: options.reason } : {}) };
+  const casResult = await putRevokedCas(backend, target, entry, env);
+
+  const baseExtras = {
+    shareRoot, storeKind, jti: options.jti, ...(kid ? { kid } : {}),
+    revocation, credentialRevoked, listOnly: Boolean(options.listOnly), revokedCount: casResult.count,
+    ...(casResult.etag ? { etag: casResult.etag } : {}),
+  };
+  emitReceipt("write", jobId, 1, 0, false, baseExtras);
+
+  // ③ verify: revoked.json read-back で jti 掲載を確認 → verified:true。
+  let verified = false;
+  try {
+    const check = await loadRevoked(backend, target, env);
+    verified = check.exists && Array.isArray(check.obj.revoked) && check.obj.revoked.some((r) => r && r.jti === options.jti);
+  } catch (e) {
+    console.error(`verify read-back failed: ${scrubMsg(e && e.message)}`);
+  }
+  if (!verified) console.error(`verify failed: jti ${options.jti} not present in revoked.json after PUT`);
+  emitReceipt("verify", jobId, 1, verified ? 0 : 1, verified, baseExtras);
+  if (!verified) process.exitCode = 1;
 }
 
 // ── backends（1 オブジェクト PUT + read-back verify）──────────────────────────

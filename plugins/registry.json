@@ -175,7 +175,7 @@
       "name": "share",
       "file": "i-repo-share",
       "displayName": "i-repo-share",
-      "version": "0.3.0",
+      "version": "0.5.0",
       "description": "gemba-share の目次系オブジェクト（share-catalog.json / dataset.json / runs/<YYYY-MM>.ndjson）を shareRoot へ clean に PUT する egress verb（put-catalog-*）、snapshot 実体（バイナリ .db/.db.gz）を世代キーへ clean に単発 PUT する egress verb（push-snapshot-*）、目次を辿って着地実体をローカルへ取り戻す read-only な pull verb（pull-*）。put/push はどちらも 1 オブジェクトを 1 キーへ置くだけで archive push と違い bundle レイアウト・着地 receipt・manifests を一切作らない。put-catalog は SI-1（ローカル絶対パス非混入）と SI-5（secret 非混入）を書込前に強制し、push-snapshot は generation 前進を行わず（put-catalog で owner が行う・#147）sourceDigest（非圧縮 .db の sha256）を receipt に併記する。pull は列挙なしで目次が教える相対キーを 1 個ずつ GET し、ストアへ書込・削除を一切しない（.db.gz は展開して .db のみ着地）",
       "platforms": [
         "macos",
@@ -195,7 +195,7 @@
         {
           "path": "i-repo-share",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-share",
-          "sha256": "759c918b1f71a61a87e7cd74abeab31c32dce5b111a0a63f88b7145f7d8dcc27"
+          "sha256": "f1a6bbda9b6c2de6c3db246282e9debfa613a79381f896e92679a54eef2327eb"
         }
       ]
     },
