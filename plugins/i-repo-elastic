@@ -24,7 +24,7 @@
 "use strict";
 
 const PLUGIN = "i-repo-elastic";
-const VERSION = "0.3.0";
+const VERSION = "0.5.0";
 
 const argv = process.argv.slice(2);
 
@@ -48,7 +48,9 @@ if (argv[0] === "--plugin-schema") {
     capabilityDetails: {
       // T2: ネイティブクエリ（仕様 §9）。query --native '<ES query DSL JSON>' を _search へ素通し。
       // read-only はプラグインが強制（エンドポイントを _search に固定＋script(painless)拒否）。audience 既定=human。
-      "native-query": { dialect: "es-query-dsl", input: "json", readOnly: "enforced", audience: ["human"] },
+      // tenantScoped:"enforced"（gemba-adc §3.11）: --endpoint-fp 併用時は query を filter 必須ラップで閉じ込め、
+      // 囲む query を無視する DSL（global agg / terms lookup / pinned / percolate / more_like_this）は拒否。
+      "native-query": { dialect: "es-query-dsl", input: "json", readOnly: "enforced", tenantScoped: "enforced", audience: ["human"] },
     },
     input: ["stdin-ndjson"],
     params: [
@@ -271,23 +273,52 @@ function runQuery(qargs, G) {
     // ES はエンドポイントを _search に固定するので構造的に read-only（_update_by_query 等は呼ばない）。
     // バリデータの主眼は script(painless) 実行の拒否。リソースガード: size(行数)・server&client timeout・出力1MB。
     if (opts.native != null) {
-      const v = validateReadOnlyEsBody(opts.native);
-      if (!v.ok) queryError("E_ARGS", `native query rejected: ${v.reason}`, "read-only の _search ボディ(JSON)のみ・script 不可（仕様 §9）", 2, dest);
+      // tenant-scoped native（gemba-adc §3.11）: --endpoint-fp 併用時はプラグインが境界を機械強制。
+      const scoped = !!opts.endpointFp;
+      let fp = null;
+      if (scoped) {
+        fp = opts.endpointFp;
+        if (!/^[a-f0-9]{64}$/.test(fp)) {
+          queryError("E_ARGS", "invalid --endpoint-fp format for tenant-scoped native query",
+            "endpointFp は SHA-256 hex 小文字64桁です。テナント境界が必要な読み返しは構造化 query / aggregate をご利用ください", 2, dest);
+        }
+      }
+      const v = validateReadOnlyEsBody(opts.native, { scoped });
+      if (!v.ok) {
+        const hint = scoped
+          ? "テナント閉じ込め下では global agg / terms lookup / pinned / percolate / more_like_this 等は使えません。構造化 query / aggregate をご利用ください"
+          : "read-only の _search ボディ(JSON)のみ・script 不可（仕様 §9）";
+        queryError("E_ARGS", `native query rejected: ${v.reason}`, hint, 2, dest);
+      }
+      // 主防御: ユーザー query を bool.filter(term _endpointFp) + must[userQuery] で必須ラップ（本文の外側・外せない）。
+      let body = v.body;
+      if (scoped) {
+        const userQuery = body.query != null ? body.query : { match_all: {} };
+        body = {
+          ...body,
+          query: {
+            bool: {
+              filter: [{ term: { "_endpointFp.keyword": fp } }],
+              must: [userQuery],
+            },
+          },
+        };
+      }
       let timeoutMs = parseInt(opts.nativeTimeoutMs ?? "", 10);
       if (!Number.isFinite(timeoutMs) || timeoutMs < 1) timeoutMs = 10000;
       if (timeoutMs > 60000) timeoutMs = 60000;
       const cap = opts.limit, byteCap = 1_000_000;
-      const userSize = Number(v.body.size);
+      const userSize = Number(body.size);
       // size:0（集計のみ）は尊重し、正の size だけ cap で抑える。未指定(NaN)は cap（§9.6・Codex P2）。
       const size = Math.min(Number.isFinite(userSize) && userSize >= 0 ? userSize : cap, cap);
       // --count-only と併用時は「count first」を尊重: 行は出さず（size:0）total だけ返す。
       // aggs も外して安価なカウントにする（行/集計を転送・開示しない・Codex P2）。
       let reqBody;
       if (opts.countOnly) {
-        const { aggs, aggregations, ...rest } = v.body;
+        const { aggs, aggregations, ...rest } = body;
         reqBody = { ...rest, size: 0, track_total_hits: true, timeout: `${timeoutMs}ms` };
       } else {
-        reqBody = { ...v.body, size, timeout: `${timeoutMs}ms` };                              // server側 timeout（§9.6）
+        reqBody = { ...body, size, timeout: `${timeoutMs}ms` };                              // server側 timeout（§9.6）
       }
 
       const ac = new AbortController();
@@ -317,7 +348,8 @@ function runQuery(qargs, G) {
       // --count-only: 行を出さず total だけ返す（count first・行非開示）。
       if (opts.countOnly) {
         const total = typeof json.hits?.total?.value === "number" ? json.hits.total.value : 0;
-        queryEnd({ count: 0, complete: true, total, nextCursor: null, dest, dedupeApplied: false, native: true });
+        queryEnd({ count: 0, complete: true, total, nextCursor: null, dest, dedupeApplied: false, native: true,
+          ...(scoped ? { tenantScoped: true } : {}) });
         process.exit(0);
       }
       const hits = json.hits.hits;
@@ -341,7 +373,8 @@ function runQuery(qargs, G) {
         if (exactTotal) { if (totalVal > n) truncated = true; }
         else if (hits.length >= size) truncated = true;
       }
-      const end = { count: n, complete: !truncated, truncated, nextCursor: null, dest, dedupeApplied: false, native: true };
+      const end = { count: n, complete: !truncated, truncated, nextCursor: null, dest, dedupeApplied: false, native: true,
+        ...(scoped ? { tenantScoped: true } : {}) };
       // 集計（ファセット）も byteCap のバイト会計に含める。超えるなら trailer 膨張を避けて落とし truncated に（§9.6・Codex P2）。
       if (json.aggregations) {
         if (bytes + Buffer.byteLength(JSON.stringify(json.aggregations)) <= byteCap) {
@@ -442,9 +475,12 @@ function runQuery(qargs, G) {
 // テナント絞り（_endpointFp 厳格）・未宣言/PII 次元ゲートは query/sqlite と同一の砦。
 function runAggregate(aargs, G) {
   const { queryEnd, emitAggRow, queryError } = G.createReadKit(PLUGIN);
+  // --q は query と同じ全文検索フィルタ（extraFlags 方式）。MCP ブリッジは filter:true 宣言を
+  // query/aggregate 両ツールへ転送するため、aggregate でも受理しないと <plugin>_aggregate で E_ARGS になる。
+  // parseAggregateArgs は既に extraFlags 口を持つ（共有 lib/gemba-read.js は変更しない）。
   const opts = G.parseAggregateArgs(aargs, {
     "--url": "url", "--index": "index", "--api-key": "apiKey", "--user": "user", "--password": "password",
-  }, queryError);
+  }, queryError, { "--q": { key: "q" } });
   if (!aargs.includes("--api-key") && process.env.IREPO_ELASTIC_API_KEY) opts.apiKey = process.env.IREPO_ELASTIC_API_KEY;
   if (!aargs.includes("--password") && process.env.IREPO_ELASTIC_PASSWORD) opts.password = process.env.IREPO_ELASTIC_PASSWORD;
   if (!opts.url) queryError("E_ARGS", "--url is required", "集計対象の Elasticsearch URL", 2);
@@ -508,7 +544,12 @@ function runAggregate(aargs, G) {
     if (opts.itemIds.length) filter.push({ terms: { "itemId.keyword": opts.itemIds } });
     // テナント厳格フィルタ（§3.9）: 未タグは term が当たらず自動除外。
     if (opts.endpointFp) filter.push({ term: { "_endpointFp.keyword": opts.endpointFp } });
-    const query = filter.length ? { bool: { filter } } : { match_all: {} };
+    // 全文検索 --q（query 側 L362 と同一述語）。simple_query_string を must に AND して集計対象を絞る。
+    // lenient:true は既定の全フィールド展開(*)が boolean/数値に当たったときの 400 を回避する（query 側と同じ）。
+    const must = opts.q ? [{ simple_query_string: { query: opts.q, default_operator: "and", lenient: true } }] : [];
+    const query = (filter.length || must.length)
+      ? { bool: { ...(filter.length ? { filter } : {}), ...(must.length ? { must } : {}) } }
+      : { match_all: {} };
 
     const grp = { composite: { size: opts.limit, sources } };
     if (Object.keys(subAggs).length) grp.aggs = subAggs;
@@ -551,7 +592,8 @@ function runAggregate(aargs, G) {
 // ── ネイティブクエリ read-only バリデータ（ES・T2 / 仕様 §9）─────────────
 // エンドポイントは _search 固定（プラグインが制御）なので _update_by_query 等は構造的に到達不能。
 // 主リスクは body 内の script(painless) 実行。再帰的に script 系キーを拒否する。
-function validateReadOnlyEsBody(raw) {
+// scoped 時は「囲む query/filter を無視して別コンテキストで評価される DSL」も拒否（gemba-adc §3.11・S4/S5）。
+function validateReadOnlyEsBody(raw, { scoped = false } = {}) {
   let body;
   try { body = JSON.parse(String(raw)); }
   catch (e) { return { ok: false, reason: `JSON parse 失敗: ${e.message}` }; }
@@ -560,14 +602,26 @@ function validateReadOnlyEsBody(raw) {
   }
   // script 実行系に加え wrapper（base64 で別クエリを内包＝再帰スキャンを潜って script を渡せる）も拒否（Codex #35 P1）。
   const FORBIDDEN = new Set(["script", "script_fields", "runtime_mappings", "scripted_metric", "wrapper"]);
+  // scoped 時のバイパス経路（query ラップを無視／別 index・別 doc 文脈で評価）:
+  //   global … aggregation がクエリを無視して全 index を集計
+  //   lookup … terms aggregation の terms lookup（別 index の doc から語を取る）
+  //   pinned / percolate / more_like_this … 囲む bool.filter と別の評価文脈を持ち得る query 型
+  const SCOPED_FORBIDDEN = new Set(["global", "lookup", "pinned", "percolate", "more_like_this", "more_like_this_field"]);
   let bad = null;
   const scan = (o) => {
     if (bad || !o || typeof o !== "object") return;
     if (Array.isArray(o)) { for (const x of o) scan(x); return; }
-    for (const k of Object.keys(o)) { if (FORBIDDEN.has(k)) { bad = k; return; } scan(o[k]); }
+    for (const k of Object.keys(o)) {
+      if (FORBIDDEN.has(k)) { bad = k; return; }
+      if (scoped && SCOPED_FORBIDDEN.has(k)) { bad = k; return; }
+      scan(o[k]);
+    }
   };
   scan(body);
-  if (bad) return { ok: false, reason: `script 実行(${bad})は read-only では不可` };
+  if (bad) {
+    if (FORBIDDEN.has(bad)) return { ok: false, reason: `script 実行(${bad})は read-only では不可` };
+    return { ok: false, reason: `tenant-scoped native では ${bad} は不可（クエリ囲み迂回防止・§3.11）` };
+  }
   return { ok: true, body };
 }
 

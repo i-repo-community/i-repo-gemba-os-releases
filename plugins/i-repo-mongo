@@ -26,7 +26,7 @@
 "use strict";
 
 const PLUGIN = "i-repo-mongo";
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const { spawnSync } = require("node:child_process");
 const { spawnSyncSpec } = require("./lib/spawn.js");
 
@@ -140,7 +140,9 @@ if (argv[0] === "--plugin-schema") {
     // ── T2: ネイティブクエリ（仕様 §9）。query --native '<find filter | aggregation pipeline>' を素通し。
     //    read-only はプラグインが機械強制（read-only stage 限定＋$out/$merge/$where/$function 拒否）。audience 既定=human。
     capabilityDetails: {
-      "native-query": { dialect: "mongo-aggregation", input: "json", readOnly: "enforced", audience: ["human"] },
+      // tenantScoped:"enforced"（gemba-adc §3.11）: --endpoint-fp 併用時は find を $and ラップ /
+      // pipeline 先頭に $match{_endpointFp} を強制付与。クロスコレクション系ステージは $facet 内も含め再帰拒否。
+      "native-query": { dialect: "mongo-aggregation", input: "json", readOnly: "enforced", tenantScoped: "enforced", audience: ["human"] },
     },
     // ── ADC-1（gemba-adc/1.0）着地スキーマ宣言。ネスト保持・camelCase ──
     dataset: [{
@@ -549,7 +551,7 @@ function runAggregate(aargs, G) {
 // ── ネイティブクエリ read-only バリデータ（mongo・T2 / 仕様 §9）─────────────
 // find filter（object）または aggregation pipeline（array）を受ける。書込/JS実行を再帰拒否し、
 // pipeline は read-only stage の whitelist のみ許可（default-deny）。
-function validateReadOnlyMongo(raw) {
+function validateReadOnlyMongo(raw, { scoped = false } = {}) {
   // pipeline で許可する read-only ステージ（default-deny・§9.3）。非掲載は拒否＝$lookup/$unionWith/
   // $graphLookup/$documents（クロスコレクション）・$out/$merge（書込）・$collStats/$currentOp 等を弾く。
   const ALLOWED_STAGES = new Set([
@@ -557,6 +559,10 @@ function validateReadOnlyMongo(raw) {
     "$facet", "$bucket", "$bucketAuto", "$unwind", "$addFields", "$set", "$unset",
     "$sortByCount", "$replaceRoot", "$replaceWith", "$sample",
   ]);
+  // scoped 時に再帰拒否するクロスコレクション・コレクション非依存ステージ（$facet 内も含む・§3.11 S4/S5）。
+  // 非 scoped でも top-level は ALLOWED_STAGES で弾かれるが、$facet 配下は従来スキャン漏れがあり得るため
+  // scoped では明示的に再帰検査する（構造的に境界を破る経路を閉じる）。
+  const SCOPED_CROSS = new Set(["$lookup", "$unionWith", "$graphLookup", "$documents", "$collStats"]);
   let v;
   try { v = JSON.parse(String(raw)); }
   catch (e) { return { ok: false, reason: `JSON parse 失敗: ${e.message}` }; }
@@ -566,23 +572,48 @@ function validateReadOnlyMongo(raw) {
   const scan = (o) => {
     if (bad || !o || typeof o !== "object") return;
     if (Array.isArray(o)) { for (const x of o) scan(x); return; }
-    for (const k of Object.keys(o)) { if (FORBIDDEN.has(k)) { bad = k; return; } scan(o[k]); }
+    for (const k of Object.keys(o)) {
+      if (FORBIDDEN.has(k)) { bad = k; return; }
+      if (scoped && SCOPED_CROSS.has(k)) { bad = k; return; }
+      scan(o[k]);
+    }
   };
   scan(v);
-  if (bad) return { ok: false, reason: `${bad} は read-only では不可` };
+  if (bad) {
+    if (FORBIDDEN.has(bad)) return { ok: false, reason: `${bad} は read-only では不可` };
+    return { ok: false, reason: `tenant-scoped native では ${bad} は不可（クロスコレクション迂回防止・§3.11）` };
+  }
   if (Array.isArray(v)) {
     // pipeline は許可ステージのみ（default-deny・仕様 §9.3）。$lookup/$unionWith/$graphLookup 等の
     // クロスコレクション読み・運用系・書込ステージをまとめて弾く。
-    for (const stage of v) {
-      if (!stage || typeof stage !== "object" || Array.isArray(stage)) {
-        return { ok: false, reason: "各ステージはオブジェクトである必要があります" };
-      }
-      for (const k of Object.keys(stage)) {
-        if (!ALLOWED_STAGES.has(k)) {
-          return { ok: false, reason: `ステージ ${k} は許可されていません（read-only の許可ステージのみ・§9.3）` };
+    // scoped 時は $facet 内のサブパイプラインも同じ ALLOWED + SCOPED_CROSS で再帰検査する。
+    const checkStages = (stages, path) => {
+      if (!Array.isArray(stages)) return `pipeline at ${path} は配列である必要があります`;
+      for (let i = 0; i < stages.length; i++) {
+        const stage = stages[i];
+        if (!stage || typeof stage !== "object" || Array.isArray(stage)) {
+          return `各ステージはオブジェクトである必要があります（${path}[${i}]）`;
+        }
+        for (const k of Object.keys(stage)) {
+          if (!ALLOWED_STAGES.has(k)) {
+            return `ステージ ${k} は許可されていません（read-only の許可ステージのみ・§9.3）`;
+          }
+          if (scoped && k === "$facet") {
+            const facets = stage[k];
+            if (!facets || typeof facets !== "object" || Array.isArray(facets)) {
+              return "$facet の値はオブジェクトである必要があります";
+            }
+            for (const [name, sub] of Object.entries(facets)) {
+              const err = checkStages(sub, `${path}[$facet].${name}`);
+              if (err) return err;
+            }
+          }
         }
       }
-    }
+      return null;
+    };
+    const stageErr = checkStages(v, "$");
+    if (stageErr) return { ok: false, reason: stageErr };
     return { ok: true, kind: "pipeline", pipeline: v };
   }
   if (v && typeof v === "object") return { ok: true, kind: "find", filter: v };
@@ -591,10 +622,29 @@ function validateReadOnlyMongo(raw) {
 
 function runNativeMongo(opts, dest, G, kit) {
   const { queryEnd, emitRow, queryError } = kit;
-  const v = validateReadOnlyMongo(opts.native);
+  // tenant-scoped native（gemba-adc §3.11）: --endpoint-fp 併用時はプラグインが境界を機械強制。
+  const scoped = !!opts.endpointFp;
+  let fp = null;
+  if (scoped) {
+    fp = opts.endpointFp;
+    if (!/^[a-f0-9]{64}$/.test(fp)) {
+      queryError("E_ARGS", "invalid --endpoint-fp format for tenant-scoped native query",
+        "endpointFp は SHA-256 hex 小文字64桁です。テナント境界が必要な読み返しは構造化 query / aggregate をご利用ください", 2, dest);
+    }
+  }
+  const v = validateReadOnlyMongo(opts.native, { scoped });
   if (!v.ok) {
-    queryError("E_ARGS", `native query rejected: ${v.reason}`,
-      "read-only の find filter / aggregation pipeline のみ（$out/$merge/$where/$function 不可・仕様 §9）", 2, dest);
+    const hint = scoped
+      ? "テナント閉じ込め下では $lookup/$unionWith/$graphLookup/$documents/$collStats 等は使えません。構造化 query / aggregate をご利用ください"
+      : "read-only の find filter / aggregation pipeline のみ（$out/$merge/$where/$function 不可・仕様 §9）";
+    queryError("E_ARGS", `native query rejected: ${v.reason}`, hint, 2, dest);
+  }
+  // 主防御: find は {$and:[userFilter,{_endpointFp:fp}]}、pipeline は先頭に {$match:{_endpointFp:fp}} を強制付与。
+  let filter = v.kind === "find" ? v.filter : null;
+  let pipeline = v.kind === "pipeline" ? v.pipeline : null;
+  if (scoped) {
+    if (v.kind === "find") filter = { $and: [filter, { _endpointFp: fp }] };
+    else pipeline = [{ $match: { _endpointFp: fp } }, ...pipeline];
   }
   let timeoutMs = parseInt(opts.nativeTimeoutMs ?? "", 10); // 実行タイムアウト（§9.6）
   if (!Number.isFinite(timeoutMs) || timeoutMs < 1) timeoutMs = 10000;
@@ -606,17 +656,17 @@ function runNativeMongo(opts, dest, G, kit) {
   let script;
   if (opts.countOnly) {
     if (v.kind === "find") {
-      script = `const c=${collExpr};print(JSON.stringify({total:c.countDocuments(${JSON.stringify(v.filter)},{maxTimeMS:${timeoutMs}})}));`;
+      script = `const c=${collExpr};print(JSON.stringify({total:c.countDocuments(${JSON.stringify(filter)},{maxTimeMS:${timeoutMs}})}));`;
     } else {
-      const p = [...v.pipeline, { $count: "total" }];
+      const p = [...pipeline, { $count: "total" }];
       script = `const c=${collExpr};const a=c.aggregate(${JSON.stringify(p)},{maxTimeMS:${timeoutMs}}).toArray();print(JSON.stringify({total:a.length?a[0].total:0}));`;
     }
   } else {
     // 行数(cap)＋出力サイズ(byteCap)を mongosh スクリプト内で打ち切る（親が 64MB buffer する前に止め、
     // 巨大 $facet/幅広ドキュメントでの ENOBUFS を防ぐ・Codex #38 P2）。超過時は __TRUNCATED__ を出す。
     const cursorExpr = v.kind === "find"
-      ? `c.find(${JSON.stringify(v.filter)}).limit(${cap}).maxTimeMS(${timeoutMs})`
-      : `c.aggregate(${JSON.stringify([...v.pipeline, { $limit: cap }])},{maxTimeMS:${timeoutMs}})`;
+      ? `c.find(${JSON.stringify(filter)}).limit(${cap}).maxTimeMS(${timeoutMs})`
+      : `c.aggregate(${JSON.stringify([...pipeline, { $limit: cap }])},{maxTimeMS:${timeoutMs}})`;
     script = `const c=${collExpr};const cur=${cursorExpr};let b=0;`
       + `while(cur.hasNext()){const d=cur.next();const s=EJSON.stringify(d);`
       + `if(b+s.length>${byteCap}){print("__TRUNCATED__");break;}print(s);b+=s.length;}`;
@@ -641,7 +691,8 @@ function runNativeMongo(opts, dest, G, kit) {
   if (opts.countOnly) {
     const parsed = parseNdjsonLines(r.stdout);
     const total = parsed.length && typeof parsed[parsed.length - 1].total === "number" ? parsed[parsed.length - 1].total : 0;
-    queryEnd({ count: 0, complete: true, total, nextCursor: null, dest, dedupeApplied: false, native: true });
+    queryEnd({ count: 0, complete: true, total, nextCursor: null, dest, dedupeApplied: false, native: true,
+      ...(scoped ? { tenantScoped: true } : {}) });
     process.exit(0);
   }
   // 出力サイズはスクリプト内 byteCap で抑え済み。__TRUNCATED__ マーカー or ENOBUFS で打ち切りを判定。
@@ -654,7 +705,8 @@ function runNativeMongo(opts, dest, G, kit) {
     n++;
   }
   if (!truncated && n >= cap) truncated = true; // $limit cap に達した＝まだあるかも
-  queryEnd({ count: n, complete: !truncated, truncated, nextCursor: null, dest, dedupeApplied: false, native: true });
+  queryEnd({ count: n, complete: !truncated, truncated, nextCursor: null, dest, dedupeApplied: false, native: true,
+    ...(scoped ? { tenantScoped: true } : {}) });
   process.exit(0);
 }
 

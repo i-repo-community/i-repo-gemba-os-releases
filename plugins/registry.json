@@ -62,7 +62,7 @@
       "name": "elastic",
       "file": "i-repo-elastic",
       "displayName": "i-repo-elastic",
-      "version": "0.3.0",
+      "version": "0.5.0",
       "description": "Index NDJSON records into Elasticsearch (日本語全文検索・中間一致・ファセット集計の写し)",
       "platforms": [
         "macos",
@@ -83,7 +83,7 @@
         {
           "path": "i-repo-elastic",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-elastic",
-          "sha256": "7506add0f3f9a2dbcece1d1107e4c8c7141583d42fa42542211e2758eb434994"
+          "sha256": "62c5484e97afb35b28ec4d8ede5e03fe31310ae359009fa1dd4267617f8d7e0b"
         }
       ]
     },
@@ -91,7 +91,7 @@
       "name": "mongo",
       "file": "i-repo-mongo",
       "displayName": "i-repo-mongo",
-      "version": "0.3.0",
+      "version": "0.4.0",
       "description": "Upsert NDJSON records into MongoDB (帳票IDキーでネスト構造をドキュメント保持)",
       "platforms": [
         "macos",
@@ -111,7 +111,7 @@
         {
           "path": "i-repo-mongo",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-mongo",
-          "sha256": "18c56898dfa2e8e653bb1cf87319ed989b11ca05f95fc2780cff45b5a67e3687"
+          "sha256": "1ade29b9abb5cfafc80cd7c09d0151a34173056a5939ac3cfd9d27e582e93648"
         }
       ]
     },
@@ -203,7 +203,7 @@
       "name": "sqlite",
       "file": "i-repo-sqlite",
       "displayName": "i-repo-sqlite",
-      "version": "0.3.0",
+      "version": "0.5.0",
       "description": "Accumulate NDJSON records into a local SQLite database (UPSERT by idempotencyKey)",
       "platforms": [
         "macos",
@@ -223,7 +223,7 @@
         {
           "path": "i-repo-sqlite",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-sqlite",
-          "sha256": "f1341f188f4f81f9fd2860dd4d33b9273ec394fef02b5b5a33933b7ee71e3b1d"
+          "sha256": "78f2593009a23f6797b54c11b8e8e492e4add9101bec959f4de56d8ad523898f"
         }
       ]
     },

@@ -24,7 +24,7 @@
 "use strict";
 
 const PLUGIN = "i-repo-sqlite";
-const VERSION = "0.3.0";
+const VERSION = "0.5.0";
 
 // ── 予約フラグ: プラグイン自身の引数より先に判定 ──────────────────────
 const argv = process.argv.slice(2);
@@ -35,6 +35,16 @@ const { resolve } = require("node:path");
 function hasColumn(db, table, col) {
   try { return db.prepare(`PRAGMA table_info("${table}")`).all().some((c) => c.name === col); }
   catch { return false; }
+}
+
+/**
+ * LIKE のワイルドカード（%・_）とエスケープ文字（\）を無効化する（--name 部分一致で使用）。
+ * 呼び出し側は `name LIKE '%' || ? || '%' ESCAPE '\'` 相当のバインド値としてこの戻り値を使い、
+ * ユーザ入力に含まれる %・_ を「リテラル文字」として扱わせる（入力が全件マッチのワイルドカードに
+ * 化けるのを防ぐ）。repo に前例なし・流用可能ヘルパーもないため i-repo-sqlite 内に新規追加。
+ */
+function escapeLike(s) {
+  return String(s).replace(/[\\%_]/g, (c) => "\\" + c);
 }
 
 // ── 構造化集計 aggregate（gemba-adc/1.2）で参照する正準名→列/属性の唯一の宣言源
@@ -78,7 +88,9 @@ if (argv[0] === "--plugin-schema") {
       { name: "--dry-run", type: "boolean", label: "Dry run",
         description: "Validate input without writing" },
       // ── query(読み返し)で受理する選択フィルタの宣言（脱料理: host が汎用描画/転送する印）。
-      //    新しい検索意味は足さない＝既に parseQueryArgs が受理する共通フラグを宣言するだけ。
+      //    大半は parseQueryArgs が受理する共通フラグ（§3.1 の閉集合）を宣言するだけ。
+      //    末尾の --name のみ sqlite 固有の追加フィルタ（canonical name の部分一致・extraFlags 方式で
+      //    sqlite に閉じる。elastic --q と同じ立て付け。§3.1 の共通閉集合には足さない）。
       { name: "--since", type: "string", subcommand: "query", filter: true, label: "開始時刻（含む）",
         placeholder: "2026-06-01 00:00:00", description: "時刻範囲の下限（半開区間 [since, until)）" },
       { name: "--until", type: "string", subcommand: "query", filter: true, label: "終了時刻（含まない）",
@@ -94,6 +106,11 @@ if (argv[0] === "--plugin-schema") {
         description: "itemId の完全一致（反復可・全リビジョン取得）" },
       { name: "--fields", type: "string", subcommand: "query", filter: true, label: "射影フィールド（CSV）",
         description: "正準名で返却フィールドを限定（カンマ区切り）" },
+      // sqlite 固有の追加フィルタ（extraFlags 方式・§3.1 共通閉集合には非追加）。canonical name の中間一致。
+      // 単一語・SQLite 既定照合（ASCII のみ大小無視）・NFKC 正規化なし・%/_ はリテラル（ESCAPE）。
+      // name は fields[] 側で pii:"possible" と宣言済み（下）。params にも filter param として現す。
+      { name: "--name", type: "string", subcommand: "query", filter: true, label: "帳票名称",
+        placeholder: "点検", description: "帳票名称（values.name）の部分一致で絞る（中間一致・単一語）" },
       { name: "--endpoint-fp", type: "string", subcommand: "query", filter: true, label: "テナント指紋（endpointFp）",
         description: "配信元 i-Reporter の endpointFp に厳格一致で絞る（未タグ=旧配信は除外・gemba-adc/1.1 §3.9）" },
     ],
@@ -110,8 +127,11 @@ if (argv[0] === "--plugin-schema") {
     capabilities: ["native-query"],
     // ── T2: ネイティブクエリ能力（仕様 §9）。query --native '<SQL>' で SELECT/WITH を素通し実行。
     //    read-only はプラグインが機械強制（DatabaseSync readOnly + バリデータ）。audience 既定=human のみ。
+    //    tenantScoped:"enforced"（gemba-adc §3.11）: --endpoint-fp 併用時はプラグインがテナント境界を
+    //    機械強制（TEMP VIEW シャドウ＋scoped バリデータ）＝ユーザー供給 SQL で境界を外せない。この宣言を
+    //    厳密一致 ==="enforced" で読んだホストのみ scoped native を許可（不在/別値/typo は fail-closed）。
     capabilityDetails: {
-      "native-query": { dialect: "sql-select", input: "sql", readOnly: "enforced", audience: ["human"] },
+      "native-query": { dialect: "sql-select", input: "sql", readOnly: "enforced", tenantScoped: "enforced", audience: ["human"] },
     },
     dataset: [{
       datasetApi: ["1"], contract: "gemba-adc/1.2", store: "sqlite",
@@ -192,7 +212,7 @@ if (argv[0] === "aggregate") {
 function runQuery(qargs, G) {
   const { queryEnd, emitRow, queryError } = G.createReadKit(PLUGIN);
   const opts = G.parseQueryArgs(qargs, { "--db": "db", "--table": "table" }, queryError,
-    { "--native": { key: "native" }, "--native-timeout-ms": { key: "nativeTimeoutMs" } });
+    { "--name": { key: "name" }, "--native": { key: "native" }, "--native-timeout-ms": { key: "nativeTimeoutMs" } });
   if (!opts.db) queryError("E_ARGS", "--db <path> is required", "読み取り対象の SQLite DB", 2);
   if (!opts.table) opts.table = "reports";
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(opts.table)) queryError("E_ARGS", `invalid table name: ${opts.table}`, null, 2);
@@ -244,6 +264,12 @@ function runQuery(qargs, G) {
   if (opts.deleted != null) { where.push("deleted = ?"); bind.push(opts.deleted ? 1 : 0); }
   if (opts.ids && opts.ids.length) { where.push(`idempotency_key IN (${opts.ids.map(() => "?").join(",")})`); bind.push(...opts.ids); }
   if (opts.itemIds.length) { where.push(`item_id IN (${opts.itemIds.map(() => "?").join(",")})`); bind.push(...opts.itemIds); }
+  // 帳票名称の部分一致（sqlite 固有・extraFlags --name）。中間一致 LIKE '%…%'（%/_ は ESCAPE で
+  // リテラル化）＝入力が全件マッチのワイルドカードへ化けない。SQLite 既定照合（ASCII 大小無視）・
+  // NFKC 正規化なし・単一語。name NULL 行は LIKE が偽で自然に対象外。テナント述語（endpoint_fp）とは
+  // AND で結合されるため tenant-scoped でも安全。索引なし＝フルスキャンだが許容（索引追加はスコープ外）。
+  // ここで where[] に足すことで pageWhere コピー（下）にも伝播し keyset ページングと整合する。
+  if (opts.name) { where.push("name LIKE '%' || ? || '%' ESCAPE '\\'"); bind.push(escapeLike(opts.name)); }
   const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
   const timeFilter = G.buildTimeFilter(opts);
@@ -301,7 +327,131 @@ function runQuery(qargs, G) {
 // ホストは DSL を解釈せず素通し、プラグインがここで read-only を機械強制する。
 // 多層防御: (1) DatabaseSync({readOnly:true}) でエンジンが本体DBへの書込/DDLを拒否、
 //           (2) 下記バリデータで単一 SELECT/WITH 以外・ATTACH・スタック文・WITH内書込を拒否。
-function validateReadOnlySql(sql) {
+//
+// tenant-scoped native（gemba-adc §3.11・--endpoint-fp 併用時）は、上記に加えて childCode 内で
+// 全ユーザーテーブルを endpoint_fp = <fp> で絞る TEMP VIEW でシャドウし（無修飾参照が temp 側へ解決＝
+// 集計/JOIN/CTE を封じ込め）、下記の scoped バリデータでシャドウ迂回口を塞ぐ。境界はユーザー供給 SQL では
+// 外せない。scoped バリデータは **引用状態を追うトークナイザ**で行う（過去、テキストを strip してから regex を
+// 当てる方式が文字列リテラル・引用境界を尊重せず越境漏洩を招いた——Codex 再指摘。字句境界を尊重する）。
+
+// ── SQL 字句スキャナ（ゼロ依存・SQLite 字句規則準拠）─────────────────────
+// 先頭からトークン化し、文字列 '…'（'' escaped）・識別子 "…"("")／[…]／`…`(``)・行コメント --…／
+// ブロックコメント /* … */ をそれぞれの終端規則で 1 トークンとして正しく消費する（コメントと文字列を
+// 取り違えない＝リテラル内の -- や /* を実コメントと誤認しない）。ws/コメントは捨てる。
+// 返り値 { malformed, tokens }。tokens[]: { kind, name?, quoted? }。
+//   kind: 'id'（bare word・"…"・[…]・`…`）| 'str'（'…'）| 'dot' | 'comma' | 'lparen' | 'rparen' | 'num' | 'punct'
+//   name: id/str の正規化論理名（二重化エスケープ復元済み・casefold）。quoted: id が引用形なら true。
+function readQuotedIdent(s, start, q) {
+  let i = start, buf = "";
+  const n = s.length;
+  while (i < n) {
+    if (s[i] === q) { if (s[i + 1] === q) { buf += q; i += 2; continue; } return { text: buf, next: i + 1 }; }
+    buf += s[i++];
+  }
+  return null; // 未終端
+}
+function tokenizeSqlScoped(sql) {
+  const s = String(sql);
+  const n = s.length;
+  const toks = [];
+  let i = 0;
+  const idStart = (c) => c === "_" || (c >= "A" && c <= "Z") || (c >= "a" && c <= "z") || c.charCodeAt(0) > 127;
+  const idPart = (c) => idStart(c) || c === "$" || (c >= "0" && c <= "9");
+  while (i < n) {
+    const c = s[i];
+    if (c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f" || c === "\v") { i++; continue; }
+    if (c === "-" && s[i + 1] === "-") { i += 2; while (i < n && s[i] !== "\n") i++; continue; } // 行コメント
+    if (c === "/" && s[i + 1] === "*") {                                                          // ブロックコメント
+      i += 2; let closed = false;
+      while (i < n) { if (s[i] === "*" && s[i + 1] === "/") { i += 2; closed = true; break; } i++; }
+      if (!closed) return { malformed: true };
+      continue;
+    }
+    if (c === "'") {                                                                              // 文字列リテラル
+      i++; let buf = "", closed = false;
+      while (i < n) {
+        if (s[i] === "'") { if (s[i + 1] === "'") { buf += "'"; i += 2; continue; } i++; closed = true; break; }
+        buf += s[i++];
+      }
+      if (!closed) return { malformed: true };
+      toks.push({ kind: "str", name: buf.toLowerCase() });
+      continue;
+    }
+    if (c === '"') { const r = readQuotedIdent(s, i + 1, '"'); if (!r) return { malformed: true }; toks.push({ kind: "id", quoted: true, name: r.text.toLowerCase() }); i = r.next; continue; }
+    if (c === "`") { const r = readQuotedIdent(s, i + 1, "`"); if (!r) return { malformed: true }; toks.push({ kind: "id", quoted: true, name: r.text.toLowerCase() }); i = r.next; continue; }
+    if (c === "[") {                                                                              // [ … ]（] は escape 不可）
+      i++; let buf = "", closed = false;
+      while (i < n) { if (s[i] === "]") { i++; closed = true; break; } buf += s[i++]; }
+      if (!closed) return { malformed: true };
+      toks.push({ kind: "id", quoted: true, name: buf.toLowerCase() });
+      continue;
+    }
+    if (idStart(c)) { let j = i + 1; while (j < n && idPart(s[j])) j++; toks.push({ kind: "id", quoted: false, name: s.slice(i, j).toLowerCase() }); i = j; continue; }
+    if (c >= "0" && c <= "9") { let j = i + 1; while (j < n && ((s[j] >= "0" && s[j] <= "9") || s[j] === "_")) j++; toks.push({ kind: "num" }); i = j; continue; }
+    if (c === ".") { toks.push({ kind: "dot" }); i++; continue; }
+    if (c === ",") { toks.push({ kind: "comma" }); i++; continue; }
+    if (c === "(") { toks.push({ kind: "lparen" }); i++; continue; }
+    if (c === ")") { toks.push({ kind: "rparen" }); i++; continue; }
+    toks.push({ kind: "punct" }); i++;
+  }
+  return { malformed: false, tokens: toks };
+}
+
+// scoped 判定: トークン列を走査し、シャドウ迂回口を拒否理由として返す＋テーブル参照名の集合を返す。
+//   R1 スキーマ修飾: 論理名 ∈ {main,temp,sqlite_temp} の識別子/文字列トークンの直後（コメント/空白跨ぎは
+//      トークナイザが吸収済み）に `.` が続く（'main'.reports の 5 引用形すべて・Codex P1）。
+//   R2 sqlite_ 接頭辞・R3 pragma_ 接頭辞・R4 eponymous 仮想表 dbstat: **識別子トークン**は常に拒否。
+//      文字列トークンは **テーブル参照位置のときだけ**拒否する（SQLite は FROM 位置で 'sqlite_master' 等の
+//      文字列も識別子として受理して漏らすため／一方 WHERE の 'sqlite_x' 等のデータは通す＝過検知しない）。
+//   tableRefs: テーブル参照位置に現れた識別子/文字列の論理名集合（R5 ビュー突合に使う・二重化エスケープ復元済み）。
+// fail-closed: 未終端引用/コメント等で字句解析に失敗したら reject。
+function analyzeScopedSql(sql) {
+  const scan = tokenizeSqlScoped(sql);
+  if (scan.malformed) return { ok: false, reason: "字句解析に失敗（引用/コメントの不整合・fail-closed）", tableRefs: new Set() };
+  const toks = scan.tokens;
+  const SCHEMA = new Set(["main", "temp", "sqlite_temp"]);
+  const FROMJOIN = new Set(["from", "join"]);
+  // FROM 節（テーブルリスト領域）を終える/切り替えるキーワード。
+  const ENDFROM = new Set(["where", "group", "having", "order", "limit", "offset", "window",
+    "union", "except", "intersect", "on", "using", "values", "set", "returning", "select", "with"]);
+  const dangerReason = (name) =>
+    name === "dbstat" ? "eponymous 仮想表 dbstat は不可（シャドウ対象外・R4）"
+    : /^pragma_/.test(name) ? "pragma_ table-valued 関数は不可（R3）"
+    : "sqlite_ 内部オブジェクト（sqlite_master 等）は不可（R2）";
+  const isDanger = (name) => /^sqlite_/.test(name) || /^pragma_/.test(name) || name === "dbstat";
+  const tableRefs = new Set();
+  let inFrom = false, expectTable = false, reason = null;
+  const stack = [];
+  for (let k = 0; k < toks.length; k++) {
+    const t = toks[k];
+    // '(' はテーブル位置文脈を括弧内へ引き継ぐ（SQLite の table-or-subquery は `'(' table-or-subquery ')'` を許す。
+    // 括弧内先頭が SELECT/WITH/VALUES ならサブクエリとして ENDFROM でリセット、テーブル/ビュー名なら tableRefs へ
+    // 記録して R5 が捕捉する）。expectTable をリセットしないのが要点＝括弧付きビュー参照 `(view)` の取りこぼし防止。
+    if (t.kind === "lparen") { stack.push([inFrom, expectTable]); inFrom = false; continue; }
+    if (t.kind === "rparen") { const st = stack.pop(); inFrom = st ? st[0] : false; expectTable = false; continue; }
+    if (t.kind === "comma") { if (inFrom) expectTable = true; continue; }
+    if (t.kind !== "id" && t.kind !== "str") continue; // dot/num/punct は素通し（FSM に影響しない）
+    // bare 識別子のみがキーワードたり得る（"from" 等の引用/文字列はキーワードでない）
+    if (t.kind === "id" && !t.quoted) {
+      if (FROMJOIN.has(t.name)) { inFrom = true; expectTable = true; continue; }
+      if (ENDFROM.has(t.name)) { inFrom = false; expectTable = false; continue; }
+    }
+    // R1 スキーマ修飾（直後が dot）
+    if (SCHEMA.has(t.name) && toks[k + 1] && toks[k + 1].kind === "dot") {
+      reason = reason || `スキーマ修飾（${t.name}.）は不可（テナント閉じ込め迂回防止 R1）`;
+    }
+    // R2/R3/R4 危険識別子（id は常に・str はテーブル参照位置のみ）
+    if (isDanger(t.name) && (t.kind === "id" || expectTable)) reason = reason || dangerReason(t.name);
+    // テーブル参照位置の実名を記録（修飾子直後 dot のときは実名待ちで expectTable 継続）
+    if (expectTable) {
+      const nextIsDot = toks[k + 1] && toks[k + 1].kind === "dot";
+      if (!nextIsDot) { tableRefs.add(t.name); expectTable = false; }
+    }
+  }
+  return { ok: !reason, reason, tableRefs };
+}
+
+function validateReadOnlySql(sql, { scoped = false } = {}) {
   const s = String(sql || "").trim().replace(/;+\s*$/, ""); // 末尾セミコロン除去
   if (!s) return { ok: false, reason: "空のクエリ" };
   if (s.includes(";")) return { ok: false, reason: "複数文は不可（; 区切りのスタック）" };
@@ -310,14 +460,64 @@ function validateReadOnlySql(sql) {
   if (/^with\b/i.test(s) && /\b(insert|update|delete|replace)\b/i.test(s)) {
     return { ok: false, reason: "WITH 内の書込文は不可" };
   }
+  // ── ここまでは非 scoped native と完全に同一（1ビットも変えない）。以降は scoped 時のみ ──
+  // scoped 追加規則（R1〜R4）は analyzeScopedSql（引用状態を追うトークナイザ）で判定する。文字列リテラル内の
+  // -- や /* を実コメントと誤認しない・データ文字列内の main./sqlite_/dbstat を過検知しない（Codex 再指摘の核）。
+  // R5（ビュー参照拒否）はビュー名一覧が要るため runNativeQuery 側で analyzeScopedSql().tableRefs を使って行う。
+  if (scoped) {
+    const a = analyzeScopedSql(s);
+    if (!a.ok) return { ok: false, reason: a.reason };
+  }
   return { ok: true, sql: s };
 }
 
 function runNativeQuery(dbp, rawSql, opts, kit, dest) {
   const { queryEnd, emitRow, queryError } = kit;
-  const v = validateReadOnlySql(rawSql);
+
+  // テナント閉じ込め経路の判定（gemba-adc §3.11）。--endpoint-fp があれば scoped。
+  const scoped = !!opts.endpointFp;
+  let fp = null;
+  if (scoped) {
+    fp = opts.endpointFp;
+    // scoped 突入前に fp を SHA-256 hex（小文字64桁・docs/SCHEMA.md §2.5a）で厳格に形式検証する
+    // （隔離コピーの述語は bind パラメータだが、想定外形式は早期に E_ARGS で弾く＝S5）。
+    if (!/^[a-f0-9]{64}$/.test(fp)) {
+      queryError("E_ARGS", "invalid --endpoint-fp format for tenant-scoped native query",
+        "endpointFp は SHA-256 hex 小文字64桁です。テナント境界が必要な読み返しは構造化 query / aggregate をご利用ください", 2, dest);
+    }
+  }
+
+  const v = validateReadOnlySql(rawSql, { scoped });
   if (!v.ok) {
-    queryError("E_ARGS", `native query rejected: ${v.reason}`, "read-only の単一 SELECT/WITH のみ許可（仕様 §9）", 2, dest);
+    const hint = scoped
+      ? "テナント閉じ込め下では schema 修飾（main./temp.）・sqlite_master・pragma_/dbstat・ビュー参照は使えません。構造化 query / aggregate をご利用ください"
+      : "read-only の単一 SELECT/WITH のみ許可（仕様 §9）";
+    queryError("E_ARGS", `native query rejected: ${v.reason}`, hint, 2, dest);
+  }
+
+  // R5（早期拒否・多層防御の一枚）: ビュー参照を実行前に fail-closed で拒否する。トークナイザが抽出した
+  // テーブル参照名（論理名・二重化エスケープ復元済み・casefold）にビュー名が含まれれば拒否（括弧付き参照も
+  // lparen 引き継ぎで tableRefs に載る）。**構造的防御は下記の隔離実行**（child が自テナント分のみを :memory:
+  // へコピーして実行）であり、R5 の取りこぼしがあっても越境は起きない。R5 は分かりやすいエラーのための層。
+  if (scoped) {
+    const { DatabaseSync } = require("node:sqlite");
+    let edb;
+    try { edb = new DatabaseSync(dbp, { readOnly: true }); }
+    catch (e) { queryError("E_CONNECT", `cannot open read-only: ${e.message}`, "WAL の場合は配信中でないか確認", 1, dest); }
+    const views = [];
+    try {
+      // 内部オブジェクトの除外は JS で literal 'sqlite_' 接頭辞判定（大小無視）。SQL の LIKE 'sqlite_%' は
+      // _ がワイルドカードで正当なユーザー名 sqliteXreports 等まで巻き込むため使わない（Codex 指摘・バリデータの
+      // /^sqlite_/ と同一意味論）。
+      for (const o of edb.prepare("SELECT name FROM sqlite_master WHERE type='view'").all()) { if (!/^sqlite_/i.test(o.name)) views.push(o.name); }
+    } catch (e) { try { edb.close(); } catch {} queryError("E_INTERNAL", e.message, null, 1, dest); }
+    try { edb.close(); } catch {}
+    const tableRefs = analyzeScopedSql(v.sql).tableRefs;
+    const hitView = views.find((vn) => tableRefs.has(String(vn).toLowerCase()));
+    if (hitView) {
+      queryError("E_ARGS", `native query rejected: ビュー参照はテナント閉じ込め下で不可（${hitView}）`,
+        "ビュー内部の絞りを外側ラップで保証できないため拒否します。構造化 query / aggregate をご利用ください", 2, dest);
+    }
   }
 
   const cap = opts.limit; // 行数キャップ（§9.6・parseQueryArgs が 1..1000 clamp 済み）
@@ -330,15 +530,90 @@ function runNativeQuery(dbp, rawSql, opts, kit, dest) {
   // worker.terminate() もネイティブ呼び出しで block 中のスレッドを止められない。確実に中断するため
   // 別プロセスで実行し、timeout 超過時に SIGKILL で OS に殺させる（巨大集計・非終端 CTE もこれで止まる・
   // §9.6 リソースガード／Codex P2）。行は cap、出力は byteCap で打ち切り＝CPU/時間/メモリすべて有界。
+  //
+  // SQL 本文・fp は argv でなく stdin の JSON job で渡す（landmine「SQL/JS 本文は stdin」契約）。
+  //
+  // ── 構造的防御（主防御）: 隔離実行（gemba-adc §3.11）──────────────────────────
+  // scoped 時、childCode は**自テナント分（endpoint_fp = fp）のみ**を新しい :memory: DB へ物理コピーし、
+  // ユーザー SQL をそのコピー DB に対してだけ実行する。元ファイルは切り離され到達不能＝他テナント行が物理的に
+  // 存在しないので、ビュー・仮想表（dbstat 等）・スキーマ修飾（main.）・括弧・文字列識別子といったあらゆる字句
+  // トリックが原理的に無効化される（tokenizer/engine の parity gap に賭けない＝3度の越境の根本対策）。
+  // ビューは複製しない＝参照は「no such table」で fail-closed（S3/S4）。endpoint_fp 列なしテーブルは空で複製。
+  // 字句バリデータ（validateReadOnlySql の scoped トークナイザ・上の R5）は早期の分かりやすいエラーを出す層として残す。
+  //
+  // コピー予算（P2・自テナント DoS 対策）: 隔離コピーは自テナント全行が必要（集計の正しさ）ゆえユーザーの
+  // --limit を適用できない。代わりに独立のハード上限（行数・累積バイト）を設け、超過したら fail-closed で停止する
+  // （越境させず OOM 前に止める）。既定は 50 万行 / 64MB＝出力ガード（1MB・limit 上限1000）より十分広く、かつ
+  // timeout の SIGKILL が効く前にメモリを守れる妥当値。巨大テナントは構造化 query/aggregate を使う（hint）。
+  // 予算は運用/検証のため env で調整可（下げるほど安全側＝越境を招かないので低リスク）。既定は上記。
+  const envBudget = (name, def) => { const v = parseInt(process.env[name] ?? "", 10); return Number.isFinite(v) && v > 0 ? v : def; };
+  const COPY_ROW_BUDGET = envBudget("IREPO_NATIVE_COPY_ROW_BUDGET", 500000);
+  const COPY_BYTE_BUDGET = envBudget("IREPO_NATIVE_COPY_BYTE_BUDGET", 64 * 1024 * 1024);
   const childCode = `
-    const { DatabaseSync } = require("node:sqlite");
-    const [dbp, sql, capStr, byteCapStr] = process.argv.slice(1);
-    const cap = parseInt(capStr, 10), byteCap = parseInt(byteCapStr, 10);
-    const db = new DatabaseSync(dbp, { readOnly: true });
+    const fs = require("node:fs");
+    const { DatabaseSync, constants } = require("node:sqlite");
+    const job = JSON.parse(fs.readFileSync(0, "utf8"));           // stdin JSON job（fd 0）
+    const { dbp, sql, cap, byteCap, scoped, fp, copyRowBudget, copyByteBudget } = job;
+    const q = (id) => '"' + String(id).replace(/"/g, '""') + '"';
+    let db;
+    if (scoped) {
+      const src = new DatabaseSync(dbp, { readOnly: true });
+      db = new DatabaseSync(":memory:");                          // 隔離先（元ファイルとは別 DB）
+      // authorizer は**コピー前**（接続直後）に設置する。コピー段の DDL/DML はスタック実行され得るため、
+      // ATTACH/DETACH/load_extension をこの時点から全域で拒否して元ファイル等への横入りを塞ぐ（Codex P1）。
+      db.setAuthorizer((action, a1, a2) => {
+        if (action === constants.SQLITE_ATTACH || action === constants.SQLITE_DETACH) return constants.SQLITE_DENY;
+        if (action === constants.SQLITE_FUNCTION && typeof a2 === "string" && a2.toLowerCase() === "load_extension") return constants.SQLITE_DENY;
+        return constants.SQLITE_OK;
+      });
+      // 列の宣言型 → SQLite 親和性 5 語（INTEGER/TEXT/BLOB/REAL/NUMERIC）または空（無親和）への写像。
+      // PRAGMA table_info.type は外部入力なので DDL へ逐語連結しない（スタック DDL 注入＝T5h）。
+      // 一方で型なし CREATE だと affinity が落ち、typeof()/比較が非 scoped とずれる（P2）。閉集合語のみ連結する。
+      const affinityOf = (decl) => {
+        const t = String(decl || "").toUpperCase();
+        if (t.includes("INT")) return "INTEGER";
+        if (t.includes("CHAR") || t.includes("CLOB") || t.includes("TEXT")) return "TEXT";
+        if (t.includes("BLOB")) return "BLOB";
+        if (t.includes("REAL") || t.includes("FLOA") || t.includes("DOUB")) return "REAL";
+        if (!t) return ""; // 空宣言＝無親和（SQLite の BLOB/NONE 相当）＝型キーワードを付けない
+        return "NUMERIC";
+      };
+      let copied = 0, copiedBytes = 0, over = false;
+      for (const t of src.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()) {
+        if (/^sqlite_/i.test(t.name)) continue; // 内部表のみ除外（literal 接頭辞・LIKE の _ ワイルドカード誤爆回避・Codex 指摘）
+        const cols = src.prepare("PRAGMA table_info(" + q(t.name) + ")").all();
+        if (!cols.length) continue;
+        const colDefs = cols.map((c) => {
+          const aff = affinityOf(c.type);
+          return aff ? (q(c.name) + " " + aff) : q(c.name);
+        }).join(", ");
+        db.exec("CREATE TABLE " + q(t.name) + " (" + colDefs + ")");
+        if (!cols.some((c) => c.name === "endpoint_fp")) continue; // endpoint_fp 列なし＝未タグのみ＝空で複製（fail-closed・S3）
+        const ins = db.prepare("INSERT INTO " + q(t.name) + " VALUES (" + cols.map(() => "?").join(", ") + ")");
+        db.exec("BEGIN");
+        for (const row of src.prepare("SELECT * FROM main." + q(t.name) + " WHERE endpoint_fp = ?").iterate(fp)) {
+          copied++; copiedBytes += Buffer.byteLength(JSON.stringify(row, (_, v) => typeof v === "bigint" ? Number(v) : v));
+          if (copied > copyRowBudget || copiedBytes > copyByteBudget) { over = true; break; } // コピー予算超過＝OOM 前に停止
+          // node:sqlite は JS number を REAL でバインドするため、INTEGER 親和列の整数は BigInt で INTEGER を保つ。
+          ins.run(...cols.map((c) => {
+            const v = row[c.name];
+            if (typeof v === "number" && Number.isInteger(v) && affinityOf(c.type) === "INTEGER") return BigInt(v);
+            return v;
+          }));
+        }
+        db.exec("COMMIT");
+        if (over) break;
+      }
+      src.close();
+      if (over) { process.stdout.write("__COPY_BUDGET_EXCEEDED__\\n"); db.close(); process.exit(0); }
+    } else {
+      db = new DatabaseSync(dbp, { readOnly: true });              // 非 scoped は従来どおり元 DB を直接（1ビット不変）
+    }
     let n = 0, bytes = 0, truncated = false;
+    const json = (row) => JSON.stringify(row, (_, v) => typeof v === "bigint" ? Number(v) : v);
     for (const row of db.prepare(sql).iterate()) {
       if (n >= cap) { truncated = true; break; }          // 行数キャップ
-      const line = JSON.stringify(row) + "\\n";
+      const line = json(row) + "\\n";
       if (bytes + Buffer.byteLength(line) > byteCap) { truncated = true; break; } // 結果サイズキャップ（巨大行は出さない）
       process.stdout.write(line); bytes += Buffer.byteLength(line); n++;
     }
@@ -346,8 +621,9 @@ function runNativeQuery(dbp, rawSql, opts, kit, dest) {
     db.close();
   `;
   const { spawnSync } = require("node:child_process");
-  const r = spawnSync(process.execPath, ["-e", childCode, dbp, v.sql, String(cap), String(byteCap)],
-    { encoding: "utf8", timeout: timeoutMs, killSignal: "SIGKILL", maxBuffer: 64 * 1024 * 1024 });
+  const job = { dbp, sql: v.sql, cap, byteCap, scoped, fp, copyRowBudget: COPY_ROW_BUDGET, copyByteBudget: COPY_BYTE_BUDGET };
+  const r = spawnSync(process.execPath, ["-e", childCode],
+    { input: JSON.stringify(job), encoding: "utf8", timeout: timeoutMs, killSignal: "SIGKILL", maxBuffer: 64 * 1024 * 1024 });
 
   if (r.signal === "SIGKILL" || (r.error && r.error.code === "ETIMEDOUT")) {
     queryError("E_TIMEOUT", `native query exceeded ${timeoutMs}ms`, "より絞り込んだクエリにしてください（§9.6 リソースガード）", 1, dest);
@@ -357,22 +633,35 @@ function runNativeQuery(dbp, rawSql, opts, kit, dest) {
     queryError("E_INTERNAL", `native exec failed: ${detail}`, "SELECT 文と列名を確認", 1, dest);
   }
 
+  // 隔離コピー予算の超過（P2・自テナント DoS 対策）。越境させず fail-closed で拒否する。
+  if ((r.stdout || "").split("\n").includes("__COPY_BUDGET_EXCEEDED__")) {
+    queryError("E_ARGS", "tenant data exceeds tenant-scoped native isolation budget",
+      "テナントのデータ量が native 隔離実行の上限を超過しました。構造化 query / aggregate をご利用ください", 2, dest);
+  }
+
   let truncated = false;
   const rows = [];
   for (const ln of (r.stdout || "").split("\n")) {
     if (!ln) continue;
     if (ln === "__TRUNCATED__") { truncated = true; continue; }
+    if (ln === "__COPY_BUDGET_EXCEEDED__") continue;
     try { rows.push(JSON.parse(ln)); } catch {}
   }
   let i = 0;
   for (const row of rows) { emitRow(`native:${i}`, null, row, true); i++; } // 任意形は raw で出す
-  queryEnd({ count: rows.length, complete: !truncated, truncated, nextCursor: null, dest, dedupeApplied: false, native: true });
+  // query-end。強制適用時のみ tenantScoped:true を additive に追記（監査信号・S7）。
+  queryEnd({ count: rows.length, complete: !truncated, truncated, nextCursor: null, dest,
+    dedupeApplied: false, native: true, ...(scoped ? { tenantScoped: true } : {}) });
   process.exit(0);
 }
 
 function runAggregate(aargs, G) {
   const { queryEnd, emitAggRow, queryError } = G.createReadKit(PLUGIN);
-  const opts = G.parseAggregateArgs(aargs, { "--db": "db", "--table": "table" }, queryError);
+  // --name は query と同じ sqlite 固有フィルタ（extraFlags 方式）。MCP ブリッジは filter:true 宣言を
+  // query/aggregate 両ツールへ転送するため、aggregate でも受理しないと <plugin>_aggregate で E_ARGS になる。
+  // parseAggregateArgs は既に extraFlags 口を持つ（gemba-read.js は変更しない）。
+  const opts = G.parseAggregateArgs(aargs, { "--db": "db", "--table": "table" }, queryError,
+    { "--name": { key: "name" } });
   if (!opts.db) queryError("E_ARGS", "--db <path> is required", "集計対象の SQLite DB", 2);
   if (!opts.table) opts.table = "reports";
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(opts.table)) queryError("E_ARGS", `invalid table name: ${opts.table}`, null, 2);
@@ -458,6 +747,8 @@ function runAggregate(aargs, G) {
   if (opts.deleted != null) { where.push("deleted = ?"); bind.push(opts.deleted ? 1 : 0); }
   if (opts.ids && opts.ids.length) { where.push(`idempotency_key IN (${opts.ids.map(() => "?").join(",")})`); bind.push(...opts.ids); }
   if (opts.itemIds.length) { where.push(`item_id IN (${opts.itemIds.map(() => "?").join(",")})`); bind.push(...opts.itemIds); }
+  // 帳票名称の部分一致（query と同一述語・escapeLike を共用）。名前で絞った集計はテナント述語と AND される。
+  if (opts.name) { where.push("name LIKE '%' || ? || '%' ESCAPE '\\'"); bind.push(escapeLike(opts.name)); }
   const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
   // ── ORDER BY（top-N の決定性）。by は measure alias か dimension key のみ ──
