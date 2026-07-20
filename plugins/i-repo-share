@@ -90,6 +90,9 @@
  *   i-repo share revoke-ticket-gcs   --to gs://bucket/prefix --jti <uuid> [--credential-ref <keyId> --reader-service-account <email>] [options]
  *   i-repo share revoke-ticket-azure --to https://<acct>.blob.core.windows.net/<container>/<p> --jti <uuid> [options]
  *   i-repo share revoke-ticket-local --to <folder|network-share> --jti <uuid> [options]
+ *   i-repo share presign-s3    --to s3://bucket/prefix --key documents/<file> --expires <n(m|h|d|w)|ISO> [options]
+ *   i-repo share presign-gcs   --to gs://bucket/prefix --key documents/<file> --expires <n(m|h|d|w)|ISO> [options]
+ *   i-repo share presign-azure --to https://<acct>.blob.core.windows.net/<container>/<p> --key documents/<file> --expires <n(m|h|d|w)|ISO> [options]
  *   i-repo share show-pubkey [--kid k-…]
  *   i-repo share rotate-key
  * push-snapshot は実装済み（#147・実体 PUT＋verify まで）。ls / get は本弾では未実装（spec §11 の Phase 3）。
@@ -116,12 +119,26 @@
  *     s3/azure/local は資格側操作なし（s3=共有資格・azure=exp＋協調・local=資格概念なし）。receipt に `revocation` と
  *     `credentialRevoked:true|false` を正直に載せる。keyId/SA は発行台帳 issued/<jti>.json（PR (a)）から解決し、`--credential-ref`・
  *     `--reader-service-account` で上書き可。
+ *   - **鍵削除の冪等性（#172）**: gcs の SA 鍵 delete が NOT_FOUND（404・鍵が既に無い＝過去の失効の途中終了/環境掃除）を返したら
+ *     「既に失効済み」＝失効の目的状態は達成済みとして**冪等成功**扱いにし（credentialRevoked:true＋receipt に credentialAlreadyAbsent:true）、
+ *     verify 相も通常どおり通す。分類は gcloud の **stderr（診断）だけ**で行い e.message は使わない（message はフルコマンド＋argv を
+ *     前置するため、SA email 等ユーザ制御 argv の "404" 等に誤マッチして false success へ陥る危険がある・#173）。
+ *     PERMISSION_DENIED（roles/iam.serviceAccountKeyAdmin 不足、または gcloud の仕様上 **SA 自体の不存在**）は NOT_FOUND と区別して
+ *     実因を報告し従来どおり失敗させる。SA 不存在っぽい NOT_FOUND 文言（"unknown service account" 等）も冪等成功にせず失敗させる。
  *   - **協調的失効リスト revoked.json**（shareRoot 直下・recordType:"share-revocations"）: jti を CAS マージ PUT する
  *     （GET→etag→jti 和集合マージ〔同一 jti は revokedAt min 勝ち・同刻 kid 辞書順＝決定的〕→ --if-match/--if-none-match PUT・
  *     bounded read-merge-write リトライ 3 回・3 敗 exit 3・local は temp→rename）。**強制の本体ではなく補助**（§5.5）。
  *   - **pull --ticket-jti**（任意）: 目次 GET 直後に revoked.json を GET し、jti 掲載なら **materialize 前に exit 1**（out 未 commit）。
  *     404→続行（fail-open）・parse 不能/版違い→ stderr 警告のみ続行（強制の本体は資格無効化）。
  *   - secret 衛生（SI-5）: revoked.json・receipt・エラーに credential 実値/チケット URI を載せない（scrubMsg/dropQuery 流儀）。
+ *
+ * 【presign 系（presign-{s3,gcs,azure}・spec §9.9・#175）の設計要点】
+ *   - 1 オブジェクトの短命 signed URL（**GET のみ**）を mint する。PUT/DELETE の署名は発行しない（read-only 境界）。
+ *     azure=コンテナ SAS mint（§9.7.3）の object SAS 縮退（az storage blob generate-sas --permissions r --https-only）、
+ *     s3=aws s3 presign（per-object・vendor CLI 標準）、gcs=gsutil signurl（signed URL・SA 鍵ファイル必須）。
+ *   - **signed URL は secret**（SI-5）: stdout 最終行の専用レコード（recordType:"presigned-url"）でのみ返し、
+ *     receipt・ログ・エラーに URL（sig=/X-Amz-Signature=）を一切出さない。消費者は台帳・監査にも残さないこと（§9.9）。
+ *   - 資格は既存の書き手 auth フラグを流用（secret は argv でなく env・§8.1）。local は対象外（presign 相手がいない）。
  */
 "use strict";
 
@@ -139,7 +156,7 @@ const { join, dirname, basename, resolve, relative, isAbsolute, sep } = require(
 const { spawnSpec } = require("./lib/spawn.js");
 
 const PLUGIN = "i-repo-share";
-const VERSION = "0.5.0";
+const VERSION = "0.6.0";
 const PLUGIN_API = "1";
 
 const PUT_SUBS = ["put-catalog-s3", "put-catalog-gcs", "put-catalog-azure", "put-catalog-local"];
@@ -154,6 +171,9 @@ const ISSUE_SUBS = ["issue-ticket-s3", "issue-ticket-gcs", "issue-ticket-azure",
 // shareRoot の revoked.json（協調的失効リスト）を CAS マージ PUT する destructive verb。真の失効は credential
 // 側であり revoked.json は補助（fail-open・強制の本体ではない）。pull-* の --ticket-jti が読む。
 const REVOKE_SUBS = ["revoke-ticket-s3", "revoke-ticket-gcs", "revoke-ticket-azure", "revoke-ticket-local"];
+// presign-*（spec §9.9・#175）: 1 オブジェクトの短命 signed URL（GET のみ）を mint する read-only verb。
+// local は無い（presign 相手となるオブジェクトストアが存在しない）。DC #504 が消費者。
+const PRESIGN_SUBS = ["presign-s3", "presign-gcs", "presign-azure"];
 
 // 「更新中」（目次 sha256 ≠ 取得実体）と判断したときに、目次から丸ごと再読するまでの待ち時間
 // （§3.4/§7.3）。既定 1500ms・テストは IREPO_SHARE_PULL_RETRY_MS=10 で短縮する。schema には載せない
@@ -185,9 +205,9 @@ if (arg0 === "--plugin-schema") {
   // パイプへの非同期書込なので、直後の process.exit(0) が未フラッシュ分を切り捨てる（spawnSync 経由で JSON が
   // 途中欠落する回帰）。fs.writeSync(1,…) で**同期的に全量書き切って**から exit する（部分書きはループで吸収）。
   const schemaJson = JSON.stringify({
-    pluginApi: [PLUGIN_API], schemaVersions: ["1.0"], recordTypes: ["share-ticket"],
+    pluginApi: [PLUGIN_API], schemaVersions: ["1.0"], recordTypes: ["share-ticket", "presigned-url"],
     name: PLUGIN, version: VERSION,
-    description: "gemba-share の目次系オブジェクト（share-catalog.json / dataset.json / runs/<YYYY-MM>.ndjson）を shareRoot へ clean に PUT する egress verb（put-catalog-*）、snapshot 実体（バイナリ .db/.db.gz）を世代キーへ clean に単発 PUT する egress verb（push-snapshot-*）、目次を辿って着地実体をローカルへ取り戻す read-only な pull verb（pull-*）。put/push はどちらも 1 オブジェクトを 1 キーへ置くだけで archive push と違い bundle レイアウト・着地 receipt・manifests を一切作らない。put-catalog は SI-1（ローカル絶対パス非混入）と SI-5（secret 非混入）を書込前に強制し、push-snapshot は generation 前進を行わず（put-catalog で owner が行う・#147）sourceDigest（非圧縮 .db の sha256）を receipt に併記する。pull は列挙なしで目次が教える相対キーを 1 個ずつ GET し、ストアへ書込・削除を一切しない（.db.gz は展開して .db のみ着地）",
+    description: "gemba-share の目次系オブジェクト（share-catalog.json / dataset.json / runs/<YYYY-MM>.ndjson）を shareRoot へ clean に PUT する egress verb（put-catalog-*）、snapshot 実体（バイナリ .db/.db.gz）を世代キーへ clean に単発 PUT する egress verb（push-snapshot-*）、目次を辿って着地実体をローカルへ取り戻す read-only な pull verb（pull-*）。put/push はどちらも 1 オブジェクトを 1 キーへ置くだけで archive push と違い bundle レイアウト・着地 receipt・manifests を一切作らない。put-catalog は SI-1（ローカル絶対パス非混入）と SI-5（secret 非混入）を書込前に強制し、push-snapshot は generation 前進を行わず（put-catalog で owner が行う・#147）sourceDigest（非圧縮 .db の sha256）を receipt に併記する。pull は列挙なしで目次が教える相対キーを 1 個ずつ GET し、ストアへ書込・削除を一切しない（.db.gz は展開して .db のみ着地）。presign-* は 1 オブジェクトの短命 signed URL（GET のみ）を mint し stdout 最終行の presigned-url レコードでのみ返す（URL は secret・SI-5・spec §9.9）",
     phases: ["write", "verify", "read"],
     platforms: ["macos", "linux", "windows"],
     // sink（put-catalog-*）＋ read（pull-*・read-only な取り戻し）。
@@ -252,11 +272,20 @@ if (arg0 === "--plugin-schema") {
       { name: "revoke-ticket-s3", input: ["none"], destructive: true,
         description: "S3 shareRoot（--to）で --jti のチケットを失効する。S3 は資格側の個別失効手段が無い（shared-credential）ため revoked.json（協調的失効リスト）に jti を CAS 追記するのみ・要 aws CLI" },
       { name: "revoke-ticket-gcs", input: ["none"], destructive: true,
-        description: "GCS shareRoot（--to）で --jti のチケットを失効する。SA 鍵を実削除（gcloud iam service-accounts keys delete・individual）し revoked.json にも jti を CAS 追記・要 gcloud CLI" },
+        description: "GCS shareRoot（--to）で --jti のチケットを失効する。SA 鍵を実削除（gcloud iam service-accounts keys delete・individual）し revoked.json にも jti を CAS 追記・要 gcloud CLI（鍵が既に無い NOT_FOUND は「既に失効済み」として冪等成功）" },
       { name: "revoke-ticket-azure", input: ["none"], destructive: true,
         description: "Azure Blob shareRoot（--to）で --jti のチケットを失効する。SAS の個別失効は不可（expiry-only）ため revoked.json に jti を CAS 追記するのみ・要 az CLI" },
       { name: "revoke-ticket-local", input: ["none"], destructive: true,
         description: "フォルダ/ネットワーク共有 shareRoot（--to）で --jti のチケットを失効する。資格概念なし（none）ため revoked.json（temp→rename）に jti を追記するのみ・外部CLI不要" },
+      // presign-*（spec §9.9・#175）: 1 オブジェクトの短命 signed URL（GET のみ）を mint する read-only verb。
+      // signed URL は secret（SI-5）で stdout 最終行の presigned-url レコードのみに出し、receipt・ログ・エラーには
+      // 一切出さない。ストアへ write/delete はしない（署名の mint のみ）。GUI 配信フォームには出ない host-managed verb。
+      { name: "presign-s3", input: ["none"], mode: "read", output: ["records"], destructive: false,
+        description: "S3 の 1 オブジェクト（<to>/<key>）の短命 presigned URL（GET のみ）を aws s3 presign で mint する（read-only・URL は presigned-url レコードのみ・SI-5）。要 aws CLI" },
+      { name: "presign-gcs", input: ["none"], mode: "read", output: ["records"], destructive: false,
+        description: "GCS の 1 オブジェクト（<to>/<key>）の短命 signed URL（GET のみ）を gsutil signurl で mint する（read-only・要 SA 鍵ファイル --gcp-credentials・URL は presigned-url レコードのみ・SI-5）。要 gsutil" },
+      { name: "presign-azure", input: ["none"], mode: "read", output: ["records"], destructive: false,
+        description: "Azure Blob の 1 オブジェクト（<to>/<key>）の短命 SAS URL（GET のみ）を az storage blob generate-sas で mint する（read-only・--permissions r --https-only・URL は presigned-url レコードのみ・SI-5）。要 az CLI" },
     ],
     params: [
       // --to（shareRoot）: backend ごとに形が違うので個別宣言。{flow} 等のトークン展開はしない
@@ -465,7 +494,7 @@ if (arg0 === "--plugin-schema") {
           description: "チケット sub クレーム（発行先の識別子）。receipt の issuedTo・発行台帳にも載る（非 secret）" },
         { name: "--expires", type: "string", required: true, subcommand: sub,
           label: "有効期限（必須）", placeholder: "7d ・ 36h ・ 2026-08-01T00:00:00Z",
-          description: "チケット exp。相対（^\\d+(h|d|w)$＝iat+n）または完全 ISO 8601 日時（Z/オフセット付き）。裸の YYYY-MM-DD は exit 2（…T00:00:00Z 形式で指定する）。azure は mint する SAS の --expiry にも焼く（実強制）" },
+          description: "チケット exp。相対（^\\d+(m|h|d|w)$＝iat+n。m=分・#175）または完全 ISO 8601 日時（Z/オフセット付き）。裸の YYYY-MM-DD は exit 2（…T00:00:00Z 形式で指定する）。azure は mint する SAS の --expiry にも焼く（実強制）" },
         { name: "--no-publish-key", type: "boolean", subcommand: sub, filter: false,
           label: "公開鍵を配置しない",
           description: "keys/<kid>.json（公開鍵 JWK）の shareRoot 配置を省略する。真正性は帯域外ピンのみが根拠なので配置は利便置き場に過ぎない（spec §5.4 自己参照封じ）。ストア側 CLI/資格が無い発行にも使える" },
@@ -570,6 +599,50 @@ if (arg0 === "--plugin-schema") {
       { name: "--sas", type: "string", subcommand: "revoke-ticket-azure", secret: true, envVar: "AZURE_STORAGE_SAS_TOKEN",
         label: "発行者 SAS トークン（任意）",
         description: "revoked.json の GET/PUT のための発行者 SAS。値は argv ではなく環境変数で az に渡す" },
+
+      // ── presign-*（短命 signed URL mint・spec §9.9・#175）の引数 ──
+      // --to（ベース URI・この直下の <key> を署名する）は backend ごとに形が違うので個別宣言。
+      { name: "--to", type: "string", required: true, subcommand: "presign-s3",
+        label: "S3 ベース URI", placeholder: "s3://bucket/prefix",
+        description: "署名対象オブジェクトの親となる S3 URI（この直下の <key> を presign）。shareRoot 基準（SAS/query は含めない）" },
+      { name: "--to", type: "string", required: true, subcommand: "presign-gcs",
+        label: "GCS ベース URI", placeholder: "gs://bucket/prefix",
+        description: "署名対象オブジェクトの親となる GCS URI（この直下の <key> を signurl）" },
+      { name: "--to", type: "string", required: true, subcommand: "presign-azure",
+        label: "Azure Blob ベース URI", placeholder: "https://<account>.blob.core.windows.net/<container>/<prefix>",
+        description: "署名対象オブジェクトの親となる Azure Blob URI（blob endpoint URL・SAS を URL に含めない＝[?#] 付きは exit 2）。この直下の <key> を blob SAS で署名" },
+      // 共通（3 サブコマンド共通）。--key/--expires は必須。
+      ...PRESIGN_SUBS.flatMap((sub) => [
+        { name: "--key", type: "string", required: true, subcommand: sub,
+          label: "オブジェクトキー（必須）", placeholder: "documents/123.pdf",
+          description: "署名する 1 オブジェクトのベース URI 相対キー（既定なし・必須）。spec §2 の relKey 文法で検証（印字可能 ASCII のみ・先頭 / ~ 禁止・# ? % @ : \\ 禁止・.. 禁止）。違反は exit 2" },
+        { name: "--expires", type: "string", required: true, subcommand: sub,
+          label: "URL 有効期限（必須）", placeholder: "15m ・ 1h ・ 2026-07-20T13:00:00Z",
+          description: "signed URL の期限。相対（^\\d+(m|h|d|w)$＝iat+n。m=分）または完全 ISO 8601 日時（Z/オフセット付き）。裸の YYYY-MM-DD は exit 2。presign は分〜十数分の短命を想定。azure は mint する SAS の --expiry にも焼く（実強制）" },
+        { name: "--dry-run", type: "boolean", subcommand: sub, label: "Dry run",
+          description: "検査（引数・--key/--expires 文法・認証の充足）だけ行い write receipt（dryRun:true）を 1 行返す。mint せず presigned-url レコードも出さない" },
+      ]),
+      // presign-s3 認証（put-catalog-s3 と同名・同 envVar。secret 値は argv でなく env で aws へ）。
+      { name: "--access-key-id", type: "string", subcommand: "presign-s3", envVar: "AWS_ACCESS_KEY_ID",
+        label: "AWS アクセスキーID（任意・無人用）",
+        description: "presign（aws s3 presign）に使う IAM アクセスキーID。値は環境変数 AWS_ACCESS_KEY_ID で aws に渡す。相方（secret）は envVar でも可（#144）" },
+      { name: "--secret-access-key", type: "string", subcommand: "presign-s3", secret: true, envVar: "AWS_SECRET_ACCESS_KEY",
+        label: "AWS シークレットアクセスキー（任意・無人用）",
+        description: "IAM シークレットアクセスキー。値は argv に出さず環境変数 AWS_SECRET_ACCESS_KEY で aws に渡す" },
+      { name: "--profile", type: "string", subcommand: "presign-s3", envVar: "AWS_PROFILE",
+        label: "AWS プロファイル（任意）",
+        description: "named profile（~/.aws 構成）。値は環境変数 AWS_PROFILE で aws に渡す" },
+      { name: "--region", type: "string", subcommand: "presign-s3", envVar: "AWS_REGION",
+        label: "AWS リージョン（任意）",
+        description: "リージョン。値は環境変数 AWS_REGION で aws に渡す" },
+      // presign-gcs 認証: gsutil signurl は SA 秘密鍵ファイルを位置引数に取るため --gcp-credentials は**必須**。
+      { name: "--gcp-credentials", type: "string", required: true, subcommand: "presign-gcs", envVar: "GOOGLE_APPLICATION_CREDENTIALS",
+        label: "GCP サービスアカウント鍵のパス（必須）",
+        description: "gsutil signurl の署名鍵（サービスアカウント鍵 JSON のファイルパス）。env GOOGLE_APPLICATION_CREDENTIALS でも可。署名対象オブジェクトへの読み取り権を持つ SA の鍵であること" },
+      // presign-azure 認証: blob SAS の mint は account key 系が必須（既存 SAS からの再署名は不可＝--sas は宣言しない）。
+      { name: "--connection-string", type: "string", subcommand: "presign-azure", secret: true, envVar: "AZURE_STORAGE_CONNECTION_STRING",
+        label: "接続文字列（任意）",
+        description: "blob SAS mint（az storage blob generate-sas）の署名に使うストレージアカウント接続文字列。値は argv ではなく環境変数で az に渡す（未指定時は az login＋listKeys）" },
     ],
     // dataset ブロックは宣言しない: これは gemba-adc の dataset ではない（gemba-share の
     // 存在は spec/gemba-share が正本）。report-delete 型＝カタログに載らない fail-open 追加。
@@ -619,17 +692,22 @@ async function healthcheck() {
   // （local は Node fs のみ・pull-azure は内蔵 fetch）なので全体 ok は常に true。
   const checks = [];
   checks.push({
-    name: "aws-cli", ok: await commandExists("aws", ["--version"]), severity: "required-for:put-catalog-s3,push-snapshot-s3,pull-s3,issue-ticket-s3,revoke-ticket-s3",
-    hint: "Install AWS CLI v2 to use put-catalog-s3 / push-snapshot-s3 / pull-s3 / issue-ticket-s3 / revoke-ticket-s3 (revoke-ticket-s3 uses aws only to CAS-update revoked.json)",
+    name: "aws-cli", ok: await commandExists("aws", ["--version"]), severity: "required-for:put-catalog-s3,push-snapshot-s3,pull-s3,issue-ticket-s3,revoke-ticket-s3,presign-s3",
+    hint: "Install AWS CLI v2 to use put-catalog-s3 / push-snapshot-s3 / pull-s3 / issue-ticket-s3 / revoke-ticket-s3 / presign-s3 (revoke-ticket-s3 uses aws only to CAS-update revoked.json)",
   });
   checks.push({
     name: "gcloud-cli", ok: await commandExists("gcloud", ["--version"]), severity: "required-for:put-catalog-gcs,push-snapshot-gcs,pull-gcs,issue-ticket-gcs,revoke-ticket-gcs",
     hint: "Install Google Cloud SDK (gcloud) to use put-catalog-gcs / push-snapshot-gcs / pull-gcs / issue-ticket-gcs / revoke-ticket-gcs (revoke-ticket-gcs deletes the SA key and updates revoked.json)",
   });
-  // az CLI は put-catalog-azure / push-snapshot-azure / issue-ticket-azure / revoke-ticket-azure 専用（pull-azure は az でなく内蔵 fetch を使うため az を要さない）。
+  // presign-gcs は gcloud ではなく gsutil（Cloud SDK 同梱）を使う（gcloud storage には signed URL 発行が無い）。
   checks.push({
-    name: "az-cli", ok: await commandExists("az", ["--version"]), severity: "required-for:put-catalog-azure,push-snapshot-azure,issue-ticket-azure,revoke-ticket-azure",
-    hint: "Install Azure CLI (az) to use put-catalog-azure / push-snapshot-azure / issue-ticket-azure / revoke-ticket-azure (revoke-ticket-azure CAS-updates revoked.json)",
+    name: "gsutil", ok: await commandExists("gsutil", ["version"]), severity: "required-for:presign-gcs",
+    hint: "Install the Google Cloud SDK (includes gsutil) to use presign-gcs (gsutil signurl)",
+  });
+  // az CLI は put-catalog-azure / push-snapshot-azure / issue-ticket-azure / revoke-ticket-azure / presign-azure 専用（pull-azure は az でなく内蔵 fetch を使うため az を要さない）。
+  checks.push({
+    name: "az-cli", ok: await commandExists("az", ["--version"]), severity: "required-for:put-catalog-azure,push-snapshot-azure,issue-ticket-azure,revoke-ticket-azure,presign-azure",
+    hint: "Install Azure CLI (az) to use put-catalog-azure / push-snapshot-azure / issue-ticket-azure / revoke-ticket-azure / presign-azure (revoke-ticket-azure CAS-updates revoked.json)",
   });
   checks.push({
     name: "local-fs", ok: true, severity: "required-for:put-catalog-local,push-snapshot-local,pull-local,issue-ticket-local,revoke-ticket-local,show-pubkey,rotate-key",
@@ -672,6 +750,9 @@ async function main() {
   if (command === "revoke-ticket-gcs") return revokeTicket(parseRevokeArgs(rest, GCS_BACKEND), GCS_BACKEND);
   if (command === "revoke-ticket-azure") return revokeTicket(parseRevokeArgs(rest, AZURE_BACKEND), AZURE_BACKEND);
   if (command === "revoke-ticket-local") return revokeTicket(parseRevokeArgs(rest, LOCAL_BACKEND), LOCAL_BACKEND);
+  if (command === "presign-s3") return presign(parsePresignArgs(rest, S3_BACKEND), S3_BACKEND);
+  if (command === "presign-gcs") return presign(parsePresignArgs(rest, GCS_BACKEND), GCS_BACKEND);
+  if (command === "presign-azure") return presign(parsePresignArgs(rest, AZURE_BACKEND), AZURE_BACKEND);
   usage();
   process.exitCode = command === undefined || command === "--help" || command === "-h" ? 0 : 2;
 }
@@ -714,6 +795,12 @@ function usage() {
   ${PLUGIN} revoke-ticket-azure --to https://<account>.blob.core.windows.net/<container>/<prefix> --jti <uuid> [options]
       [--connection-string <cs> | --sas <token>]
   ${PLUGIN} revoke-ticket-local --to <folder|network-share path> --jti <uuid> [options]
+  ${PLUGIN} presign-s3    --to s3://bucket/prefix --key documents/<file> --expires <n(m|h|d|w)|ISO> [options]
+      [--access-key-id <id> --secret-access-key <key> | --profile <name>] [--region <r>]
+  ${PLUGIN} presign-gcs   --to gs://bucket/prefix --key documents/<file> --expires <n(m|h|d|w)|ISO> [options]
+      --gcp-credentials <service-account-key.json path>（必須・gsutil signurl の署名鍵）
+  ${PLUGIN} presign-azure --to https://<account>.blob.core.windows.net/<container>/<prefix> --key documents/<file> --expires <n(m|h|d|w)|ISO> [options]
+      [--connection-string <cs>]
   ${PLUGIN} show-pubkey [--kid k-…]
   ${PLUGIN} rotate-key
   put-catalog Options:
@@ -744,9 +831,13 @@ function usage() {
       --dataset <id>       scope.datasetIds（必須・反復可・^ds-[0-9a-f]{12}$）
       --visibility <v>     own | all（既定 own）
       --issued-to <id>     チケット sub（必須）
-      --expires <spec>     exp（必須・^\\d+(h|d|w)$＝iat+n または完全 ISO 8601。裸 YYYY-MM-DD は exit 2）
+      --expires <spec>     exp（必須・^\\d+(m|h|d|w)$＝iat+n または完全 ISO 8601。裸 YYYY-MM-DD は exit 2）
       --no-publish-key     keys/<kid>.json を shareRoot へ置かない（真正性は帯域外ピンのみ）
       --dry-run            検査だけ行い write receipt(dryRun:true)を返す（mint/PUT/発行なし）
+  presign Options:
+      --key <relKey>       署名する 1 オブジェクトのベース URI 相対キー（必須・既定なし・§2 relKey 文法）
+      --expires <spec>     URL 有効期限（必須・^\\d+(m|h|d|w)$＝iat+n（m=分）または完全 ISO 8601。裸 YYYY-MM-DD は exit 2）
+      --dry-run            検査だけ行い write receipt(dryRun:true)を返す（mint しない・URL レコードも出さない）
   show-pubkey Options:
       --kid <k->          表示する鍵世代（既定は現行 keys/current.json）
   issue-ticket mints a read-only credential where possible (gcs=SA key, azure=SAS) or falls back
@@ -773,6 +864,13 @@ function usage() {
   catalog names (no store listing), verifies each object's sha256, and materializes them under
   <--out> (relative structure preserved; .db.gz is gunzipped so only .db lands). It never calls
   a store write/delete API. Catalog contract violations / sha256 mismatch after re-read exit 1.
+  presign-* mints a short-lived signed URL for EXACTLY ONE object (<--to>/<--key>): azure=blob SAS
+  (az storage blob generate-sas --permissions r --https-only), s3=aws s3 presign, gcs=gsutil
+  signurl (requires --gcp-credentials). The URL is GET-only — PUT/DELETE signatures are never
+  minted (read-only boundary, spec §9.9). The signed URL is a SECRET (SI-5): it is printed ONLY
+  as the final stdout line (a presigned-url record) and NEVER appears in receipts/logs/errors;
+  consumers must not persist it to ledgers/audit either. presign-local does not exist (nothing
+  to sign against on a dir share).
   Unattended creds are read from the flags above OR env and passed to the cloud CLI (or the
   fetch URL query for pull-azure) via env, never argv.`);
 }
@@ -2084,15 +2182,15 @@ function endpointHasUserinfo(raw) {
   return authority.includes("@");
 }
 
-// --expires のパース（spec §9.7）: 相対 ^\d+(h|d|w)$（exp=iat+n）or 完全 ISO 8601 日時（Z/オフセット付き）。
+// --expires のパース（spec §9.7/§9.9）: 相対 ^\d+(m|h|d|w)$（exp=iat+n・m=分・#175）or 完全 ISO 8601 日時（Z/オフセット付き）。
 // 裸の YYYY-MM-DD は exit 2（…T00:00:00Z 形式を案内）。exp<=iat は呼び出し側で exit 2。返値は epoch 秒。
 const ISO_DATETIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2}|Z)$/;
 function parseExpires(spec, iat) {
-  const rel = /^(\d+)(h|d|w)$/.exec(spec);
+  const rel = /^(\d+)(m|h|d|w)$/.exec(spec);
   if (rel) {
     const n = Number(rel[1]);
     if (n <= 0) throw usageError(`--expires "${spec}" must be a positive duration.`);
-    const mult = rel[2] === "h" ? 3600 : rel[2] === "d" ? 86400 : 604800;
+    const mult = rel[2] === "m" ? 60 : rel[2] === "h" ? 3600 : rel[2] === "d" ? 86400 : 604800;
     return iat + n * mult;
   }
   if (/^\d{4}-\d{2}-\d{2}$/.test(spec)) {
@@ -2103,7 +2201,7 @@ function parseExpires(spec, iat) {
     if (Number.isNaN(ms)) throw usageError(`--expires "${spec}" is not a valid ISO 8601 datetime.`);
     return Math.floor(ms / 1000);
   }
-  throw usageError(`--expires "${spec}" is invalid. Use <n>(h|d|w) (e.g. 7d) or a full ISO 8601 datetime with Z/offset.`);
+  throw usageError(`--expires "${spec}" is invalid. Use <n>(m|h|d|w) (e.g. 15m, 7d) or a full ISO 8601 datetime with Z/offset.`);
 }
 
 function parseIssueArgs(argv, backend) {
@@ -2162,7 +2260,7 @@ function parseIssueArgs(argv, backend) {
   const visibility = o.visibility ?? "own";
   if (visibility !== "own" && visibility !== "all") throw usageError(`--visibility must be "own" or "all" (got ${JSON.stringify(visibility)}).`);
   if (!o["issued-to"]) throw usageError(`${label} requires --issued-to <id>.`);
-  if (o.expires === undefined) throw usageError(`${label} requires --expires <n(h|d|w)|ISO8601>.`);
+  if (o.expires === undefined) throw usageError(`${label} requires --expires <n(m|h|d|w)|ISO8601>.`);
 
   const out = {
     store: backend.store, to: o.to, endpoint, endpointFp, datasets, visibility,
@@ -2487,6 +2585,156 @@ function rotateKey() {
   }) + "\n");
 }
 
+// ── presign（短命 signed URL mint・spec §9.9・#175 / DC #504）────────────────────────
+//
+// 1 オブジェクトの短命 signed URL（**GET のみ**）を mint する read-only verb。ストアへ write/delete は
+// 一切しない（署名の mint のみ）。**signed URL は secret（SI-5）** であり stdout 最終行の専用レコード
+// （recordType:"presigned-url"）でのみ返す — receipt・ログ・エラーに URL（sig=/X-Amz-Signature=）を
+// 出さない（issue-ticket の share-ticket 流儀）。local は対象外（署名の相手となるオブジェクトストアが
+// 無い）。資格は既存の書き手 auth フラグを流用（secret は argv でなく env・§8.1）。
+
+function parsePresignArgs(argv, backend) {
+  const label = `presign-${backend.store}`;
+  const spec = { "--to": "value", "--key": "value", "--expires": "value", "--dry-run": "flag" };
+  // 発行者認証（put-catalog と同名・同 envVar）。azure は blob SAS mint に account key 系が必須なので
+  // --connection-string のみ（既存 SAS からの再署名は不可＝--sas は受けない）。
+  if (backend.store === "azure") { spec["--connection-string"] = "value"; }
+  if (backend.store === "s3") {
+    spec["--access-key-id"] = "value"; spec["--secret-access-key"] = "value";
+    spec["--profile"] = "value"; spec["--region"] = "value";
+  }
+  if (backend.store === "gcs") { spec["--gcp-credentials"] = "value"; }
+  const o = parseArgv(argv, spec, label);
+  if (o._.length !== 0) throw usageError(`${label} takes no positional arguments (got ${o._.length}).`);
+
+  // --to（backend 別・put-catalog と同基準。azure は [?#] を exit 2 で拒否＝SAS 混入防止）
+  if (!o.to) throw usageError(`${label} requires --to ${backend.scheme}…`);
+  if (!o.to.startsWith(backend.scheme)) throw usageError(`shareRoot must start with "${backend.scheme}".`);
+  if (backend.store === "azure") parseAzureTo(o.to);
+
+  // --key は必須・既定なし（1 オブジェクトを明示）。relKey 文法で検証。
+  const key = o.key;
+  if (key === undefined) {
+    throw usageError(`${label} requires --key <relKey> (the single object to sign; no default).`);
+  }
+  if (!REL_KEY_RE.test(key)) {
+    throw usageError(
+      `--key "${key}" is not a valid shareRoot relative key.\n` +
+      "Must be printable ASCII, no leading / or ~, no # ? % @ : \\, no .. segment (spec gemba-share §2).",
+    );
+  }
+  if (o.expires === undefined) throw usageError(`${label} requires --expires <n(m|h|d|w)|ISO8601>.`);
+
+  const out = { store: backend.store, to: o.to, key, expiresSpec: o.expires, dryRun: Boolean(o["dry-run"]) };
+  if (backend.store === "azure") {
+    out.connectionString = o["connection-string"] || process.env.AZURE_STORAGE_CONNECTION_STRING || "";
+  }
+  if (backend.store === "s3") Object.assign(out, s3CredsFromArgs(o, label));
+  if (backend.store === "gcs") {
+    // gsutil signurl は SA 秘密鍵ファイルを位置引数に取る（ADC は使えない）ため必須。
+    out.gcpCredentials = o["gcp-credentials"] || process.env.GOOGLE_APPLICATION_CREDENTIALS || "";
+    if (!out.gcpCredentials) {
+      throw usageError(`${label} requires --gcp-credentials <service-account-key.json path> (gsutil signurl signs with the SA private key file; env GOOGLE_APPLICATION_CREDENTIALS also accepted).`);
+    }
+  }
+  return out;
+}
+
+// ストア別に signed URL を mint する。返値は完全な URL（**secret**・呼び出し側は最終行レコード以外に出さない）。
+// 実クラウドの mint は本開発環境では実測不可（vendor CLI/資格情報が無い）→ DC 切替時に実クラウドで確定する
+// （§9.7.3 の mint 表と同じ注記）。
+async function mintPresignedUrl(options, backend, target, env, expiresInSec, sasExpiry) {
+  if (backend.store === "s3") {
+    // aws s3 presign は完全な URL を stdout に返す（per-object・GET のみ）。
+    const uri = backend.objectUri(target, options.key);
+    let url;
+    try {
+      const r = await runCommand("aws", ["s3", "presign", uri, "--expires-in", String(expiresInSec)],
+        { env, captureStdout: true, captureStderr: true });
+      url = (r.stdout || "").trim();
+    } catch (e) {
+      throw storeError(`s3 presign failed: ${scrubMsg(e && e.message)}`);
+    }
+    if (!/^https:\/\//.test(url)) throw storeError("s3 presign returned no URL (check issuer auth and the object URI).");
+    return url;
+  }
+  if (backend.store === "azure") {
+    // コンテナ SAS mint（§9.7.3）の object SAS 縮退。--permissions r（GET のみ）・--https-only。
+    const blob = backend.blobName(target, options.key);
+    const args = ["storage", "blob", "generate-sas", "--account-name", target.account, "--container-name", target.container,
+      "--name", blob, "--permissions", "r", "--expiry", sasExpiry, "--https-only", "--output", "tsv"];
+    let token;
+    try {
+      const r = await runCommand("az", args, { env, captureStdout: true, captureStderr: true });
+      token = (r.stdout || "").trim();
+    } catch (e) {
+      throw storeError(`azure blob SAS mint failed: ${scrubMsg(e && e.message)}`);
+    }
+    if (!token) throw storeError("azure blob SAS mint returned an empty token (check issuer auth: --connection-string or az login).");
+    // URL は自前で組み立てる。パスはセグメントごとに percent-encode する（非 ASCII の prefix/キーでも
+    // 署名対象の blob 名と一致させ、& や % を含む名前が query を壊さないようにするため）。
+    const path = blob.split("/").map(encodeURIComponent).join("/");
+    return `https://${target.account}.blob.core.windows.net/${target.container}/${path}?${normalizeSas(token)}`;
+  }
+  if (backend.store === "gcs") {
+    // gsutil signurl -d <sec> <keyfile> <gsuri>。出力は TSV（URL・HTTP method・expiration・signed URL）。
+    const uri = backend.objectUri(target, options.key);
+    let out;
+    try {
+      const r = await runCommand("gsutil", ["signurl", "-d", String(expiresInSec), options.gcpCredentials, uri],
+        { env, captureStdout: true, captureStderr: true });
+      out = r.stdout || "";
+    } catch (e) {
+      throw storeError(`gcs signurl failed: ${scrubMsg(e && e.message)}`);
+    }
+    // データ行（gs:// で始まる）の末尾フィールドが signed URL。ヘッダ行や警告に紛れないよう行で絞る。
+    const line = out.split("\n").map((l) => l.trim()).find((l) => l.startsWith("gs://"));
+    const url = line ? line.split(/\s+/).pop() : "";
+    if (!url || !/^https:\/\//.test(url)) {
+      throw storeError("gcs signurl returned no signed URL (check --gcp-credentials and the object URI).");
+    }
+    return url;
+  }
+  throw usageError(`unsupported store for presign: ${backend.store}`);
+}
+
+async function presign(options, backend) {
+  const jobId = `presign-${timestampTag()}-${process.pid}`;
+  const target = backend.parse(options);
+  const shareRoot = backend.shareRoot(target);
+  const storeKind = backend.storeKind;
+
+  // --expires 文法（相対 m/h/d/w or 完全 ISO 8601）→ epoch 秒。過去は exit 2。
+  const iat = Math.floor(Date.now() / 1000);
+  const exp = parseExpires(options.expiresSpec, iat);
+  if (exp <= iat) throw usageError(`--expires resolves to a time at or before now (exp=${exp} <= iat=${iat}). Choose a future expiry.`);
+  const expiresAt = new Date(exp * 1000).toISOString();
+
+  // receipt の extras は**すべて非 secret**（URL は載せない・SI-5）。
+  const baseExtras = { shareRoot, storeKind, objectKey: options.key, expiresAt };
+
+  if (options.dryRun) {
+    // 検査のみ通過（引数・--key/--expires 文法・認証の充足）。mint せず URL レコードも出さない。write 1 行のみ。
+    emitReceipt("write", jobId, 1, 0, false, { ...baseExtras, dryRun: true });
+    return;
+  }
+
+  const env = buildPushEnv({ ...options, store: backend.store });
+  // az の datetime パーサはミリ秒付き（….000Z）を受けないことがあるので秒精度へ丸める（§9.7.3 と同じ対処）。
+  const url = await mintPresignedUrl(options, backend, target, env, exp - iat, expiresAt.replace(/\.\d{3}Z$/, "Z"));
+
+  // write 相 receipt（verified:false・非 secret メタのみ）。
+  emitReceipt("write", jobId, 1, 0, false, { ...baseExtras });
+  // verify 相: presign はストアへの write が無いため read-back で確かめられない。mint（vendor CLI の署名
+  // 成功）をもって verified:true とする（URL の実 GET 確認は匿名アクセスを発生させ監査を汚すため行わない）。
+  emitReceipt("verify", jobId, 1, 0, true, { ...baseExtras });
+
+  // signed URL（secret）は stdout 最終行の専用レコードでのみ返す（share-ticket 流儀・SI-5・§9.9）。
+  process.stdout.write(JSON.stringify({
+    schemaVersion: "1.0", recordType: "presigned-url", store: backend.store, key: options.key, expiresAt, url,
+  }) + "\n");
+}
+
 // ── revoke-ticket / revoked.json CAS（協調的失効・spec §9.8・#472 PR (b)）──────────
 //
 // 真の失効は credential 側（gcs のみ実失効＝SA 鍵削除）。s3/azure/local は資格側操作なし。あわせて
@@ -2676,6 +2924,7 @@ async function revokeTicket(options, backend) {
 
   // ① credential 側の実失効（gcs の individual のみ・--list-only はスキップ）。s3/azure/local は資格側操作なし。
   let credentialRevoked = false;
+  let credentialAlreadyAbsent = false;
   if (!options.listOnly && backend.store === "gcs" && revocation === "individual") {
     if (!credentialRef) {
       throw usageError(`revoke-ticket-gcs requires the SA key id — pass --credential-ref <keyId> (or run where the issue ledger ~/.i-repo/share/issued/${options.jti}.json exists).`);
@@ -2688,7 +2937,64 @@ async function revokeTicket(options, backend) {
         { env, captureStdout: true, captureStderr: true });
       credentialRevoked = true;
     } catch (e) {
-      throw storeError(`gcs SA key delete failed: ${scrubMsg(e && e.message)}`);
+      // 分類は「gcloud が**実際に走って返した診断（stderr）**」だけで行う。runCommand は exit-code 失敗のときだけ
+      // err.stderr（string）を付与し、未実行系（ENOENT＝gcloud 不在／signal 終了／Windows spawnSpec の
+      // メタ文字 throw）は e.stderr を持たない Error で reject する。未実行なのに分類器へ回すと、ENOENT の
+      // フォールバック文言 "Required command not found: gcloud…" が NOT_FOUND 分類器にマッチし「鍵は既に無い」
+      // へ誤分類 → 実在鍵が残ったまま credentialRevoked:true・exit 0 の false success に化ける（#173 P2-2）。
+      // よって `typeof e.stderr === "string"` を分類のゲートにし、未実行系は else の汎用失敗へ落とす。
+      if (typeof e.stderr === "string") {
+        // e.message は使わない — runCommand は message 先頭に「フルコマンド＋argv」を前置するため、ユーザ制御の
+        // argv（例: --reader-service-account が `reader@plant-404.iam.gserviceaccount.com` のように "404" を含む）
+        // へ誤マッチし、無関係な delete 失敗を「鍵は既に無い」と誤分類する危険がある（#173 P2-1・Codex 指摘）。
+        // stderr が空文字のときだけ、message からコマンド前置部（`… failed with exit code N.`）を剥がした残り＝
+        // stderr 再掲部分をフォールバックに使う（argv は決して含めない）。
+        const diag = e.stderr.trim()
+          ? e.stderr
+          : String((e && e.message) || "").replace(/^[\s\S]*?failed with exit code -?\d+\.\s*/, "");
+        // 資格の鍵 ID / SA は argv 経由で e.message に載る（＝secret を漏らす）。thrown error には e.message も
+        // 生 diag も埋め込まず、我々の解釈文言のみ載せる（gcloud の生 stderr は runCommand が既に process.stderr へ
+        // 出しているので二重に載せない・SI-5）。
+        if (/PERMISSION[_ ]?DENIED|\b403\b|permission denied/i.test(diag)) {
+          // gcloud は SA 自体が存在しない場合も（NOT_FOUND ではなく）PERMISSION_DENIED を返す
+          // （公式 doc: "If the service account does not exist, this command returns a PERMISSION_DENIED error."）。
+          // よって権限不足と「SA が無い（--reader-service-account の typo／発行台帳の陳腐化）」の両方を実因候補として出す。
+          // いずれも失効の目的状態は未達なので従来どおり失敗（exit 1）。
+          throw storeError(
+            "gcs SA key delete permission denied — you may lack roles/iam.serviceAccountKeyAdmin, " +
+            "or the reader service account does not exist (typo of --reader-service-account, or a stale issue ledger).");
+        } else if (/\bkey\b[\s\S]{0,40}?(?:NOT[_ ]?FOUND|not found|does ?n[o']t exist|doesn't exist|unknown|no such|missing)|(?:NOT[_ ]?FOUND|not found|does ?n[o']t exist|doesn't exist|unknown|no such|missing)[\s\S]{0,40}?\bkey\b/i.test(diag)) {
+          // 鍵固有の不在文言（資源名詞 "key" を伴う NOT_FOUND / unknown / does-not-exist 系）を SA 不存在判定より
+          // **先に**捕捉する。gcloud（や将来実装）が鍵の miss を "Unknown service account key" /
+          // "service account key does not exist" のように "key" を含む名詞句で返すと、下の SA 不存在 regex
+          // （belt-and-suspenders）が "service account" 部分を先取りし恒久失敗へ誤分類 → #172 が確立した
+          // 冪等成功が逆戻りする（#173 P2-1・Codex inline）。ここで先に鍵不在＝冪等成功へ倒す。
+          credentialRevoked = true;
+          credentialAlreadyAbsent = true;
+          console.error("note: gcs SA key already absent — treating as already revoked (idempotent, #172).");
+        } else if (/unknown service account|no such service account|service account\b[\s\S]{0,80}?(?:does ?n[o']t|doesn't) exist|service account\b[\s\S]{0,80}?not[_ ]?found/i.test(diag)) {
+          // SA 自体が見つからない（belt-and-suspenders: 将来 gcloud が SA 不存在に NOT_FOUND 系文言を返す実装向け）。
+          // 上の鍵固有判定を通過した＝"key" を伴わない SA 名詞句。鍵 NOT_FOUND と違い「失効すべき資格の在り処が
+          // 分からない」ので**冪等成功にしない** — 実因（typo／台帳陳腐化）で失敗させる。
+          throw storeError(
+            "gcs SA key delete failed — reader service account not found " +
+            "(typo of --reader-service-account, or a stale issue ledger).");
+        } else if (/NOT[_ ]?FOUND|\b404\b|does not exist|key not found/i.test(diag)) {
+          // 鍵の実体が既に無い＝失効の目的状態は達成済み。冪等成功として扱う（過去の失効試行の途中終了・環境掃除で
+          // 先に鍵が消えたケースで、以後永久に「失効できない」状態へ陥らないため・#172）。verify 相は revoked.json read-back で通常どおり通す。
+          credentialRevoked = true;
+          credentialAlreadyAbsent = true;
+          console.error("note: gcs SA key already absent — treating as already revoked (idempotent, #172).");
+        } else {
+          throw storeError("gcs SA key delete failed (see gcloud stderr above for the cause).");
+        }
+      } else {
+        // gcloud が実際には走っていない（ENOENT／signal／spawnSpec の throw）。診断（stderr）が無いので分類せず
+        // 汎用失敗に落とす — ここで NOT_FOUND 等へ寄せると鍵が実在するのに冪等成功へ化ける（#173 P2-2）。
+        throw storeError(
+          "gcs SA key delete failed before gcloud returned a diagnostic — the command may be missing from PATH " +
+          "or was terminated; the SA key was not confirmed absent.");
+      }
     }
   }
 
@@ -2700,6 +3006,7 @@ async function revokeTicket(options, backend) {
   const baseExtras = {
     shareRoot, storeKind, jti: options.jti, ...(kid ? { kid } : {}),
     revocation, credentialRevoked, listOnly: Boolean(options.listOnly), revokedCount: casResult.count,
+    ...(credentialAlreadyAbsent ? { credentialAlreadyAbsent: true } : {}),
     ...(casResult.etag ? { etag: casResult.etag } : {}),
   };
   emitReceipt("write", jobId, 1, 0, false, baseExtras);
@@ -2936,9 +3243,10 @@ async function exclusiveCreateLocal(dest, srcFile) {
 // ── 子プロセス（spec 構築は lib/spawn.js・spawn 部は upload runCommand の移植）──
 
 const INSTALL_HINTS = {
-  aws: "Install the AWS CLI v2 to use put-catalog-s3.",
+  aws: "Install the AWS CLI v2 to use put-catalog-s3 / presign-s3.",
   gcloud: "Install the Google Cloud SDK (gcloud) to use put-catalog-gcs.",
-  az: "Install the Azure CLI (az) to use put-catalog-azure.",
+  gsutil: "Install the Google Cloud SDK (includes gsutil) to use presign-gcs.",
+  az: "Install the Azure CLI (az) to use put-catalog-azure / presign-azure.",
 };
 
 function runCommand(command, args, options) {
