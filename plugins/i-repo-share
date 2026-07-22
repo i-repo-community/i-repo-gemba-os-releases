@@ -156,7 +156,7 @@ const { join, dirname, basename, resolve, relative, isAbsolute, sep } = require(
 const { spawnSpec } = require("./lib/spawn.js");
 
 const PLUGIN = "i-repo-share";
-const VERSION = "0.6.0";
+const VERSION = "0.6.1";
 const PLUGIN_API = "1";
 
 const PUT_SUBS = ["put-catalog-s3", "put-catalog-gcs", "put-catalog-azure", "put-catalog-local"];
@@ -2677,15 +2677,32 @@ async function mintPresignedUrl(options, backend, target, env, expiresInSec, sas
     return `https://${target.account}.blob.core.windows.net/${target.container}/${path}?${normalizeSas(token)}`;
   }
   if (backend.store === "gcs") {
-    // gsutil signurl -d <sec> <keyfile> <gsuri>。出力は TSV（URL・HTTP method・expiration・signed URL）。
+    // gsutil signurl -d <sec>s <keyfile> <gsuri>。出力は TSV（URL・HTTP method・expiration・signed URL）。
+    // -d は**単位サフィックス必須**: 裸の数値は「時間」と解釈され、900（15分のつもり）が 900 時間＝
+    // 上限 7 日超過で常に失敗する（実機で確認・DC #531 リリース検証で発覚）。
     const uri = backend.objectUri(target, options.key);
+    const durationArg = `${expiresInSec}s`;
     let out;
     try {
-      const r = await runCommand("gsutil", ["signurl", "-d", String(expiresInSec), options.gcpCredentials, uri],
+      const r = await runCommand("gsutil", ["signurl", "-d", durationArg, options.gcpCredentials, uri],
         { env, captureStdout: true, captureStderr: true });
       out = r.stdout || "";
     } catch (e) {
-      throw storeError(`gcs signurl failed: ${scrubMsg(e && e.message)}`);
+      // signurl はバケット位置の自動検出（storage.buckets.get・周辺 gcloud 認証）に依存し、
+      // gcloud の再認証待ちや SA の権限不足で「Failed to auto-detect location」で落ちる。
+      // GCS は v4 署名の region スコープを検証しない（不一致 region の URL でも GET 200 を実測）ため、
+      // 自動検出に失敗したときだけ -r 固定でリトライする（署名鍵はどちらも SA 鍵で同一・read-only 不変）。
+      const msg = String((e && e.message) || "");
+      if (!/auto-detect location|Reauthentication required/i.test(msg)) {
+        throw storeError(`gcs signurl failed: ${scrubMsg(msg)}`);
+      }
+      try {
+        const r2 = await runCommand("gsutil", ["signurl", "-r", "us-central1", "-d", durationArg, options.gcpCredentials, uri],
+          { env, captureStdout: true, captureStderr: true });
+        out = r2.stdout || "";
+      } catch (e2) {
+        throw storeError(`gcs signurl failed: ${scrubMsg(e2 && e2.message)}`);
+      }
     }
     // データ行（gs:// で始まる）の末尾フィールドが signed URL。ヘッダ行や警告に紛れないよう行で絞る。
     const line = out.split("\n").map((l) => l.trim()).find((l) => l.startsWith("gs://"));
