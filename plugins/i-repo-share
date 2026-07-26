@@ -45,6 +45,16 @@
  *     gunzip 失敗で exit 2。DC は目次エントリの generation.sourceDigest にそのまま転記できる。
  *   - PUT／verify／exit 規約／CAS 配管／認証は put-catalog（§9.1）と同型（backend put/stat 流用）。
  *
+ * 【presign 系（presign-s3/gcs/azure・spec §9.9・#175 / #182）の --key 文法】
+ *   - presign の --key だけは **成果物キー文法（ARTIFACT_KEY_RE）** で検証する。§2 relKey
+ *     （REL_KEY_RE・印字可能 ASCII 限定）は書き手が生成する目次系キーの文法であり、署名対象の
+ *     成果物（documents/ 配下の PDF・添付画像）は i-Reporter サーバが与えたファイル名 verbatim
+ *     ＝日本語・空白・`&`・`【】` を含むため、そのまま当てると実機で必ず弾かれる（#182）。
+ *     禁止は `..` / `\` / 制御文字に加え `?` `*` `[` `#`（gsutil の wildcard/generation 副作用回避・
+ *     3 動詞で統一）。`%` は許可。
+ *   - 他の動詞（put-catalog / push-snapshot / issue-ticket / revoke-ticket / pull）の relKey 検証は
+ *     一切変えない。分離点は parsePresignArgs 1 箇所のみ。
+ *
  * 【SI-1/SI-5 検査ロジックは「第2実装」である旨の注記】
  * 下の findPortabilityViolations / findSecretViolations は scripts/check-share.mjs の
  * SH3/SH4（findPortabilityViolations / findSecretViolations）と**同じ判定**を持つ。
@@ -156,7 +166,7 @@ const { join, dirname, basename, resolve, relative, isAbsolute, sep } = require(
 const { spawnSpec } = require("./lib/spawn.js");
 
 const PLUGIN = "i-repo-share";
-const VERSION = "0.6.1";
+const VERSION = "0.6.2";
 const PLUGIN_API = "1";
 
 const PUT_SUBS = ["put-catalog-s3", "put-catalog-gcs", "put-catalog-azure", "put-catalog-local"];
@@ -197,6 +207,31 @@ const DEFAULT_KEY = "share-catalog.json";
 // （同一秒衝突回避）・.gz は任意（.db / .db.gz 両合法）。REL_KEY_RE の狭い部分集合（この形は必ず relKey
 // にも合致する）だが、push-snapshot は「実体を世代キー以外へ置かせない」ため追加でこの形を強制する。
 const SNAPSHOT_KEY_RE = /^datasets\/ds-[0-9a-f]{12}\/snapshot-\d{8}T\d{6}Z(-[0-9a-z]{1,16})?\.db(\.gz)?$/;
+
+// 成果物キー文法（artifact key・presign 専用・spec §9.9.2・#182）。**REL_KEY_RE とは別文法**。
+// なぜ分けるか: presign が署名するのは bundle の `documents/` 配下に着地した i-Reporter の成果物
+// （PDF・添付画像）であり、そのファイル名は**サーバが与えた名前を verbatim で使う**。実データは
+// 「27111_テスト帳票_NNAtest.pdf」のように日本語・空白・`&`・`【】` を普通に含むので、§2 relKey の
+// 印字可能 ASCII 限定を当てると実機で必ず弾かれる（#182・実機 E2E で発覚）。書き手が生成する
+// 目次系キー（§2 の対象）と違い、ここは名前を選べない。
+// 残す禁止（脱出・壊れ値・gsutil 副作用）: `documents/` 始まり必須（バンドル内成果物に限定＝
+// 目次・manifests・keys 等の運用面を署名対象にしない）・`..` セグメント禁止（shareRoot 脱出）・
+// `\` 禁止（Windows パス区切りと `..\` 脱出）・制御文字（U+0000–U+001F・U+007F）禁止・
+// `?` `*` `[` `#` 禁止（gsutil は shell とは別レイヤで URI 中の `?` `*` `[` を wildcard 展開し、
+// 末尾 `#<数字>` を generation として解釈するため、これらを含むキーは別オブジェクト/別世代へ
+// 署名し得る＝契約「1 動詞 1 オブジェクト」と衝突。s3/azure は該当しにくいが 3 動詞で文法を
+// 統一し、呼び手が store 種別を知らずに presign 可否を予測できるようにする）。`%` は許可のまま
+// （各 CLI はリテラル扱い・`%2e%2e` も normalize されない）。
+// 先頭 `/`・`~` は `documents/` 必須により自動的に排除される。
+// 安全性の根拠: キーは URL 文字列へ手で連結せず、署名ツールの**固定 argv**（aws s3 presign /
+// gsutil signurl / az storage blob generate-sas）へ 1 引数として渡す＝shell を経由しない
+// （spawnSpec は POSIX で shell:false・Windows は cmd.exe argv を明示構築）。azure だけは URL を
+// 自前で組むが、パスはセグメントごとに encodeURIComponent する（mintPresignedUrl 参照）。
+// 既知の残制約（Windows のみ・キー文法の問題ではない）: cmd.exe 経由になる Windows では spawn.js が
+// `& | < > ^ " % !` を含む argv を拒否するため、そういう名前の成果物は mint 時に exit 1 で落ちる
+// （POSIX は shell 非経由なので通る）。ここで文法として禁じないのは、実行面の制約を成果物名の
+// 契約に持ち込むと POSIX でも署名できなくなるため。
+const ARTIFACT_KEY_RE = /^documents\/(?!(?:[\s\S]*\/)?\.\.(?:\/|$))(?:[^\\\u0000-\u001f\u007f?*\[#])+$/;
 
 // ── 予約フラグ: --plugin-schema は API 検査より先に応答する（docs/PLUGINS.md）──
 const arg0 = process.argv[2];
@@ -614,8 +649,8 @@ if (arg0 === "--plugin-schema") {
       // 共通（3 サブコマンド共通）。--key/--expires は必須。
       ...PRESIGN_SUBS.flatMap((sub) => [
         { name: "--key", type: "string", required: true, subcommand: sub,
-          label: "オブジェクトキー（必須）", placeholder: "documents/123.pdf",
-          description: "署名する 1 オブジェクトのベース URI 相対キー（既定なし・必須）。spec §2 の relKey 文法で検証（印字可能 ASCII のみ・先頭 / ~ 禁止・# ? % @ : \\ 禁止・.. 禁止）。違反は exit 2" },
+          label: "成果物キー（必須）", placeholder: "documents/27111_点検記録.pdf",
+          description: "署名する 1 成果物のベース URI 相対キー（既定なし・必須）。spec §9.9.2 の**成果物キー文法**で検証（§2 relKey とは別文法: documents/ 配下限定・.. 禁止・\\ 禁止・制御文字禁止・? * [ # 禁止＝gsutil の wildcard/generation 副作用回避・3 動詞で統一。日本語などの非 ASCII・空白・& % 【】 等はサーバ提供ファイル名 verbatim として許可）。違反は exit 2" },
         { name: "--expires", type: "string", required: true, subcommand: sub,
           label: "URL 有効期限（必須）", placeholder: "15m ・ 1h ・ 2026-07-20T13:00:00Z",
           description: "signed URL の期限。相対（^\\d+(m|h|d|w)$＝iat+n。m=分）または完全 ISO 8601 日時（Z/オフセット付き）。裸の YYYY-MM-DD は exit 2。presign は分〜十数分の短命を想定。azure は mint する SAS の --expiry にも焼く（実強制）" },
@@ -2612,15 +2647,18 @@ function parsePresignArgs(argv, backend) {
   if (!o.to.startsWith(backend.scheme)) throw usageError(`shareRoot must start with "${backend.scheme}".`);
   if (backend.store === "azure") parseAzureTo(o.to);
 
-  // --key は必須・既定なし（1 オブジェクトを明示）。relKey 文法で検証。
+  // --key は必須・既定なし（1 オブジェクトを明示）。**成果物キー文法**（ARTIFACT_KEY_RE・§9.9.2）で
+  // 検証する — §2 relKey（印字可能 ASCII 限定）ではない。署名対象は documents/ 配下の成果物であり、
+  // ファイル名は i-Reporter サーバ由来 verbatim（日本語・空白・記号を含む）だから（#182）。
   const key = o.key;
   if (key === undefined) {
-    throw usageError(`${label} requires --key <relKey> (the single object to sign; no default).`);
+    throw usageError(`${label} requires --key <artifactKey> (the single object to sign; no default).`);
   }
-  if (!REL_KEY_RE.test(key)) {
+  if (!ARTIFACT_KEY_RE.test(key)) {
     throw usageError(
-      `--key "${key}" is not a valid shareRoot relative key.\n` +
-      "Must be printable ASCII, no leading / or ~, no # ? % @ : \\, no .. segment (spec gemba-share §2).",
+      `--key "${key}" is not a valid artifact key.\n` +
+      "Must be a bundle artifact under documents/ (no .. segment, no backslash, no control characters, no ? * [ #). " +
+      "Non-ASCII file names (Japanese, spaces, & % 【】 …) are allowed verbatim (spec gemba-share §9.9.2).",
     );
   }
   if (o.expires === undefined) throw usageError(`${label} requires --expires <n(m|h|d|w)|ISO8601>.`);
