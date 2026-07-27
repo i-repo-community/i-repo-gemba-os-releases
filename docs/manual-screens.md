@@ -21,14 +21,15 @@ has_children: true
 | [接続先テンプレート](screen-connections.html) | 送り先を名前を付けて保存・再利用 |
 | [フロー作成](screen-flows.html) | 「どの帳票を・いつ・どこへ」を1セットにまとめる |
 | [帳票ライブビュー](screen-reports.html) | 送信元と送信済みを突き合わせ |
-| [クリーンアップ設定](screen-cleanup.html) | 元データの整理（保持期間・承認・ソフトデリート） |
+| [削除メンテナンス](screen-cleanup.html) | i-Reporter サーバ本体の帳票を削除（論理削除・段階消化） |
 | [現場蓄積データ](screen-gemba.html) | ソース横断の検索窓・すべてのソース・API ソース登録・現場AIチャット結線 |
+| [実行状況](screen-runs.html) | 実行ログ・成功確認・再実行・成果物（PDF など）の閲覧（現場蓄積データの中から開きます） |
 | [共有ビュー](screen-share.html) | 従来の共有チケットを読み手として読み込む（既定は非表示・非推奨） |
 | [スケジュール](screen-scheduler.html) | 定期実行・カレンダー・OS タスク登録 |
 | [API](screen-readapi.html) | 読み取り API の稼働・トークン発行/編集/削除・Swagger UI・従来の共有 |
 | [着信 Webhook](screen-webhook.html) | 外部システムからフローを起動 |
 | [プラグイン](screen-plugins.html) | 送り先部品の状態・フォルダ・削除 |
 | [エージェント接続](screen-mcp.html) | Claude / Codex に読み取り専用でつなぐ |
-| ログ（i-repo） | i-repo CLI の診断ログを読み取り専用で確認（トラブル解析・監査） |
+| [ログ（i-repo）](screen-logs.html) | 送信の詳しい記録を読み取り専用で確認（トラブル解析・監査） |
 | [現場 AI チャット](screen-agent.html) | アプリ内で AI に日本語で質問 |
 | [Ontology Studio（現場スキル）](screen-ontology.html) | 帳票に意味を付け、ベテランの“見方”を現場スキルにする |
