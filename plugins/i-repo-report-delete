@@ -34,7 +34,7 @@ async function loadBuiltins() {
 }
 
 const PLUGIN = "i-repo-report-delete";
-const VERSION = "0.1.6";
+const VERSION = "0.1.7";
 const PLUGIN_API = "1";
 
 // 検索フィルタ（DeleteReport 仕様の抽出条件・すべて filter:true）。
@@ -102,7 +102,9 @@ if (arg0 === "--plugin-schema") {
       // 認証上書き（未指定時は呼び戻し先 i-repo が config/プロンプトで解決）
       { name: "--endpoint", type: "string", subcommand: "delete", label: "エンドポイント", description: "呼び戻す i-repo のエンドポイントを上書き" },
       { name: "--user", type: "string", subcommand: "delete", label: "ユーザー", description: "呼び戻す i-repo のユーザーを上書き" },
-      { name: "--password", type: "string", secret: true, subcommand: "delete", label: "パスワード", description: "呼び戻す i-repo のパスワードを上書き（値は argv に出さず env で渡す）" },
+      { name: "--password", type: "string", secret: true, subcommand: "delete",
+        envVar: "IREPO_REPORT_DELETE_PASSWORD",
+        label: "パスワード", description: "呼び戻す i-repo のパスワードを上書き（値は argv に出さず env で渡す。argv 未指定時は環境変数 IREPO_REPORT_DELETE_PASSWORD から読む・gemba-adc §6.2a）" },
     ],
   }));
   process.exit(0);
@@ -168,6 +170,11 @@ const FILTER_KEYS = [
     console.error(`${PLUGIN}: ${error.message}`);
     process.exit(2);
   }
+
+  // secret は argv 未指定時に env から読む（gemba-adc §6.2a・argv 優先。--password "" の
+  // 明示指定は null にならないため尊重される）。読んだ値は下の env.IREPO_PASSWORD 設定で
+  // 内側 i-repo へ env のまま引き渡す（argv には載らない）。
+  if (o.password == null && process.env.IREPO_REPORT_DELETE_PASSWORD) o.password = process.env.IREPO_REPORT_DELETE_PASSWORD;
 
   // 安全弁1（要望7・フィルタ必須ガードの前倒し）: フィルタ皆無の削除は
   // 全件事故になりうる。呼び戻し先 SDK も throw するが、ここで fail-fast して

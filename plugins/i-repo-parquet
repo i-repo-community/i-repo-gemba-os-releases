@@ -34,7 +34,7 @@
 "use strict";
 
 const PLUGIN = "i-repo-parquet";
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const { spawnSyncSpec } = require("./lib/spawn.js");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -100,8 +100,9 @@ if (argv[0] === "--plugin-schema") {
         label: "S3アクセスキー（任意）",
         description: "Object store access key id" },
       { name: "--s3-secret", type: "string", secret: true,
+        envVar: "IREPO_PARQUET_S3_SECRET",
         label: "S3シークレット（任意）",
-        description: "Object store secret access key" },
+        description: "Object store secret access key。argv 未指定時は環境変数 IREPO_PARQUET_S3_SECRET から読む（§6.2a。Iceberg/MinIO 用は配信先 S3 と別資格になりうるため AWS_SECRET_ACCESS_KEY ではなくプラグイン固有名）" },
       { name: "--s3-region", type: "string", default: "us-east-1",
         label: "S3リージョン",
         description: "Object store region" },
@@ -234,6 +235,9 @@ function runQuery(qargs, G) {
     "--iceberg-table": "icebergTable", "--s3-endpoint": "s3Endpoint",
     "--s3-key-id": "s3KeyId", "--s3-secret": "s3Secret", "--s3-region": "s3Region",
   }, queryError);
+  // secret は host から環境変数で渡る場合がある（§6.2a・argv 露出回避）。argv に「無いときだけ」 env を
+  // 読む（argv 優先。--s3-secret "" の明示指定は尊重 — elastic の runQuery と同流儀）。
+  if (!qargs.includes("--s3-secret") && process.env.IREPO_PARQUET_S3_SECRET) opts.s3Secret = process.env.IREPO_PARQUET_S3_SECRET;
   if (!opts.s3Region) opts.s3Region = "us-east-1";
 
   // --iceberg-table があれば iceberg、なければ --out で parquet（write と同判定）。
@@ -386,6 +390,8 @@ function runAggregate(aargs, G) {
     "--iceberg-table": "icebergTable", "--s3-endpoint": "s3Endpoint",
     "--s3-key-id": "s3KeyId", "--s3-secret": "s3Secret", "--s3-region": "s3Region",
   }, queryError);
+  // secret の env フォールバック（§6.2a。query と同じく argv 優先・未指定時のみ env を読む）。
+  if (!aargs.includes("--s3-secret") && process.env.IREPO_PARQUET_S3_SECRET) opts.s3Secret = process.env.IREPO_PARQUET_S3_SECRET;
   if (!opts.s3Region) opts.s3Region = "us-east-1";
 
   // --iceberg-table があれば iceberg、なければ --out で parquet（write/query と同判定）。
@@ -585,6 +591,7 @@ function parseDuckdbJsonArrays(stdout) {
 let out = "", icebergEndpoint = "", warehouse = "", icebergTable = "";
 let s3Endpoint = "", s3KeyId = "", s3Secret = "", s3Region = "us-east-1";
 let dryRun = false, endpointFpFlag = "";
+let s3SecretSeen = false;
 for (let i = 0; i < argv.length; i++) {
   switch (argv[i]) {
     case "--out":              out = argv[++i] ?? ""; break;
@@ -593,7 +600,7 @@ for (let i = 0; i < argv.length; i++) {
     case "--iceberg-table":    icebergTable = argv[++i] ?? ""; break;
     case "--s3-endpoint":      s3Endpoint = argv[++i] ?? ""; break;
     case "--s3-key-id":        s3KeyId = argv[++i] ?? ""; break;
-    case "--s3-secret":        s3Secret = argv[++i] ?? ""; break;
+    case "--s3-secret":        s3Secret = argv[++i] ?? ""; s3SecretSeen = true; break;
     case "--s3-region":        s3Region = argv[++i] ?? "us-east-1"; break;
     case "--dry-run":          dryRun = true; break;
     // 配信元テナント指紋のフォールバック刻印値（gemba-adc/1.1）。レコードが provenance を持たない
@@ -602,6 +609,10 @@ for (let i = 0; i < argv.length; i++) {
     default: console.error(`unknown option: ${argv[i]}`); process.exit(2);
   }
 }
+
+// secret は host から環境変数で渡る場合がある（§6.2a・argv 露出回避）。フラグが「未指定のときだけ」
+// env を読む（argv 優先。--s3-secret "" の明示指定を env で上書きしない — elastic/archive:548 と同流儀）。
+if (!s3SecretSeen && process.env.IREPO_PARQUET_S3_SECRET) s3Secret = process.env.IREPO_PARQUET_S3_SECRET;
 
 const icebergMode = !!(icebergEndpoint || warehouse || icebergTable);
 // dry-run は出力先なしでも入力検証だけ行える（plugin verify が使う経路）
