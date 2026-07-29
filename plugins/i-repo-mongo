@@ -287,7 +287,7 @@ function looksLikeConnError(text) {
 }
 
 function runQuery(qargs, G) {
-  const { queryEnd, emitRow, queryError } = G.createReadKit(PLUGIN);
+  const { queryEnd, emitRow, queryError, createRowGate } = G.createReadKit(PLUGIN);
   const opts = G.parseQueryArgs(qargs, { "--uri": "uri", "--db": "db", "--collection": "collection" }, queryError,
     { "--native": { key: "native" }, "--native-timeout-ms": { key: "nativeTimeoutMs" } });
   // secret は host から環境変数で渡る場合がある（§6.2a・argv 露出回避）。argv に「無いときだけ」 env を
@@ -344,7 +344,7 @@ function runQuery(qargs, G) {
     const parsed = parseNdjsonLines(r.stdout);
     const total = parsed.length && typeof parsed[parsed.length - 1].total === "number"
       ? parsed[parsed.length - 1].total : 0;
-    const end = { count: 0, complete: true, total, nextCursor: null, dest, dedupeApplied: false };
+    const end = { count: 0, complete: true, total, nextCursor: null, truncated: false, dest, dedupeApplied: false };
     if (timeFilter) end.timeFilter = timeFilter;
     queryEnd(end);
     process.exit(0);
@@ -372,10 +372,12 @@ function runQuery(qargs, G) {
   }
 
   const rows = parseNdjsonLines(r.stdout);
+  // rows バイト上限ゲート（§3.3・i-repo#197）。cursor は最後に emit した行の key から
+  // 作るため、打ち切っても次ページは未送出の行から正しく再開する（黙った欠落なし）。
+  const gate = createRowGate();
   let lastKey = null;
   for (const doc of rows) {
     const key = doc._id;
-    lastKey = key;
     const loadedAt = doc._loadedAt ?? null;
     // record 復元: 内部フィールド（_id / _loadedAt / _endpointFp）を剥がしたものが元 envelope（§3.3）。
     const record = {};
@@ -385,11 +387,12 @@ function runQuery(qargs, G) {
     }
     let out = record;
     if (!opts.raw && opts.fields) out = G.pickFields(record, opts.fields);
-    emitRow(key, loadedAt, opts.raw ? doc : out, opts.raw);
+    if (!gate.emitRowWithin(key, loadedAt, opts.raw ? doc : out, opts.raw)) break;
+    lastKey = key;
   }
-  const complete = rows.length < opts.limit;
+  const complete = !gate.truncated && rows.length < opts.limit;
   const end = {
-    count: rows.length, complete,
+    count: gate.count, complete, truncated: gate.truncated,
     nextCursor: complete ? null : G.encodeCursor(lastKey),
     dest, dedupeApplied: false,
   };

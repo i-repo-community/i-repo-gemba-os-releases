@@ -15,6 +15,17 @@
 
 const CONTRACT = "gemba-read/1.0";
 
+// ── rows バイト上限（§3.3・i-repo#197）────────────────────────────────
+// query の rows は変動費の最大経路なのに上限が無かった（スキル本文 256KiB・成果物 10MB・
+// manifest 1MB にはある非対称）。呼び出し側の limit では説明できない打ち切りを
+// query-end.truncated で報告する。既定 256KiB（rows は会話トークンを直接食うため）。
+// IREPO_MCP_MAX_ROWS_BYTES で調整可能。ブリッジ経由でもプラグイン直接でも同じ環境変数。
+const DEFAULT_MAX_ROWS_BYTES = 256 * 1024;
+function maxRowsBytes() {
+  const v = parseInt(process.env.IREPO_MCP_MAX_ROWS_BYTES || "", 10);
+  return Number.isFinite(v) && v > 0 ? v : DEFAULT_MAX_ROWS_BYTES;
+}
+
 /** プラグイン名を束ねた読み返しキットを作る。 */
 function createReadKit(PLUGIN) {
   const qEmit = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
@@ -23,10 +34,42 @@ function createReadKit(PLUGIN) {
   const queryEnd = (o) =>
     qEmit({ schemaVersion: "1.0", recordType: "query-end", contract: CONTRACT, plugin: PLUGIN, ...o });
 
-  /** row / row-raw 行（§3.3）。 */
-  const emitRow = (key, loadedAt, record, raw = false) =>
-    qEmit({ schemaVersion: "1.0", recordType: raw ? "row-raw" : "row", contract: CONTRACT,
+  /** row / row-raw の NDJSON 1行（改行なし）を組み立てる。emit とバイト計量で共用するため分離。 */
+  const rowLine = (key, loadedAt, record, raw = false) =>
+    JSON.stringify({ schemaVersion: "1.0", recordType: raw ? "row-raw" : "row", contract: CONTRACT,
       plugin: PLUGIN, key, loadedAt, record });
+
+  /** row / row-raw 行（§3.3）。 */
+  const emitRow = (key, loadedAt, record, raw = false) => process.stdout.write(rowLine(key, loadedAt, record, raw) + "\n");
+
+  /** rows バイト上限ゲート（§3.3・i-repo#197）。structured query の emit ループで使う:
+   *    for (const row of rows) {
+   *      if (!gate.emitRowWithin(key, loadedAt, record, raw)) break; // バイト上限で打ち切り
+   *      lastKey = key; // cursor は最後に emit した行の key から作る（捏造しない）
+   *    }
+   *    const complete = !gate.truncated && <従来の complete 判定>;
+   * 上限は「1行の床」付きソフト上限: 最初の1行は上限を超えても必ず emit する
+   * （0行＋cursor 不動だと呼び出し側が同じ cursor で無限再試行する。超過は1行分で収まる）。
+   * 0行を返して cursor を進める形は厳禁（その行が永久に読めなくなる＝黙った欠落）。 */
+  const createRowGate = () => {
+    const cap = maxRowsBytes();
+    let used = 0, n = 0, over = false;
+    return {
+      /** 収まれば emit して true。収まらなければ emit せず false（最初の1行は必ず emit）。 */
+      emitRowWithin(key, loadedAt, record, raw = false) {
+        const line = rowLine(key, loadedAt, record, raw);
+        const need = Buffer.byteLength(line) + 1;
+        if (n > 0 && used + need > cap) { over = true; return false; }
+        process.stdout.write(line + "\n");
+        used += need; n++;
+        return true;
+      },
+      /** 1行でも拒否したか（= query-end.truncated にそのまま使う）。 */
+      get truncated() { return over; },
+      /** emit した行数（= query-end.count に使う）。 */
+      get count() { return n; },
+    };
+  };
 
   /** aggregate-row 行（gemba-adc/1.2 §aggregate）。dimensions{}＝group_by の値、measures{}＝集計値（数値）。 */
   const emitAggRow = (dimensions, measures) =>
@@ -43,7 +86,7 @@ function createReadKit(PLUGIN) {
     process.exit(exitCode);
   };
 
-  return { qEmit, queryEnd, emitRow, emitAggRow, queryError };
+  return { qEmit, queryEnd, emitRow, emitAggRow, queryError, createRowGate };
 }
 
 // ── 時刻（§2.6/§3.5）────────────────────────────────────────────────
@@ -354,6 +397,8 @@ module.exports = {
   parseQueryArgs,
   timeBounds,
   buildTimeFilter,
+  maxRowsBytes,
+  DEFAULT_MAX_ROWS_BYTES,
   AGG_GRANULARITIES,
   AGG_MEASURE_OPS,
   bucketSubstrLen,

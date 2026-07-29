@@ -54,7 +54,7 @@
         {
           "path": "i-repo-bigquery",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-bigquery",
-          "sha256": "2e6fda55035ba3585e85a7e5968d847043024835f52324a8394665293ff2a043"
+          "sha256": "350245c94da3e24753e475858a355e2a94bebe602aa4ac87a2d6611508ed8f92"
         }
       ]
     },
@@ -83,7 +83,7 @@
         {
           "path": "i-repo-elastic",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-elastic",
-          "sha256": "62c5484e97afb35b28ec4d8ede5e03fe31310ae359009fa1dd4267617f8d7e0b"
+          "sha256": "310816c008b3499e791991f7462fb02ba624af6225ad9f64ba1eb4f463353da3"
         }
       ]
     },
@@ -111,7 +111,7 @@
         {
           "path": "i-repo-mongo",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-mongo",
-          "sha256": "e79383cc47d947908f21fa8429f1f7c3257ee7143e77ee22e13331f6c3acca95"
+          "sha256": "2294779fa64a777eafc9e77a2c39b58e6a194a80ca9631ad5b24442a13471ffb"
         }
       ]
     },
@@ -140,7 +140,7 @@
         {
           "path": "i-repo-parquet",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-parquet",
-          "sha256": "522968d1e54025d0e661246ef66ad7f07d5aa5e996127bcfdd0403f6da205fe1"
+          "sha256": "089f8e22ee5d8982f69e47f5966191f76da02284b73a7c602debc6fd7cf47022"
         }
       ]
     },
@@ -223,7 +223,7 @@
         {
           "path": "i-repo-sqlite",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-sqlite",
-          "sha256": "78f2593009a23f6797b54c11b8e8e492e4add9101bec959f4de56d8ad523898f"
+          "sha256": "e29887106b0a97a362255c9edcfea68b8bb7ebbc432357b19e387211d48101bf"
         }
       ]
     },
@@ -259,7 +259,7 @@
     {
       "path": "lib/gemba-read.js",
       "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/lib/gemba-read.js",
-      "sha256": "afa9851c9249a3e93f498fbc830dcae5100f27129de020f887513fc6839e416c"
+      "sha256": "ecfbe8869094bb951b0d853d064d70076858dfbf7e503efd8ed99954971e88bc"
     },
     {
       "path": "lib/spawn.js",
