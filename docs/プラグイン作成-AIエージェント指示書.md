@@ -53,7 +53,12 @@ spec と実プラグインを読んで確認する。最後に必ず自己テス
   schemaVersion / recordType（"receipt"）/ plugin / phase（write|verify）/ jobId / count / failedCount / verified。
   jobId は実行を識別する一意値（write/verify で同じ値）。
 - 読みの成功 ＝ stdout 末尾の query-end トレーラのみ（無ければ切断＝不採用）。0 件でも必ず出す。
-- secret は argv でなく環境変数（params[].secret:true で宣言。生 URL/パスワードを argv に載せない）。
+- secret は argv でなく環境変数（argv は ps / WMI から他プロセスに見える）。**宣言と実装の両方**が要る:
+  ① params[] に secret:true ＋ envVar:"IREPO_<PLUGIN>_<PARAM>"（例 {name:"--uri", secret:true,
+     envVar:"IREPO_MONGO_URI"}）。汎用のクラウド標準名はそのクラウドが主目的のときだけ。
+  ② query / aggregate / write の全サブコマンドで flag ?? process.env.<envVar> ?? config の順に読む（argv 優先）。
+  secret:true だけで envVar が無いと env にならない（ホストは argv に積む＝後方互換）。逆に宣言だけして
+  env を読まない実装は禁止（ホストが argv から外すため認証が黙って失敗する）。宣言と実装は同一バージョンで出す。
 - 破壊的フラグ・サブコマンドは destructive:true（--cleanup 等）。エージェント面には露出させない。
 - 時刻の 3 形式を字句比較しない: 業務時刻 YYYY/MM/DD HH:mm:ss（JST）・取込 ISO8601（UTC）・
   watermark YYYY-MM-DD HH:MM:SS（ローカル）。必ずパースしてから比較（UTC↔JST は 9 時間差）。
@@ -94,7 +99,7 @@ if (argv[0] === "--plugin-schema") {
   process.stdout.write(JSON.stringify({
     pluginApi:["1"], schemaVersions:["1.0"], recordTypes:["*"], name:PLUGIN, version:VERSION,
     roles:["sink","read"], input:["stdin-ndjson"], platforms:["macos","linux","windows"],
-    params:[{ name:"--db", type:"string", required:true }],   // 接続フラグ。secret は secret:true を付ける
+    params:[{ name:"--db", type:"string", required:true }],   // 接続フラグ。secret は secret:true ＋ envVar を付け、実装でも env を読む
     subcommands:[{ name:"query", mode:"read", input:["none"], output:["ndjson"] }],  // query を付けない場合は省く
     dataset:[{ datasetApi:["1"], contract:"gemba-adc/1.0", store:"mystore",
       locator:{ db:{ param:"--db" } },
@@ -178,6 +183,7 @@ i-repo plugin list && i-repo plugin verify <name>
 - [ ] 配信: stream-end 照合 → write receipt → verify receipt verified:true。冪等 UPSERT。
 - [ ] query を付けたなら: 0 件でも query-end・読み取り専用。
 - [ ] --plugin-schema の dataset/fields/locator/datetime(format+timezone) が実態と一致。canonical は許可値のみ。
-- [ ] secret は env・破壊的は destructive:true・時刻は字句比較しない・exit で stdout を切らない。
+- [ ] secret は secret:true ＋ envVar を宣言し、全サブコマンドで env を読む（argv 優先）。宣言だけは不可。
+- [ ] 破壊的は destructive:true・時刻は字句比較しない・exit で stdout を切らない。
 - [ ] i-repo plugin verify <name> と node scripts/check-adc.mjs --fast が緑。
 ````

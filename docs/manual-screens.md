@@ -32,4 +32,5 @@ has_children: true
 | [エージェント接続](screen-mcp.html) | Claude / Codex に読み取り専用でつなぐ |
 | [ログ（i-repo）](screen-logs.html) | 送信の詳しい記録を読み取り専用で確認（トラブル解析・監査） |
 | [現場 AI チャット](screen-agent.html) | アプリ内で AI に日本語で質問 |
+| [プロジェクト](screen-projects.html) | 既存フォルダをエージェンティック・プロジェクトとして登録し、Codex / Claude と作業 |
 | [Ontology Studio（現場スキル）](screen-ontology.html) | 帳票に意味を付け、ベテランの“見方”を現場スキルにする |
