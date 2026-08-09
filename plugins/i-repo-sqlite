@@ -24,7 +24,7 @@
 "use strict";
 
 const PLUGIN = "i-repo-sqlite";
-const VERSION = "0.5.0";
+const VERSION = "0.6.0";
 
 // ── 予約フラグ: プラグイン自身の引数より先に判定 ──────────────────────
 const argv = process.argv.slice(2);
@@ -104,7 +104,8 @@ if (argv[0] === "--plugin-schema") {
         description: "冪等キーの完全一致（カンマ区切り）" },
       { name: "--item-id", type: "string", subcommand: "query", filter: true, repeatable: true, label: "itemId",
         description: "itemId の完全一致（反復可・全リビジョン取得）" },
-      { name: "--fields", type: "string", subcommand: "query", filter: true, label: "射影フィールド（CSV）",
+      // 射影は取得レコード集合（WHERE 相当）を変えない唯一の共通フラグ → affectsRecordSet:false（#217・未宣言=true）。
+      { name: "--fields", type: "string", subcommand: "query", filter: true, affectsRecordSet: false, label: "射影フィールド（CSV）",
         description: "正準名で返却フィールドを限定（カンマ区切り）" },
       // sqlite 固有の追加フィルタ（extraFlags 方式・§3.1 共通閉集合には非追加）。canonical name の中間一致。
       // 単一語・SQLite 既定照合（ASCII のみ大小無視）・NFKC 正規化なし・%/_ はリテラル（ESCAPE）。
@@ -824,6 +825,24 @@ const receipt = (phase, count, failedCount, verified, extra = {}) => {
   }) + "\n");
 };
 
+// per-item 明細（failures/missing）の上限（SCHEMA.md §6）: 先頭100件。超過は切り詰めて
+// *Truncated:true を付ける（通常時はフィールド自体を出さない）。
+const RECEIPT_DETAIL_CAP = 100;
+function capReceiptDetails(list) {
+  return list.length <= RECEIPT_DETAIL_CAP
+    ? { list, truncated: false }
+    : { list: list.slice(0, RECEIPT_DETAIL_CAP), truncated: true };
+}
+
+// receipt の reason は接続情報（URI の userinfo 等）・PII を含まない短い要約にする（SCHEMA.md §6）。
+function shortReason(error) {
+  const msg = (error instanceof Error ? error.message : String(error))
+    .replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/@\s]+@/g, "$1****@")
+    .replace(/\s+/g, " ")
+    .trim();
+  return msg.length > 160 ? `${msg.slice(0, 159)}…` : msg;
+}
+
 // ── stdin を読み切り、stream-end トレーラを照合（SCHEMA.md §2.6） ────
 async function readStdin() {
   const chunks = [];
@@ -901,12 +920,18 @@ async function readStdin() {
   const now = new Date().toISOString();
   let failed = 0;
   const keys = [];
+  const failures = []; // per-item 失敗明細（write receipt の failures[]・SCHEMA.md §6）
   db.exec("BEGIN");
   for (let i = 0; i < records.length; i++) {
     const r = records[i];
+    const v = r.values ?? r;
+    const key = r.idempotencyKey ?? `${jobId}:${i}`;   // キーが無い行も一意に保存
+    // recordId は冪等キー形式 report:<itemId>:rev<revNo> を第一選択（SCHEMA.md §6）。
+    // itemId を持たない行のみ投入キー（その sink の識別単位）にフォールバック。
+    const itemId = r.itemId ?? v.itemId;
+    const revNo = r.revNo ?? v.revNo;
+    const recordId = itemId != null && itemId !== "" ? `report:${itemId}:rev${revNo ?? "?"}` : key;
     try {
-      const v = r.values ?? r;
-      const key = r.idempotencyKey ?? `${jobId}:${i}`;   // キーが無い行も一意に保存
       // テナント指紋: レコード自身の provenance（マニフェスト由来・SSOT）を最優先。無ければ
       // load フラグ（--endpoint-fp）で補完。どちらも無ければ NULL（＝厳格 query で除外・gemba-adc/1.1）。
       const efp = r.provenance?.endpointFingerprint || endpointFpFlag || null;
@@ -926,19 +951,31 @@ async function readStdin() {
       keys.push(key);
     } catch (e) {
       failed++;
+      failures.push({ recordId, reason: shortReason(e) });
       console.error(`row ${i}: ${e.message}`);
     }
   }
   db.exec("COMMIT");
-  receipt("write", records.length, failed, false);
+  const fw = capReceiptDetails(failures);
+  receipt("write", records.length, failed, false,
+    { ...(fw.list.length > 0 ? { failures: fw.list } : {}),
+      ...(fw.truncated ? { failuresTruncated: true } : {}) });
 
   // ── 読み戻し検証（verify 相）: 今回のキーが全件 DB に存在するか ────
   const placeholders = keys.map(() => "?").join(",");
-  const got = keys.length
-    ? db.prepare(`SELECT COUNT(*) AS n FROM "${table}" WHERE idempotency_key IN (${placeholders})`).get(...keys).n
-    : 0;
-  const verified = failed === 0 && got === keys.length;
-  receipt("verify", records.length, failed, verified, { verifiedRows: got });
+  const foundRows = keys.length
+    ? db.prepare(`SELECT idempotency_key FROM "${table}" WHERE idempotency_key IN (${placeholders})`).all(...keys)
+    : [];
+  const foundKeys = new Set(foundRows.map((row) => row.idempotency_key));
+  // verify 相のみ: ストア照合で見つからなかった recordId（投入キー）の配列（SCHEMA.md §6 missing）。
+  const missingKeys = keys.filter((k) => !foundKeys.has(k));
+  const verified = failed === 0 && missingKeys.length === 0;
+  const mv = capReceiptDetails(missingKeys);
+  receipt("verify", records.length, failed, verified, {
+    verifiedRows: foundKeys.size,
+    ...(mv.list.length > 0 ? { missing: mv.list } : {}),
+    ...(mv.truncated ? { missingTruncated: true } : {}),
+  });
   db.close();
   process.exit(verified ? 0 : 1);
 })().catch((e) => {

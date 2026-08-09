@@ -166,7 +166,7 @@ const { join, dirname, basename, resolve, relative, isAbsolute, sep } = require(
 const { spawnSpec } = require("./lib/spawn.js");
 
 const PLUGIN = "i-repo-share";
-const VERSION = "0.6.2";
+const VERSION = "0.7.0";
 const PLUGIN_API = "1";
 
 const PUT_SUBS = ["put-catalog-s3", "put-catalog-gcs", "put-catalog-azure", "put-catalog-local"];
@@ -1704,8 +1704,15 @@ async function pullShare(options, backend) {
   emitReceipt("read", jobId, result.materialized, 0, false, baseExtras);
   const problems = await verifyReadBack(result.plan);
   const verified = problems.length === 0;
-  if (!verified) for (const m of problems) console.error(`${PLUGIN}: verify failed: ${m}`);
-  emitReceipt("verify", jobId, result.materialized, verified ? 0 : problems.length, verified, baseExtras);
+  if (!verified) for (const p of problems) console.error(`${PLUGIN}: verify failed: ${p.reason}`);
+  // per-item 失敗明細（verify receipt の failures[]・SCHEMA.md §6）。recordId は datasetId
+  // （pull の検証単位は dataset.json / snapshot .db を持つデータセット）。
+  const fv = capReceiptDetails(problems);
+  emitReceipt("verify", jobId, result.materialized, verified ? 0 : problems.length, verified, {
+    ...baseExtras,
+    ...(fv.list.length > 0 ? { failures: fv.list } : {}),
+    ...(fv.truncated ? { failuresTruncated: true } : {}),
+  });
   if (!verified) process.exitCode = 1;
 }
 
@@ -1908,17 +1915,19 @@ function datasetReceiptEntry(p) {
 }
 
 // verify 相（read-back・§9.2.3-⑧）: index=sha256 再計算一致・snapshot=.db 実在+size>0＋sourceDigest
-// あれば展開後 .db の sha256 一致。問題の列を返す（空＝verified:true）。
+// あれば展開後 .db の sha256 一致。問題の明細（{recordId, reason}・SCHEMA.md §6 failures[] 形）を返す
+// （空＝verified:true）。reason は接続情報・PII を含まない短い要約（キー/パスと不一致種別のみ）。
 async function verifyReadBack(plan) {
   const problems = [];
   for (const p of plan) {
-    if (!fs.existsSync(p.indexDest)) { problems.push(`dataset.json missing: ${p.indexDest}`); continue; }
-    if (await sha256File(p.indexDest) !== p.ds.sha256) problems.push(`dataset.json sha256 mismatch: ${p.indexDest}`);
+    const recordId = p.ds.datasetId;
+    if (!fs.existsSync(p.indexDest)) { problems.push({ recordId, reason: `dataset.json missing: ${p.indexDest}` }); continue; }
+    if (await sha256File(p.indexDest) !== p.ds.sha256) problems.push({ recordId, reason: `dataset.json sha256 mismatch: ${p.indexDest}` });
     if (p.class === "snapshot" && p.ds.generation) {
       const s = await fsp.stat(p.landedDest).catch(() => null);
-      if (!s || s.size <= 0) { problems.push(`snapshot .db missing/empty: ${p.landedDest}`); continue; }
+      if (!s || s.size <= 0) { problems.push({ recordId, reason: `snapshot .db missing/empty: ${p.landedDest}` }); continue; }
       const src = p.ds.generation.sourceDigest;
-      if (src && await sha256File(p.landedDest) !== src) problems.push(`snapshot .db sourceDigest mismatch: ${p.landedDest}`);
+      if (src && await sha256File(p.landedDest) !== src) problems.push({ recordId, reason: `snapshot .db sourceDigest mismatch: ${p.landedDest}` });
     }
   }
   return problems;
@@ -2067,6 +2076,15 @@ const LOCAL_PULL = {
 };
 
 // ── receipts（SCHEMA.md §6・sink なので provenance 非搭載）─────────────────
+
+// per-item 明細（failures）の上限（SCHEMA.md §6）: 先頭100件。超過は切り詰めて
+// failuresTruncated:true を付ける（通常時はフィールド自体を出さない）。
+const RECEIPT_DETAIL_CAP = 100;
+function capReceiptDetails(list) {
+  return list.length <= RECEIPT_DETAIL_CAP
+    ? { list, truncated: false }
+    : { list: list.slice(0, RECEIPT_DETAIL_CAP), truncated: true };
+}
 
 function emitReceipt(phase, jobId, count, failedCount, verified, extras) {
   process.stdout.write(JSON.stringify({

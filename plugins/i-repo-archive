@@ -34,17 +34,18 @@
 // BOTH module systems: inside a "type":"module" package tree it is ESM, while
 // in ~/.i-repo/plugins (no package.json above) Node loads it as CommonJS.
 // Static require()/import would each break in one of the two environments.
-let spawn, fs, fsp, homedir, tmpdir, basename, dirname, join, resolve, sep;
+let spawn, fs, fsp, homedir, tmpdir, basename, dirname, join, resolve, sep, inflateRawSync;
 async function loadBuiltins() {
   ({ spawn } = await import("node:child_process"));
   fs = await import("node:fs");
   fsp = await import("node:fs/promises");
   ({ homedir, tmpdir } = await import("node:os"));
   ({ basename, dirname, join, resolve, sep } = await import("node:path"));
+  ({ inflateRawSync } = await import("node:zlib"));
 }
 
 const PLUGIN = "i-repo-archive";
-const VERSION = "0.9.2";
+const VERSION = "0.10.0";
 const PLUGIN_API = "1";
 const defaultArchiveRoot = () => join(homedir(), ".i-repo", "archives");
 
@@ -108,23 +109,34 @@ if (arg0 === "--plugin-schema") {
       //   --allow-worktree/--force（運用フラグ）, --regist/update-from/to（period から host が注入）,
       //   --definition（--definition-id に一本化）, --dry-run。
       // ユーザー向け抽出フィルタは filter:true を付ける。
+      // affectsRecordSet:false は「取得レコード集合（WHERE 相当）を変えない内容系キー」の申告（#217）。
+      // 未宣言 = true（fail-closed）なので、集合を変える抽出フィルタ群（--definition-id 等）は宣言しない。
       { name: "--out", type: "string", subcommand: "create", label: "Output directory",
         placeholder: "~/.i-repo/archives/<timestamp>", description: "Archive output directory" },
-      { name: "--with-artifacts", type: "select", subcommand: "create", default: "pdf", filter: true,
+      { name: "--with-artifacts", type: "select", subcommand: "create", default: "pdf", filter: true, affectsRecordSet: false,
         label: "出力形式（成果物）",
         choices: ["pdf", "pdf,excel", "text", "none"],
         description: "アーカイブに含める成果物（pdf=PDF＋メタデータ / pdf,excel=PDF＋Excel＋メタデータ / text=バイナリ無し・フィールド入力値(クラスター値)まで含むテキストのみ / none=一覧メタのみ）" },
-      { name: "--with-detail", type: "boolean", subcommand: "create", filter: true,
+      { name: "--with-detail", type: "boolean", subcommand: "create", filter: true, affectsRecordSet: false,
         label: "クラスター詳細を含める",
         description: "各帳票の reports get を呼び、manifest にクラスター値(detail)を埋め込む" },
-      { name: "--detail-sleep-ms", type: "string", subcommand: "create", filter: true,
+      { name: "--detail-sleep-ms", type: "string", subcommand: "create", filter: true, affectsRecordSet: false,
         label: "詳細取得間隔(ms)", placeholder: "500", default: "500",
         description: "各帳票の詳細取得ごとのスリープ時間(ms)。0 で無効。API 過負荷防止用",
         dependsOn: "--with-detail" },
-      { name: "--detail-sleep-every", type: "string", subcommand: "create", filter: true,
+      { name: "--detail-sleep-every", type: "string", subcommand: "create", filter: true, affectsRecordSet: false,
         label: "詳細スリープ周期(件)", placeholder: "1", default: "1",
         description: "N 件ごとにスリープを入れる（例: 10 なら10件ごと）",
         dependsOn: "--with-detail" },
+      { name: "--artifact-sleep-ms", type: "string", subcommand: "create", filter: true, affectsRecordSet: false,
+        label: "成果物DL間隔(ms)", placeholder: "0", default: "0",
+        description: "成果物ダウンロードごとのスリープ時間(ms)。0 で無効。API 過負荷防止用（最終DLの後は眠らない）" },
+      { name: "--skip-unchanged-keys", type: "string", subcommand: "create", affectsRecordSet: false,
+        label: "不変スキップキーファイル", placeholder: "keys.txt",
+        description: "行区切りキーファイル（1行1キー: report:<itemId>:rev<revNo> または <itemId>:<revNo>・任意で TAB 区切り第2列=前回の完全着地キー/URI）。マッチした帳票の成果物はDLせず skipped 印を付ける（host が前回配信の receipt から生成する運用キー）" },
+      { name: "--artifacts-bulk", type: "boolean", subcommand: "create", affectsRecordSet: false,
+        label: "PDFまとめ取り（取得方式）",
+        description: "PDF の取得方式指定: report-batches download（DownloadReport・withPDF の ZIP 同梱）で定義リビジョンごとにスライス取得し個別DLを省略する（--definition-id または --definition 必須・--with-artifacts に pdf が必要）。※--skip-unchanged-keys との併用時、skip は配置スキップにしかならず通信量は減らない（DownloadReport はスライス内全帳票を返すため）" },
       { name: "--allow-worktree", type: "boolean", subcommand: "create",
         description: "Allow writing inside the current git worktree" },
       { name: "--force", type: "boolean", subcommand: "create", destructive: true,
@@ -378,6 +390,19 @@ function usage() {
       --with-detail            Embed cluster values (reports get per record)
       --detail-sleep-ms <ms>   Sleep between detail fetches (default: 500)
       --detail-sleep-every <n> Apply sleep every N records (default: 1)
+      --artifact-sleep-ms <ms> Sleep between artifact downloads (default: 0; the final
+                               download is not followed by a sleep)
+      --skip-unchanged-keys <f>  Skip artifact downloads for records listed in key file <f>
+                               (1 key per line: report:<itemId>:rev<revNo> or <itemId>:<revNo>;
+                                optional TAB + 2nd column = previous landed key/URI, adopted
+                                verbatim into the receipt; blank/# lines ignored. Skipped records
+                                get {skipped:"unchanged"} entries instead of downloads)
+      --artifacts-bulk       Fetch PDFs in bulk instead of per-report downloads
+                               (report-batches DownloadReport ZIP, sliced per definition
+                                revision; requires --definition-id/--definition and pdf in
+                                --with-artifacts). Note: combined with --skip-unchanged-keys
+                                the skip only avoids PLACEMENT — bulk still downloads the whole
+                                slice window (DownloadReport returns every report in the slice).
       --dry-run                Resolve inputs and report without writing
       --endpoint/--user/--password <v>   Override i-repo credentials
       Filters: -l/--label-id -w/--word --public-status -e/--edit-status
@@ -445,6 +470,8 @@ const CREATE_SPEC = {
   "--out": "value", "--allow-worktree": "flag", "--force": "flag",
   "--with-artifacts": "value", "--with-detail": "flag", "--dry-run": "flag",
   "--detail-sleep-ms": "value", "--detail-sleep-every": "value",
+  "--artifact-sleep-ms": "value", "--skip-unchanged-keys": "value",
+  "--artifacts-bulk": "flag",
   "--endpoint": "value", "--user": "value", "--password": "value",
   "--label-id": "value", "-l": "--label-id",
   "--word": "value", "-w": "--word",
@@ -468,6 +495,36 @@ function parseCreateArgs(argv) {
       throw new Error(`Unsupported artifact type "${a}". Use pdf, pdfLayer, excel, text, or none.`);
     }
   }
+  const filters = {
+    // 既定 -9 = 全階層（すべて）。未指定だと rep list が最上位階層のみ＝0件になりやすいので、
+    // schema の default だけでなく直接 create 実行（GUI 非経由）でも -9 を既定にする。
+    labelId: o["label-id"] ?? "-9", word: o.word, publicStatus: o["public-status"],
+    editStatus: o["edit-status"], itemType: o.type,
+    definition: o["definition-id"] ?? o.definition,
+    wordTarget: o["word-target"], history: Boolean(o.history),
+    registFrom: o["regist-from"], registTo: o["regist-to"],
+    updateFrom: o["update-from"], updateTo: o["update-to"],
+    systemKeys: o["system-key"] ?? [],
+  };
+  const artifactsBulk = Boolean(o["artifacts-bulk"]);
+  if (artifactsBulk) {
+    // bulk は定義リビジョン列挙（definitions list --history → itemOrg 系譜）が前提。
+    // 定義未定義の全帳票窓はリビジョン厳密一致の DownloadReport では張れないので拒否する。
+    if (!filters.definition) {
+      throw new Error(
+        "--artifacts-bulk requires --definition-id (or --definition): the bulk path enumerates " +
+        "definition revisions. Drop --artifacts-bulk to use per-report downloads.",
+      );
+    }
+    // text/none はバイナリ無し（createArchive と同じ判定）— bulk の対象 PDF が無ければ無意味なので弾く。
+    const noBinaries = artifacts.some((a) => a === "none" || a === "text");
+    if (noBinaries || !artifacts.includes("pdf")) {
+      throw new Error(
+        "--artifacts-bulk only fetches PDFs: include pdf in --with-artifacts (and no text/none), " +
+        "or drop --artifacts-bulk.",
+      );
+    }
+  }
   return {
     out: o.out,
     allowWorktree: Boolean(o["allow-worktree"]),
@@ -477,21 +534,14 @@ function parseCreateArgs(argv) {
     withDetail: Boolean(o["with-detail"]) || artifacts.includes("text"),
     detailSleepMs: Math.max(0, parseInt(o["detail-sleep-ms"] ?? "500", 10) || 0),
     detailSleepEvery: Math.max(1, parseInt(o["detail-sleep-every"] ?? "1", 10) || 1),
+    artifactSleepMs: Math.max(0, parseInt(o["artifact-sleep-ms"] ?? "0", 10) || 0),
+    skipUnchangedKeys: o["skip-unchanged-keys"],
+    artifactsBulk,
     dryRun: Boolean(o["dry-run"]),
     endpoint: o.endpoint,
     user: o.user,
     password: o.password,
-    filters: {
-      // 既定 -9 = 全階層（すべて）。未指定だと rep list が最上位階層のみ＝0件になりやすいので、
-      // schema の default だけでなく直接 create 実行（GUI 非経由）でも -9 を既定にする。
-      labelId: o["label-id"] ?? "-9", word: o.word, publicStatus: o["public-status"],
-      editStatus: o["edit-status"], itemType: o.type,
-      definition: o["definition-id"] ?? o.definition,
-      wordTarget: o["word-target"], history: Boolean(o.history),
-      registFrom: o["regist-from"], registTo: o["regist-to"],
-      updateFrom: o["update-from"], updateTo: o["update-to"],
-      systemKeys: o["system-key"] ?? [],
-    },
+    filters,
   };
 }
 
@@ -580,6 +630,7 @@ async function createArchive(options) {
   // (bundle landedPrefix + objectKey) keyed by itemId+revNo — without needing
   // --with-detail (which embeds the same objectKey into manifest records).
   const landedArtifacts = [];
+  let skippedUnchanged = 0; // --skip-unchanged-keys で DL を省略したレコード数
 
   if (!options.dryRun) {
     // ── 成果物ダウンロード（先に実行し、各レコードへ objectKey を記録） ──
@@ -591,38 +642,108 @@ async function createArchive(options) {
       if (id !== null) idCounts.set(id, (idCounts.get(id) ?? 0) + 1);
     }
     const usedNames = new Set();
+
+    // (b) --skip-unchanged-keys: 前回配信から不変のレコードの DL を省く照合マップ
+    // （key: "<itemId>:<revNo>"・revNo 無しは "0" に正規化。value: 第2列 or null）。
+    const skipMap = options.skipUnchangedKeys
+      ? await readSkipUnchangedKeys(options.skipUnchangedKeys)
+      : null;
+
+    // (c) --artifacts-bulk: PDF を DownloadReport の ZIP から一括取得（個別 DL の代替）。
+    // 窓はスライス全件を含むため、バッチ外 ID の PDF は配置せず破棄する。
+    const bulk = options.artifactsBulk && artifacts.includes("pdf")
+      ? await downloadBulkPdfs(credentials, options.filters, records)
+      : null;
+
+    // (a) --artifact-sleep-ms は「DL と DL の間」にだけ挟む（最終 DL の後に眠りを残さない
+    // — report-batch.ts の sliceSleepMs と同型）。そのため個別 DL の実施予定数を先に数える。
+    const sleepMs = options.artifactSleepMs;
+    let plannedDownloads = 0;
     for (const record of records) {
       const reportId = getReportId(record);
-      if (reportId === null) {
-        console.error("skipping artifact download for a record without itemId/topId");
-        continue;
-      }
+      if (reportId === null) continue;
       const revNo = record.revNo != null ? String(record.revNo) : "";
-      const needsRev = (idCounts.get(reportId) ?? 0) > 1 && revNo !== "";
+      if (skipMap && lookupSkipUnchanged(skipMap, reportId, revNo).matched) continue;
       for (const artifact of artifacts) {
-        const dl = await downloadArtifactNamed(credentials, reportId, artifact);
-        try {
-          const fileName = chooseArtifactFileName(dl.name, {
-            record, reportId, revNo, needsRev, artifact,
-            multipleArtifacts: artifacts.length > 1, usedNames,
-          });
-          usedNames.add(fileName);
-          const outputPath = join(archivePath, "documents", fileName);
-          await moveFile(dl.tempPath, outputPath);
-          savedFiles.push(outputPath);
-          // NoSQLドキュメントから添付を辿れるよう、相対 objectKey を記録（S3なら <prefix>/documents/<name>）
-          (record.artifacts = record.artifacts ?? []).push({
-            type: artifact, file: fileName, objectKey: `documents/${fileName}`,
-          });
-          // 同じ objectKey を receipt 向けの平坦マップにも積む（itemId+revNo で索ける）。
-          landedArtifacts.push({
-            itemId: String(reportId), revNo: revNo || null,
-            type: artifact, objectKey: `documents/${fileName}`,
-          });
-        } finally {
-          await fsp.rm(dl.tempDir, { recursive: true, force: true });
+        if (bulk && artifact === "pdf" && bulk.has(reportId)) continue; // bulk 供給分は DL 不要
+        plannedDownloads++;
+      }
+    }
+
+    let downloadsDone = 0;
+    try {
+      for (const record of records) {
+        const reportId = getReportId(record);
+        if (reportId === null) {
+          console.error("skipping artifact download for a record without itemId/topId");
+          continue;
+        }
+        const revNo = record.revNo != null ? String(record.revNo) : "";
+        const needsRev = (idCounts.get(reportId) ?? 0) > 1 && revNo !== "";
+
+        // (b) 不変スキップ照合（レコード単位 — マッチしたら全 artifact 種類を取らない）。
+        // 「成果物が無い」と「取らなかった」を区別するため skipped 印を付記する。
+        const skipHit = skipMap ? lookupSkipUnchanged(skipMap, reportId, revNo) : { matched: false };
+        if (skipHit.matched) {
+          skippedUnchanged++;
+          for (const artifact of artifacts) {
+            (record.artifacts = record.artifacts ?? []).push({
+              type: artifact, skipped: "unchanged", objectKey: skipHit.objectKey,
+            });
+            landedArtifacts.push({
+              itemId: String(reportId), revNo: revNo || null,
+              type: artifact, skipped: "unchanged", objectKey: skipHit.objectKey,
+            });
+          }
+          continue;
+        }
+
+        for (const artifact of artifacts) {
+          let dl = null;
+          if (bulk && artifact === "pdf") {
+            const bulkPath = bulk.take(reportId);
+            if (bulkPath) {
+              // ZIP エントリ名（CP932・デコードしない）ではなく CLI 既定名を渡し、
+              // 命名は chooseArtifactFileName のフォールバック経路（manifest の帳票名称由来
+              // `<帳票ID>_<帳票名称>.pdf`）に載せる — 日本語名の文字化けを回避。
+              dl = { tempDir: null, tempPath: bulkPath, name: `report-${reportId}${fileExtensionFor(artifact)}` };
+            } else {
+              // 窓に無い（一覧取得〜bulk 間の更新・PDF 生成失敗等）→ 個別 DL に切り戻す（沈黙欠損しない）。
+              console.error(`--artifacts-bulk: report ${reportId} not found in the bulk ZIP window — falling back to per-report download`);
+            }
+          }
+          if (!dl) {
+            dl = await downloadArtifactNamed(credentials, reportId, artifact);
+            downloadsDone++;
+            if (sleepMs > 0 && downloadsDone < plannedDownloads) {
+              await new Promise((r) => setTimeout(r, sleepMs));
+            }
+          }
+          try {
+            const fileName = chooseArtifactFileName(dl.name, {
+              record, reportId, revNo, needsRev, artifact,
+              multipleArtifacts: artifacts.length > 1, usedNames,
+            });
+            usedNames.add(fileName);
+            const outputPath = join(archivePath, "documents", fileName);
+            await moveFile(dl.tempPath, outputPath);
+            savedFiles.push(outputPath);
+            // NoSQLドキュメントから添付を辿れるよう、相対 objectKey を記録（S3なら <prefix>/documents/<name>）
+            (record.artifacts = record.artifacts ?? []).push({
+              type: artifact, file: fileName, objectKey: `documents/${fileName}`,
+            });
+            // 同じ objectKey を receipt 向けの平坦マップにも積む（itemId+revNo で索ける）。
+            landedArtifacts.push({
+              itemId: String(reportId), revNo: revNo || null,
+              type: artifact, objectKey: `documents/${fileName}`,
+            });
+          } finally {
+            if (dl.tempDir) await fsp.rm(dl.tempDir, { recursive: true, force: true });
+          }
         }
       }
+    } finally {
+      if (bulk) await bulk.cleanup();
     }
 
     // ── --with-detail: 各帳票の reports get を呼び、クラスター値を record.detail に埋め込む ──
@@ -672,8 +793,10 @@ async function createArchive(options) {
     requestedArtifacts: artifacts,
     savedFiles,
     // record → landed objectKey map (deliver §9.4 enrich source). Empty on dry-run.
+    // skipped:"unchanged" エントリは前回バッチの着地キー/URI（objectKey・verbatim）を持つ。
     artifacts: landedArtifacts,
     filters: compactObject(options.filters),
+    ...(skippedUnchanged > 0 ? { skippedUnchanged } : {}),
     ...(options.dryRun ? { dryRun: true } : {}),
   };
   emitReceipt("write", jobId, records.length, 0, false, extras);
@@ -693,14 +816,21 @@ async function createArchive(options) {
 
   // ── verify phase: read back every saved file (exists and non-empty) ──
   let failed = 0;
+  const missingFiles = []; // verify 相の欠落明細（receipt の missing[]・SCHEMA.md §6）
   for (const file of savedFiles) {
     const details = await fsp.stat(file).catch(() => null);
     if (!details || !details.isFile() || details.size === 0) {
       console.error(`verify failed: missing or empty ${file}`);
       failed++;
+      missingFiles.push(file); // この sink の検証単位はファイル（recordId = ファイルパス）
     }
   }
-  emitReceipt("verify", jobId, records.length, failed, failed === 0, { archivePath });
+  const mv = capReceiptDetails(missingFiles);
+  emitReceipt("verify", jobId, records.length, failed, failed === 0, {
+    archivePath,
+    ...(mv.list.length > 0 ? { missing: mv.list } : {}),
+    ...(mv.truncated ? { missingTruncated: true } : {}),
+  });
   if (failed > 0) process.exitCode = 1;
 }
 
@@ -1103,6 +1233,15 @@ function emitReceipt(phase, jobId, count, failedCount, verified, extras) {
   }) + "\n");
 }
 
+// per-item 明細（missing）の上限（SCHEMA.md §6）: 先頭100件。超過は切り詰めて
+// missingTruncated:true を付ける（通常時はフィールド自体を出さない）。
+const RECEIPT_DETAIL_CAP = 100;
+function capReceiptDetails(list) {
+  return list.length <= RECEIPT_DETAIL_CAP
+    ? { list, truncated: false }
+    : { list: list.slice(0, RECEIPT_DETAIL_CAP), truncated: true };
+}
+
 // ── manifest parsing + stream-end validation (SCHEMA.md §2.6) ───────────────
 
 function parseManifest(text) {
@@ -1388,6 +1527,261 @@ async function downloadArtifactNamed(credentials, reportId, artifact) {
     throw error;
   }
 }
+
+// ── --skip-unchanged-keys（不変スキップ・#216）───────────────────────────────
+//
+// ホストが前回配信の receipt/manifest から生成する行区切りキーファイル（manifest パスではない）。
+// 受理形式（1行1キー）:
+//   report:<itemId>:rev<revNo>   … 封筒の idempotencyKey 形式（envelope.ts と同形）
+//   <itemId>:<revNo>             … 短縮形
+// 空行・# 始まりは無視。任意の TAB 区切り第2列は前回の完全着地キー/URIで、
+// receipt artifacts[] の skipped エントリへ verbatim で引き継ぐ（deliver locator は
+// prefix と合成せずそのまま採用する — prefix はバッチごとに変わるため合成は成立しない）。
+
+/** キーファイルを読み key("<itemId>:<revNo>")→第2列(string|null) のマップを作る。 */
+async function readSkipUnchangedKeys(path) {
+  const text = await fsp.readFile(path, "utf8"); // 読めなければここで投げる（fail-closed）
+  const map = new Map();
+  for (const [index, raw] of text.split(/\r?\n/).entries()) {
+    const tab = raw.indexOf("\t");
+    const col1 = (tab === -1 ? raw : raw.slice(0, tab)).trim();
+    const col2raw = tab === -1 ? "" : raw.slice(tab + 1).trim();
+    if (!col1 || col1.startsWith("#")) continue;
+    const m = /^report:([^:]+):rev([^:]*)$/.exec(col1) ?? /^([^:]+):([^:]*)$/.exec(col1);
+    if (!m || !m[1]) {
+      throw new Error(
+        `--skip-unchanged-keys: malformed key on line ${index + 1}: ${col1} ` +
+        `(expected "report:<itemId>:rev<revNo>" or "<itemId>:<revNo>").`,
+      );
+    }
+    // revNo 無しは封筒の idempotencyKey（:rev0）と同じく "0" に正規化する。
+    map.set(`${m[1]}:${m[2] === "" ? "0" : m[2]}`, col2raw || null);
+  }
+  return map;
+}
+
+/** レコードの冪等キー（<itemId>:<revNo>・revNo 無しは "0"）を組み立てて照合する。 */
+function lookupSkipUnchanged(skipMap, reportId, revNo) {
+  const key = `${reportId}:${revNo === "" ? "0" : revNo}`;
+  return skipMap.has(key)
+    ? { matched: true, objectKey: skipMap.get(key) }
+    : { matched: false };
+}
+
+// ── --artifacts-bulk（PDF まとめ取り・#216）──────────────────────────────────
+//
+// DownloadReport（report-batches download）の withPDF ZIP 同梱経路で、定義リビジョン
+// ごとに startIndex/executeCount スライスを tmp へ保存し、ZIP から PDF だけを抜く。
+// DownloadMergedPdf（1つの連結 PDF）は per-report 配置に合わないので使わない。
+
+const BULK_SLICE_COUNT = 100; // DownloadReport 1 スライスあたりの帳票数
+const BULK_MAX_SLICES = 1000; // サーバ異常時の無限ループ打ち止め（fail-closed）
+
+/**
+ * PDF を一括取得し { has(id), take(id), cleanup() } を返す。take(id) は帳票IDの
+ * tmp ファイルを1つ消費する（窓内のバッチ外 ID は抽出時点で破棄済み）。
+ * tmp ディレクトリは cleanup() で消す。
+ */
+async function downloadBulkPdfs(credentials, filters, records) {
+  const wanted = new Set(); // バッチ内の帳票ID（窓内のバッチ外 PDF 破棄の判定用）
+  for (const record of records) {
+    const id = getReportId(record);
+    if (id !== null) wanted.add(id);
+  }
+  // バッチに ID 持ちレコードが無ければ窓を張る意味が無い（無駄なスライス取得を避ける）。
+  if (wanted.size === 0) {
+    return { has: () => false, take: () => null, cleanup: async () => {} };
+  }
+  const definitionIds = await listDefinitionLineage(credentials, filters);
+  const dir = await fsp.mkdtemp(join(tmpdir(), "irepo-archive-bulk-"));
+  const byId = new Map(); // reportId → [tmpFilePath, ...]（--history で同一IDの複数版があり得る）
+  let seq = 0;
+  try {
+    for (const defId of definitionIds) {
+      for (let slice = 0; ; slice++) {
+        if (slice >= BULK_MAX_SLICES) {
+          throw bulkError(`exceeded ${BULK_MAX_SLICES} slices for definition ${defId} — aborting (fail-closed)`);
+        }
+        const start = slice * BULK_SLICE_COUNT;
+        const zipPath = join(dir, `slice-${defId}-${start}.zip`);
+        const args = [
+          "report-batches", "download", "-d", defId,
+          "--with-pdf", "true",
+          "--start-index", String(start), "--execute-count", String(BULK_SLICE_COUNT),
+          "-o", zipPath,
+        ];
+        // DownloadReport の時間フィルタへ引き継ぐ（個別モードの一覧窓と同じ update 範囲）。
+        if (filters.updateFrom) args.push("--update-from", filters.updateFrom);
+        if (filters.updateTo) args.push("--update-to", filters.updateTo);
+        // --history 無しのバッチは現行リビジョンのみ＝ZIP 側も最新のみに絞る
+        if (!filters.history) args.push("--current-only");
+        await runCommand(iRepoBin(), args, { env: buildIRepoEnv(credentials), captureStdout: true })
+          .catch((error) => {
+            throw bulkError(`slice download failed (definition ${defId}, startIndex ${start}): ${error.message}`);
+          });
+        const buf = await fsp.readFile(zipPath);
+        await fsp.unlink(zipPath).catch(() => {});
+        const pdfs = extractBulkPdfs(buf);
+        for (const p of pdfs) {
+          if (!wanted.has(p.reportId)) continue; // 窓内のバッチ外 PDF は破棄
+          const target = join(dir, `bulk-${seq++}-${p.reportId}.pdf`);
+          await fsp.writeFile(target, p.data);
+          let list = byId.get(p.reportId);
+          if (!list) byId.set(p.reportId, (list = []));
+          list.push(target);
+        }
+        // withPDF=true はスライス内全帳票の PDF を返す前提 — 端数スライスを終端とみなす。
+        if (pdfs.length < BULK_SLICE_COUNT) break;
+      }
+    }
+  } catch (error) {
+    await fsp.rm(dir, { recursive: true, force: true });
+    throw error;
+  }
+  return {
+    has: (id) => (byId.get(id) ?? []).length > 0,
+    take: (id) => {
+      const list = byId.get(id);
+      return list && list.length > 0 ? list.shift() : null;
+    },
+    cleanup: () => fsp.rm(dir, { recursive: true, force: true }),
+  };
+}
+
+/**
+ * --definition-id の系譜（改版またぎの全リビジョン定義ID）を列挙する。
+ * DownloadReport の definition 指定はリビジョン厳密一致（帳票は作成時リビジョンの定義IDに
+ * ぶら下がる）ため、definitions list --history から itemOrg（元アイテムID）が同じ定義を全部拾う。
+ */
+async function listDefinitionLineage(credentials, filters) {
+  const args = ["definitions", "list", "--history", "--format", "ndjson", "-l", "-9"];
+  if (filters.publicStatus) args.push("--public-status", filters.publicStatus);
+  const result = await runCommand(iRepoBin(), args, {
+    env: buildIRepoEnv(credentials), captureStdout: true,
+  });
+  const rows = [];
+  for (const line of result.stdout.split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t) continue;
+    let row;
+    try { row = JSON.parse(t); } catch { continue; } // 非 JSON 行（警告等）は捨てる
+    if (row && typeof row === "object" && row.itemId != null) rows.push(row);
+  }
+  const self = rows.find((r) => String(r.itemId) === String(filters.definition));
+  if (!self) {
+    throw new Error(
+      `--artifacts-bulk: definition ${filters.definition} was not found in "definitions list --history" output. ` +
+      "Check --definition-id, or drop --artifacts-bulk to use per-report downloads.",
+    );
+  }
+  // itemOrg は元アイテムID（系譜で共通）。空の行は自分自身を系譜キーにする。
+  const lineageOf = (r) => String(r.itemOrg ?? "") || String(r.itemId);
+  const org = lineageOf(self);
+  return [...new Set(
+    rows.filter((r) => lineageOf(r) === org).map((r) => String(r.itemId)),
+  )];
+}
+
+// ── ZIP リーダ（zero-dep 最小実装・#216）─────────────────────────────────────
+//
+// DownloadReport の ZIP を node 組み込みだけで読む。central directory をパースし、
+// store（無圧縮）はそのまま切り出し、deflate は node:zlib の inflateRawSync で展開する。
+// 外部 unzip コマンドには依存しない。ZIP64・未知の圧縮方式・破損は fail-closed で
+// エラー化し、個別モードへの切り戻しを案内する（黙って欠損させない）。
+
+function bulkError(detail) {
+  return new Error(
+    `--artifacts-bulk: ${detail}\nRe-run without --artifacts-bulk to use per-report downloads.`,
+  );
+}
+
+/** central directory の全エントリを返す（名前は生バイト列のまま — CP932 をデコードしない）。 */
+function listZipEntries(buf) {
+  if (buf.length < 22) throw bulkError("not a ZIP file (too small)");
+  // EOCD（end of central directory）を末尾から探す（コメント込みで最大 65535+22 バイト）。
+  const minEocd = Math.max(0, buf.length - 22 - 0xffff);
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= minEocd; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd === -1) throw bulkError("not a ZIP file (end of central directory not found)");
+  const total = buf.readUInt16LE(eocd + 10);
+  const cdOffset = buf.readUInt32LE(eocd + 16);
+  if (total === 0xffff || cdOffset === 0xffffffff) throw bulkError("ZIP64 archives are not supported");
+  const entries = [];
+  let p = cdOffset;
+  for (let n = 0; n < total; n++) {
+    if (p + 46 > buf.length || buf.readUInt32LE(p) !== 0x02014b50) {
+      throw bulkError("corrupt ZIP central directory");
+    }
+    const method = buf.readUInt16LE(p + 10);
+    const compressedSize = buf.readUInt32LE(p + 20);
+    const nameLen = buf.readUInt16LE(p + 28);
+    const extraLen = buf.readUInt16LE(p + 30);
+    const commentLen = buf.readUInt16LE(p + 32);
+    const localOffset = buf.readUInt32LE(p + 42);
+    if (compressedSize === 0xffffffff || localOffset === 0xffffffff) {
+      throw bulkError("ZIP64 archives are not supported");
+    }
+    if (p + 46 + nameLen > buf.length) throw bulkError("corrupt ZIP central directory");
+    entries.push({ name: buf.subarray(p + 46, p + 46 + nameLen), method, compressedSize, localOffset });
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  return entries;
+}
+
+/** 1エントリの実データを取り出す（local header の name/extra 長からデータ位置を求める）。 */
+function inflateZipEntry(buf, entry) {
+  if (entry.localOffset + 30 > buf.length || buf.readUInt32LE(entry.localOffset) !== 0x04034b50) {
+    throw bulkError("corrupt ZIP local file header");
+  }
+  const nameLen = buf.readUInt16LE(entry.localOffset + 26);
+  const extraLen = buf.readUInt16LE(entry.localOffset + 28);
+  const start = entry.localOffset + 30 + nameLen + extraLen;
+  const raw = buf.subarray(start, start + entry.compressedSize);
+  if (raw.length !== entry.compressedSize) throw bulkError("truncated ZIP entry data");
+  if (entry.method === 0) return Buffer.from(raw); // store: 無圧縮（subarray を detach）
+  if (entry.method === 8) {
+    try {
+      return inflateRawSync(raw);
+    } catch (error) {
+      throw bulkError(`deflate failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  throw bulkError(`unsupported ZIP compression method ${entry.method}`);
+}
+
+/**
+ * ZIP 内の PDF エントリ（pdf_<帳票ID>_<名称>.pdf）だけを { reportId, data } で抽出する。
+ * 値 CSV は列ズレ不具合で対象外（issue の認識共有どおり）なので pdf_* 以外は無視する。
+ */
+function extractBulkPdfs(buf) {
+  const out = [];
+  for (const entry of listZipEntries(buf)) {
+    const reportId = bulkPdfEntryReportId(entry.name);
+    if (reportId === null) continue;
+    out.push({ reportId, data: inflateZipEntry(buf, entry) });
+  }
+  return out;
+}
+
+/**
+ * エントリ名（生バイト列）の ASCII 接頭辞 `pdf_<帳票ID>_` から帳票IDだけを機械抽出する。
+ * 名称部は CP932 のことがあるがデコードしない — 先頭からの前方走査だけなので、
+ * マルチバイト文字の第2バイト（0x5F 等）を接頭辞と誤認することはない。
+ */
+function bulkPdfEntryReportId(name) {
+  // 最小形 "pdf_<1桁>_.pdf" = 10 バイト。接頭辞 "pdf_" = 0x70 0x64 0x66 0x5F。
+  if (name.length < 10 || name[0] !== 0x70 || name[1] !== 0x64 || name[2] !== 0x66 || name[3] !== 0x5f) return null;
+  let i = 4;
+  while (i < name.length && name[i] >= 0x30 && name[i] <= 0x39) i++; // 帳票ID（数字列）
+  if (i === 4 || i >= name.length || name[i] !== 0x5f) return null; // 数字列の後は "_"
+  // 末尾は ".pdf"（0x2E 0x70 0x64 0x66）
+  const n = name.length;
+  if (name[n - 4] !== 0x2e || name[n - 3] !== 0x70 || name[n - 2] !== 0x64 || name[n - 1] !== 0x66) return null;
+  return name.subarray(4, i).toString("ascii");
+}
+
 
 /**
  * rename で移動し、tmpdir と保存先が別ボリュームのとき (EXDEV) は copy+unlink。

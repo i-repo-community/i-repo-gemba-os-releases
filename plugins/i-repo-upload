@@ -50,7 +50,7 @@ const { basename, join, resolve, relative, isAbsolute, sep } = require("node:pat
 const { spawnSpec } = require("./lib/spawn.js");
 
 const PLUGIN = "i-repo-upload";
-const VERSION = "0.1.1";
+const VERSION = "0.2.0";
 const PLUGIN_API = "1";
 
 const PLACE_SUBS = ["push-s3", "push-gcs", "push-azure", "push-local"];
@@ -596,6 +596,12 @@ async function pushPlacement(options, backend) {
     });
   }
   const count = files.length; // count はファイル数（placement の検証単位）
+  // recordId 索引（SCHEMA.md §6 failures/missing）: 冪等キー形式 report:<itemId>:rev<revNo> を
+  // 第一選択。itemId/revNo を持たないファイルはファイル名（placement の検証単位）にフォールバック。
+  const recordIdByName = new Map(artifacts.map((a) => [
+    a.fileName,
+    a.itemId != null ? `report:${a.itemId}:rev${a.revNo ?? "?"}` : a.fileName,
+  ]));
 
   if (options.dryRun) {
     emitReceipt("write", jobId, count, 0, false,
@@ -608,6 +614,7 @@ async function pushPlacement(options, backend) {
   // --only 時と push-local は per-file — ファイル名に cmd.exe メタ文字（& ! % 等）が含まれ
   // spawn.js が拒否した場合は、そのファイルだけ failedCount 計上で続行する（全体 throw しない）。
   const failedUpload = new Set();
+  const uploadFailures = []; // per-item 失敗明細（write receipt の failures[]・SCHEMA.md §6）
   if (count > 0) {
     if (backend.prepare) await backend.prepare(placedPrefix);
     if (backend.perFileAlways || options.only.length > 0) {
@@ -616,6 +623,10 @@ async function pushPlacement(options, backend) {
           await backend.uploadOne(f.path, f.fileName, placedPrefix, env);
         } catch (error) {
           failedUpload.add(f.fileName);
+          uploadFailures.push({
+            recordId: recordIdByName.get(f.fileName) ?? f.fileName,
+            reason: shortReason(error),
+          });
           console.error(`upload failed for ${f.fileName}: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
@@ -624,8 +635,11 @@ async function pushPlacement(options, backend) {
       await backend.uploadAll(docsDir, placedPrefix, env);
     }
   }
+  const fw = capReceiptDetails(uploadFailures);
   emitReceipt("write", jobId, count, failedUpload.size, false,
-    { archivePath, dest, storeKind, placedPrefix, artifacts });
+    { archivePath, dest, storeKind, placedPrefix, artifacts,
+      ...(fw.list.length > 0 ? { failures: fw.list } : {}),
+      ...(fw.truncated ? { failuresTruncated: true } : {}) });
 
   // ── verify: 宛先 1 回 list（local は per-file stat）で存在＋バイト数を照合 ──
   const failedVerify = new Set(failedUpload);
@@ -647,11 +661,15 @@ async function pushPlacement(options, backend) {
     }
   }
   const verified = failedVerify.size === 0;
+  // verify 相のみ: 照合で「正しく配置された」と言えなかった recordId の配列（SCHEMA.md §6 missing）。
+  const mv = capReceiptDetails([...failedVerify].map((name) => recordIdByName.get(name) ?? name));
 
   // ── --cleanup: verified:true かつ失敗 0 件のときだけローカル bundle を削除 ──
   // (発火条件は exit 0 ではなく verified receipt — SCHEMA.md §6)。削除失敗は配送の
   // 失敗ではないので exit 0 のまま、cleanedUp:false と stderr で必ず報告する。
-  const extras = { archivePath, dest, storeKind, placedPrefix };
+  const extras = { archivePath, dest, storeKind, placedPrefix,
+    ...(mv.list.length > 0 ? { missing: mv.list } : {}),
+    ...(mv.truncated ? { missingTruncated: true } : {}) };
   if (options.cleanup) {
     if (verified && failedVerify.size === 0) {
       try {
@@ -694,6 +712,11 @@ async function readArtifactIndex(archivePath) {
   const index = new Map();
   for (const a of Array.isArray(receipt.artifacts) ? receipt.artifacts : []) {
     if (!a || typeof a.objectKey !== "string") continue;
+    // skipped:"unchanged" エントリ（#216・archive create --skip-unchanged-keys）は今回バッチの
+    // documents/ に実ファイルを持たない（objectKey は前回バッチの着地キー/URIの verbatim）ので
+    // 索引から除外する。載せると、host が artifacts[] 由来で --only を駆動した際に
+    // documents/ 不在名で exit 2 になる・同名の実ファイルの来歴を先勝ちで汚染する。
+    if (typeof a.skipped === "string" && a.skipped !== "") continue;
     const name = a.objectKey.replace(/^documents\//, "");
     if (!name || index.has(name)) continue;
     index.set(name, {
@@ -733,6 +756,24 @@ async function listDocumentFiles(docsDir) {
 }
 
 // ── receipts（SCHEMA.md §6・sink なので provenance 非搭載）─────────────────
+
+// per-item 明細（failures/missing）の上限（SCHEMA.md §6）: 先頭100件。超過は切り詰めて
+// *Truncated:true を付ける（通常時はフィールド自体を出さない）。
+const RECEIPT_DETAIL_CAP = 100;
+function capReceiptDetails(list) {
+  return list.length <= RECEIPT_DETAIL_CAP
+    ? { list, truncated: false }
+    : { list: list.slice(0, RECEIPT_DETAIL_CAP), truncated: true };
+}
+
+// receipt の reason は接続情報（URI の userinfo 等）・PII を含まない短い要約にする（SCHEMA.md §6）。
+function shortReason(error) {
+  const msg = (error instanceof Error ? error.message : String(error))
+    .replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/@\s]+@/g, "$1****@")
+    .replace(/\s+/g, " ")
+    .trim();
+  return msg.length > 160 ? `${msg.slice(0, 159)}…` : msg;
+}
 
 function emitReceipt(phase, jobId, count, failedCount, verified, extras) {
   process.stdout.write(JSON.stringify({

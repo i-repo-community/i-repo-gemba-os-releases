@@ -30,7 +30,7 @@
 "use strict";
 
 const PLUGIN = "i-repo-bigquery";
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const { spawnSyncSpec } = require("./lib/spawn.js");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -110,7 +110,8 @@ if (argv[0] === "--plugin-schema") {
         description: "冪等キーの完全一致（カンマ区切り）" },
       { name: "--item-id", type: "string", subcommand: "query", filter: true, repeatable: true, label: "itemId",
         description: "itemId の完全一致（反復可・全リビジョン取得）" },
-      { name: "--fields", type: "string", subcommand: "query", filter: true, label: "射影フィールド（CSV）",
+      // 射影は取得レコード集合（WHERE 相当）を変えない唯一の共通フラグ → affectsRecordSet:false（#217・未宣言=true）。
+      { name: "--fields", type: "string", subcommand: "query", filter: true, affectsRecordSet: false, label: "射影フィールド（CSV）",
         description: "正準名で返却フィールドを限定（カンマ区切り）" },
       { name: "--endpoint-fp", type: "string", subcommand: "query", filter: true, label: "テナント指紋（endpointFp）",
         description: "配信元 i-Reporter の endpointFp に厳格一致で絞る（未タグ=旧配信は除外・gemba-adc/1.1 §3.9）" },
@@ -524,6 +525,15 @@ const receipt = (phase, count, failedCount, verified, extra = {}) => {
   }) + "\n");
 };
 
+// per-item 明細（missing）の上限（SCHEMA.md §6）: 先頭100件。超過は切り詰めて
+// missingTruncated:true を付ける（通常時はフィールド自体を出さない）。
+const RECEIPT_DETAIL_CAP = 100;
+function capReceiptDetails(list) {
+  return list.length <= RECEIPT_DETAIL_CAP
+    ? { list, truncated: false }
+    : { list: list.slice(0, RECEIPT_DETAIL_CAP), truncated: true };
+}
+
 async function readStdin() {
   const chunks = [];
   for await (const c of process.stdin) chunks.push(c);
@@ -654,22 +664,33 @@ function bqEnv(kf) {
   }
   receipt("write", rows.length, 0, false);
 
-  // ── verify 相: 読み戻して今回 loaded_at の行数を照合 ──────────────────
+  // ── verify 相: 読み戻して今回 loaded_at の行のキーを照合 ─────────────
   const fqtn = "`" + `${project}.${dataset}.${table}` + "`";
-  const vsql = `SELECT COUNT(*) AS n FROM ${fqtn} WHERE loaded_at = ${q(now)};`;
-  // vsql は COUNT(*) の括弧等を含むため stdin で渡す（runBqJson と同じ理由・cmd.exe メタ文字回避）。
+  const vsql = `SELECT idempotency_key FROM ${fqtn} WHERE loaded_at = ${q(now)};`;
+  // vsql は識別子のバッククォート等を含むため stdin で渡す（runBqJson と同じ理由・cmd.exe メタ文字回避）。
   const v = spawnSyncSpec("bq", ["--quiet", "--headless", "--format=json", `--location=${location}`,
     `--project_id=${project}`, "query", "--use_legacy_sql=false"],
     { encoding: "utf8", env, input: vsql, maxBuffer: 64 * 1024 * 1024 });
-  let found = -1;
+  let foundKeys = null;
   if (v.status === 0) {
-    try { const arr = JSON.parse(v.stdout || "[]"); found = arr.length ? Number(arr[0].n) : 0; }
-    catch { found = -1; }
+    try {
+      const arr = JSON.parse(v.stdout || "[]");
+      foundKeys = new Set(arr.map((row) => row.idempotency_key));
+    }
+    catch { foundKeys = null; }
   } else {
     console.error((v.stderr || "bq verify failed").trim());
   }
-  const verified = found === rows.length;
-  receipt("verify", rows.length, verified ? 0 : rows.length, verified, { verifiedRows: found });
+  // verify 相のみ: ストア照合で見つからなかった recordId（idempotency_key）の配列（SCHEMA.md §6 missing）。
+  const keys = rows.map((r) => r.idempotency_key);
+  const missingKeys = foundKeys ? keys.filter((k) => !foundKeys.has(k)) : [];
+  const verified = foundKeys !== null && missingKeys.length === 0;
+  const mv = capReceiptDetails(missingKeys);
+  receipt("verify", rows.length, verified ? 0 : rows.length, verified, {
+    verifiedRows: foundKeys ? foundKeys.size : -1,
+    ...(foundKeys && mv.list.length > 0 ? { missing: mv.list } : {}),
+    ...(foundKeys && mv.truncated ? { missingTruncated: true } : {}),
+  });
   cleanup();
   process.exit(verified ? 0 : 1);
 })().catch((e) => {

@@ -24,7 +24,7 @@
 "use strict";
 
 const PLUGIN = "i-repo-elastic";
-const VERSION = "0.5.0";
+const VERSION = "0.6.0";
 
 const argv = process.argv.slice(2);
 
@@ -86,7 +86,8 @@ if (argv[0] === "--plugin-schema") {
         description: "冪等キーの完全一致（カンマ区切り）" },
       { name: "--item-id", type: "string", subcommand: "query", filter: true, repeatable: true, label: "itemId",
         description: "itemId の完全一致（反復可・全リビジョン取得）" },
-      { name: "--fields", type: "string", subcommand: "query", filter: true, label: "射影フィールド（CSV）",
+      // 射影は取得レコード集合（WHERE 相当）を変えない唯一の共通フラグ → affectsRecordSet:false（#217・未宣言=true）。
+      { name: "--fields", type: "string", subcommand: "query", filter: true, affectsRecordSet: false, label: "射影フィールド（CSV）",
         description: "正準名で返却フィールドを限定（カンマ区切り）" },
       // capability: keyword-search（elastic の本領）。全文検索＝帳票のどこかに語を含むものを引く。
       { name: "--q", type: "string", subcommand: "query", filter: true, label: "全文検索",
@@ -707,6 +708,24 @@ function chunked(arr, n) {
   return out;
 }
 
+// per-item 明細（failures/missing）の上限（SCHEMA.md §6）: 先頭100件。超過は切り詰めて
+// *Truncated:true を付ける（通常時はフィールド自体を出さない）。
+const RECEIPT_DETAIL_CAP = 100;
+function capReceiptDetails(list) {
+  return list.length <= RECEIPT_DETAIL_CAP
+    ? { list, truncated: false }
+    : { list: list.slice(0, RECEIPT_DETAIL_CAP), truncated: true };
+}
+
+// receipt の reason は接続情報（URI の userinfo 等）・PII を含まない短い要約にする（SCHEMA.md §6）。
+function shortReason(s) {
+  const msg = String(s)
+    .replace(/(\/\/)[^/@\s]*@/g, "$1****@")
+    .replace(/\s+/g, " ")
+    .trim();
+  return msg.length > 160 ? `${msg.slice(0, 159)}…` : msg;
+}
+
 (async () => {
   const text = await readStdin();
   const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
@@ -767,6 +786,7 @@ function chunked(arr, n) {
 
   // ── write 相: _bulk index（_id 指定 = 同IDは全置換 = 冪等）。500件ずつ ──
   let writeFailed = 0;
+  const failures = []; // per-item 失敗明細（write receipt の failures[]・SCHEMA.md §6）
   for (const batch of chunked(prepared, CHUNK)) {
     const body = batch
       .map(({ id, doc }) =>
@@ -783,25 +803,42 @@ function chunked(arr, n) {
         const op = item.index || item.create || {};
         if (op.error) {
           writeFailed++;
+          failures.push({
+            recordId: op._id,
+            reason: shortReason(`${op.error.type}: ${op.error.reason}`),
+          });
           console.error(`index error _id=${op._id}: ${op.error.type}: ${op.error.reason}`);
         }
       }
     }
   }
-  receipt("write", prepared.length, writeFailed, false);
+  const fw = capReceiptDetails(failures);
+  receipt("write", prepared.length, writeFailed, false,
+    { ...(fw.list.length > 0 ? { failures: fw.list } : {}),
+      ...(fw.truncated ? { failuresTruncated: true } : {}) });
   if (writeFailed > 0) process.exit(1);
 
-  // ── verify 相: refresh 後、_mget で全 _id を読み戻して件数照合 ─────────
+  // ── verify 相: refresh 後、_mget で全 _id を読み戻して照合 ────────────
   await es("POST", `/${encodeURIComponent(index)}/_refresh`);
   const ids = prepared.map((p) => p.id);
   let found = 0, verifyErr = false;
+  const foundIds = new Set();
   for (const batch of chunked(ids, CHUNK)) {
     const r = await es("POST", `/${encodeURIComponent(index)}/_mget?_source=false`, { ids: batch });
     if (!r.ok || !r.json || !Array.isArray(r.json.docs)) { verifyErr = true; break; }
-    found += r.json.docs.filter((d) => d.found).length;
+    for (const d of r.json.docs) {
+      if (d.found) { found++; foundIds.add(d._id); }
+    }
   }
-  const verified = !verifyErr && found === ids.length;
-  receipt("verify", prepared.length, verified ? 0 : prepared.length - found, verified, { verifiedDocs: found });
+  // verify 相のみ: ストア照合で見つからなかった recordId（_id＝冪等キー）の配列（SCHEMA.md §6 missing）。
+  const missingIds = verifyErr ? [] : ids.filter((id) => !foundIds.has(id));
+  const verified = !verifyErr && missingIds.length === 0;
+  const mv = capReceiptDetails(missingIds);
+  receipt("verify", prepared.length, verified ? 0 : prepared.length - found, verified, {
+    verifiedDocs: found,
+    ...(!verifyErr && mv.list.length > 0 ? { missing: mv.list } : {}),
+    ...(!verifyErr && mv.truncated ? { missingTruncated: true } : {}),
+  });
   process.exit(verified ? 0 : 1);
 })().catch((e) => {
   console.error(`${PLUGIN}: ${e.message}`);
