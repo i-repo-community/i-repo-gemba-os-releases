@@ -5,7 +5,7 @@
       "name": "archive",
       "file": "i-repo-archive",
       "displayName": "i-repo-archive",
-      "version": "0.12.0",
+      "version": "0.13.0",
       "description": "帳票を bundle 化して保管：ローカル/ファイルサーバー、または S3 / GCS / Azure Blob へ配信（create=取得、push-*=配信）",
       "platforms": [
         "macos",
@@ -25,7 +25,7 @@
         {
           "path": "i-repo-archive",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-archive",
-          "sha256": "d9163e6490598c4cb81e74c722c668761f268e82a607f63ce3156d3a05d0b596"
+          "sha256": "cb4e987dd79bf1cacb7ccd75a95259d85077d1d1a91ea1f5e4b893c35bf9c853"
         }
       ]
     },
@@ -148,7 +148,7 @@
       "name": "report-delete",
       "file": "i-repo-report-delete",
       "displayName": "i-repo-report-delete",
-      "version": "0.1.7",
+      "version": "0.2.0",
       "description": "帳票削除（DeleteReport）— 寿命管理。認証済み組み込み report-batches delete を呼び戻す（自分では認証しない）",
       "platforms": [
         "macos",
@@ -167,7 +167,7 @@
         {
           "path": "i-repo-report-delete",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-report-delete",
-          "sha256": "f3cafeef4271380f04c81d9985bbf3cb087fca351a0768f9ada42f324647b51b"
+          "sha256": "3fcf088469322ce6f0c176f9c84729b23a41d3a564a263da86c2de9fcfe96c5b"
         }
       ]
     },

@@ -45,7 +45,7 @@ async function loadBuiltins() {
 }
 
 const PLUGIN = "i-repo-archive";
-const VERSION = "0.12.0";
+const VERSION = "0.13.0";
 const PLUGIN_API = "1";
 const defaultArchiveRoot = () => join(homedir(), ".i-repo", "archives");
 
@@ -171,7 +171,10 @@ if (arg0 === "--plugin-schema") {
         description: "Filter: 帳票定義ID（数値・改版前後の全リビジョン配下を対象）" },
       { name: "--label-id", type: "string", subcommand: "create", filter: true, default: "-9",
         label: "ラベルID", placeholder: "-9 で全レベル",
-        description: "Filter: ラベルID（rep list の -l）。既定 -9 は全レベル（すべて）。空欄/未指定だと最上位階層のみ＝対象帳票0件になりやすいので既定を -9 にしている" },
+        description: "Filter: ラベルID（rep list の -l）。既定 -9 は全レベル（すべて）。空欄/未指定だと最上位階層のみ＝対象帳票0件になりやすいので既定を -9 にしている。指定したラベルが直接付いた帳票だけが対象（子孫ラベルの帳票は含まない）。ID は 1 つだけ（カンマ区切り不可）",
+        // ラベルを名前で選ぶ GUI 用の申告（docs/PLUGINS.md labelRef）。GetReportList は直下だけ・未指定は最上位だけ。
+        labelRef: { source: "report-label-masters", scope: "direct", emptyMeans: "top-level-only",
+          specialValues: [{ value: "-9", meaning: "all-levels", label: "全階層（すべて）" }] } },
       { name: "--word", type: "string", subcommand: "create", filter: true,
         label: "検索ワード", description: "Filter: 帳票名・備考などの検索ワード" },
       // rep list の choices は文字列（test/published）。repb download の数値コードとは別物。
@@ -539,7 +542,7 @@ function parseCreateArgs(argv) {
   const filters = {
     // 既定 -9 = 全階層（すべて）。未指定だと rep list が最上位階層のみ＝0件になりやすいので、
     // schema の default だけでなく直接 create 実行（GUI 非経由）でも -9 を既定にする。
-    labelId: o["label-id"] ?? "-9", word: o.word, publicStatus: o["public-status"],
+    labelId: checkLabelId(o["label-id"] ?? "-9"), word: o.word, publicStatus: o["public-status"],
     editStatus: o["edit-status"], itemType: o.type,
     definition: o["definition-id"] ?? o.definition,
     wordTarget: o["word-target"], history: Boolean(o.history),
@@ -674,6 +677,8 @@ async function createArchive(options) {
 
   const jobId = `archive-${timestampTag()}-${process.pid}`;
   const credentials = await resolveCredentials(options);
+  // 実行時に解決したラベル（ID とフルパス名）を receipt に残す — 後でラベル名が変わっても、その時の対象が読める。
+  const labelResolved = await resolveLabel(credentials, options.filters.labelId);
   const manifestText = await listReports(credentials, options.filters);
   const records = parseManifest(manifestText); // validates the stream-end trailer
   const savedFiles = [];
@@ -871,6 +876,7 @@ async function createArchive(options) {
     // skipped:"unchanged" エントリは前回バッチの着地キー/URI（objectKey・verbatim）を持つ。
     artifacts: landedArtifacts,
     filters: compactObject(options.filters),
+    ...(labelResolved ? { label: labelResolved } : {}),
     ...(skippedUnchanged > 0 ? { skippedUnchanged } : {}),
     ...(options.dryRun ? { dryRun: true } : {}),
   };
@@ -1624,6 +1630,59 @@ function serverFileNameFrom(stdout, artifact) {
     return name.toLowerCase().endsWith(ext) ? name : `${name}${ext}`;
   }
   return null;
+}
+
+// ── ラベル（--label-id）の確認と解決 ─────────────────────────────────────────
+
+/**
+ * --label-id の形を検査する。i-Reporter の labelId は 1 つだけで、カンマ区切りは**エラーにならず
+ * 「指定なし」扱い**（GetReportList は最上位階層だけを返す・実機 sales02 で確認）になるので拒否する。
+ */
+function checkLabelId(value) {
+  const v = String(value).trim();
+  if (v === "") return v; // 従来どおり「指定なし」＝最上位階層だけ（labelRef emptyMeans:top-level-only）
+  if (v === "nolabel") {
+    // GetReportList は nolabel を解釈せず「指定なし」と同じ結果（最上位だけ）を返す（実機 sales02 で確認）。
+    // 「ラベルなしの帳票」のつもりで違う集合を黙って取らないよう拒否する。
+    throw new Error(
+      '--label-id nolabel is not supported by archive create: GetReportList ignores it and returns the top level ' +
+      "(same as no label). Use -9 for all levels.",
+    );
+  }
+  if (v !== "-9" && !/^\d+$/.test(v)) {
+    throw new Error(
+      `--label-id "${value}" is not a single numeric label ID (or -9 for all levels). ` +
+      "Comma-separated IDs are not supported by i-Reporter (they are silently treated as \"no label\").",
+    );
+  }
+  return v;
+}
+
+/**
+ * ラベル ID を `i-repo sys rep-label-masters list` で解決して receipt 用の形にする。
+ * -9 は特別値（全階層）。存在しない ID は 0 件のまま黙って成功するのを防ぐため stderr に警告する
+ * （止めはしない — 取得は読み取りで、0 件の bundle も正当）。解決できない（権限・旧 CLI 等）ときも警告のみ。
+ */
+async function resolveLabel(credentials, labelId) {
+  if (labelId === "-9") return { labelId: "-9", special: "all-levels" };
+  if (labelId === "") return { labelId: "", special: "top-level-only" };
+  let rows;
+  try {
+    const result = await runCommand(
+      iRepoBin(), ["sys", "rep-label-masters", "list", "--label-id", labelId, "--format", "json"],
+      { env: buildIRepoEnv(credentials), captureStdout: true },
+    );
+    rows = JSON.parse(result.stdout);
+  } catch (error) {
+    console.error(`warning: could not verify --label-id ${labelId} (${error instanceof Error ? error.message.split("\n")[0] : String(error)}) — continuing without the label name`);
+    return { labelId, verified: false };
+  }
+  const row = Array.isArray(rows) ? rows.find((r) => r && String(r.labelId) === labelId) : null;
+  if (!row) {
+    console.error(`warning: --label-id ${labelId} does not exist on this server (deleted, or not visible to this user) — the archive will likely be empty`);
+    return { labelId, found: false };
+  }
+  return { labelId, labelIdPath: row.labelIdPath, labelNamePath: row.labelNamePath };
 }
 
 // ── --csv-zip（帳票CSV一式・DownloadCsv の ZIP）──────────────────────────────
