@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
  * i-repo-upload — placement（配置）plugin: archive bundle の documents/ の中身
- * **だけ**を送り先 <--to>/<--prefix> 直下へ**実名のまま flat** に置く egress-only sink。
+ * **だけ**を送り先 <--to>/<--prefix> 直下へ**実名のまま・documents/ の構造をそのまま**置く
+ * egress-only sink（帳票CSV一式 = archive create --csv-zip の帳票フォルダはサブフォルダになる）。
  *
  * 目的（GEMBA OS 要望 #239）: 送り先が「人が使うファイル共有ストア」（Box / Dropbox /
  * Google Drive / SharePoint — 同期クライアントの local マウント経由で着地）のとき、
@@ -23,7 +24,7 @@
  * 注意（deliver 連携）: 実配置ベース URI は新設キー **`placedPrefix`** で返す。`s3Prefix` /
  * `gcsPrefix` / `azurePrefix` / `localPrefix`（deliver locator.ts の LANDED_PREFIX_KEYS）は
  * **名乗らない** — deliver の enrichLocator は `landedPrefix + "/documents/<name>"` という
- * bundle レイアウト前提の URI を組むため、flat 配置がこれらを名乗ると誤 URI になる。
+ * bundle レイアウト前提の URI を組むため、placement がこれらを名乗ると誤 URI になる。
  * enrichLocator の locator source には archive push-* を使うこと。
  *
  * ZERO DEPENDENCIES: node 内蔵 + ./lib/spawn.js（同梱の spawn 正本）のみ。単一ファイル・CJS。
@@ -44,13 +45,13 @@ const fsp = require("node:fs/promises");
 const { createHash } = require("node:crypto");
 const { spawn } = require("node:child_process");
 const { homedir } = require("node:os");
-const { basename, join, resolve, relative, isAbsolute, sep } = require("node:path");
+const { basename, dirname, join, resolve, relative, isAbsolute, sep } = require("node:path");
 // 子プロセスの spec 構築は全プラグイン共通の正本 lib/spawn.js に一本化する
 // （Windows .cmd シム対応・cmd.exe メタ文字拒否）。spawn 自体はここで非同期に行う。
 const { spawnSpec } = require("./lib/spawn.js");
 
 const PLUGIN = "i-repo-upload";
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const PLUGIN_API = "1";
 
 const PLACE_SUBS = ["push-s3", "push-gcs", "push-azure", "push-local"];
@@ -61,7 +62,7 @@ if (arg0 === "--plugin-schema") {
   console.log(JSON.stringify({
     pluginApi: [PLUGIN_API], schemaVersions: ["1.0"], recordTypes: [],
     name: PLUGIN, version: VERSION,
-    description: "帳票 bundle の documents/ の中身だけを送り先直下へ実名のまま flat 配置（manifests/receipts 等の裏方ファイルはゼロ）。同名は in-place 置換＝版機構を持つストア（Box/SharePoint/Drive 同期・S3/Blob バージョニング）では新バージョンとして積まれる。人が開くファイル共有向けの egress-only 配信",
+    description: "帳票 bundle の documents/ の中身だけを送り先直下へ実名のまま配置（documents/ の構造をそのまま＝帳票CSVフォルダはサブフォルダ。manifests/receipts 等の裏方ファイルはゼロ）。同名は in-place 置換＝版機構を持つストア（Box/SharePoint/Drive 同期・S3/Blob バージョニング）では新バージョンとして積まれる。人が開くファイル共有向けの egress-only 配信",
     phases: ["write", "verify"],
     platforms: ["macos", "linux", "windows"],
     // sink のみ。keep は付けない（「読み返せる保管」の含意を避ける — 送り先に目録を
@@ -71,25 +72,25 @@ if (arg0 === "--plugin-schema") {
     category: "file-share",
     subcommands: [
       { name: "push-s3", input: ["dir"],
-        description: "bundle の帳票実体を S3 の <to>/<prefix> 直下へ実名 flat 配置（要 aws CLI）" },
+        description: "bundle の帳票実体を S3 の <to>/<prefix> 直下へ実名のまま配置（要 aws CLI）" },
       { name: "push-gcs", input: ["dir"],
-        description: "bundle の帳票実体を Google Cloud Storage の <to>/<prefix> 直下へ実名 flat 配置（要 gcloud CLI）" },
+        description: "bundle の帳票実体を Google Cloud Storage の <to>/<prefix> 直下へ実名のまま配置（要 gcloud CLI）" },
       { name: "push-azure", input: ["dir"],
-        description: "bundle の帳票実体を Azure Blob の <to>/<prefix> 直下へ実名 flat 配置（要 az CLI）" },
+        description: "bundle の帳票実体を Azure Blob の <to>/<prefix> 直下へ実名のまま配置（要 az CLI）" },
       { name: "push-local", input: ["dir"],
-        description: "bundle の帳票実体をフォルダ/ネットワーク共有（Box/Drive 等の同期フォルダ含む）へ実名 flat 配置（外部CLI不要）" },
+        description: "bundle の帳票実体をフォルダ/ネットワーク共有（Box/Drive 等の同期フォルダ含む）へ実名のまま配置（外部CLI不要）" },
     ],
     params: [
       // --to（配置先）: backend ごとに形が違うので個別宣言（archive push-* と同名・同 placeholder）。
       { name: "--to", type: "string", required: true, subcommand: "push-s3",
         label: "S3 destination", placeholder: "s3://bucket/prefix",
-        description: "S3 destination（この直下へ実名 flat 配置）" },
+        description: "S3 destination（この直下へ実名のまま配置）" },
       { name: "--to", type: "string", required: true, subcommand: "push-gcs",
         label: "GCS destination", placeholder: "gs://bucket/prefix",
-        description: "Google Cloud Storage destination（この直下へ実名 flat 配置）" },
+        description: "Google Cloud Storage destination（この直下へ実名のまま配置）" },
       { name: "--to", type: "string", required: true, subcommand: "push-azure",
         label: "Azure Blob destination", placeholder: "https://<account>.blob.core.windows.net/<container>/<prefix>",
-        description: "Azure Blob destination (blob endpoint URL)（この直下へ実名 flat 配置）" },
+        description: "Azure Blob destination (blob endpoint URL)（この直下へ実名のまま配置）" },
       { name: "--to", type: "string", required: true, subcommand: "push-local",
         label: "保存先フォルダ/ファイルサーバー",
         placeholder: "/Volumes/share/reports ・ \\\\server\\share\\reports ・ D:\\reports",
@@ -99,7 +100,7 @@ if (arg0 === "--plugin-schema") {
         { name: "--prefix", type: "string", subcommand: sub, filter: false,
           label: "配置先サブパス（任意）", placeholder: "{flow}/{date}/{batchId}",
           tokens: ["{batchId}", "{date}", "{datetime}", "{flow}"],
-          description: "<--to>/ 配下の配置先サブパス。未指定なら <--to> 直下へ実名 flat 配置（実行ごとフォルダは作らない）。下のチップで差し込み可（{date}=YYYY-MM-DD, {datetime}=YYYYMMDDTHHMMSS, {flow}=フロー名, {batchId}=bundle 名）。安全な相対パスへ無害化（.. ・scheme 不可）— 無害化で空/危険になる指定はフォールバックせずエラー（exit 2）" },
+          description: "<--to>/ 配下の配置先サブパス。未指定なら <--to> 直下へ実名のまま配置（実行ごとフォルダは作らない）。下のチップで差し込み可（{date}=YYYY-MM-DD, {datetime}=YYYYMMDDTHHMMSS, {flow}=フロー名, {batchId}=bundle 名）。安全な相対パスへ無害化（.. ・scheme 不可）— 無害化で空/危険になる指定はフォールバックせずエラー（exit 2）" },
         { name: "--cleanup", type: "boolean", subcommand: sub, destructive: true,
           label: "Clean up local archive",
           description: "配置が verified（verified:true かつ失敗0件）のときだけローカル bundle を削除" },
@@ -131,11 +132,11 @@ if (arg0 === "--plugin-schema") {
       // 全サブコマンド共通
       { name: "--only", type: "string", repeatable: true,
         label: "配置対象ファイル名（反復可）",
-        description: "documents/ 内のファイル名に完全一致で絞って部分配置する（**反復可**・台帳駆動の部分再送用）。bundle に無い名前を指定するとエラー（exit 2・黙殺失敗防止）" },
+        description: "documents/ からの相対パス（例 report.pdf・<帳票ID>_<帳票名称>/report.csv）に完全一致で絞って部分配置する（**反復可**・台帳駆動の部分再送用）。bundle に無い名前を指定するとエラー（exit 2・黙殺失敗防止）" },
       { name: "--dry-run", type: "boolean", label: "Dry run",
         description: "Validate without writing（配置先プレビューと artifacts 一覧を receipt で返すだけ）" },
     ],
-    // ── ADC-1（gemba-adc/1.0）着地スキーマ宣言。placement 形（実体のみ・実名 flat・目録なし）──
+    // ── ADC-1（gemba-adc/1.0）着地スキーマ宣言。placement 形（実体のみ・実名のまま・documents/ の構造そのまま・目録なし）──
     // contract は 1.0 のまま（placement は宣言語彙のみの fail-open 追加で、読み手の新動作を
     // 要求しない）。query 経路が無いので endpointFp 絞りも宣言しない。
     dataset: PLACE_SUBS.map((sub) => ({
@@ -226,11 +227,11 @@ function usage() {
   Options:
       --prefix <template>  <--to>/ 配下の配置先サブパス（{batchId}/{date}/{datetime}/{flow}）。
                            未指定なら <--to> 直下。無害化で空/危険になる指定は exit 2
-      --only <fileName>    documents/ 内のファイル名で部分配置（反復可）。不在名は exit 2
+      --only <path>        documents/ からの相対パス（直下ならファイル名）で部分配置（反復可）。不在名は exit 2
       --cleanup            verified:true かつ失敗0件のときだけローカル bundle を削除
       --dry-run            配置せず write receipt（dryRun:true・artifacts 一覧付き）だけ返す
-  Places ONLY the files inside <archive-dir>/documents/ flat（実名のまま）into the
-  destination — no manifests/, no receipts/, no batch folder. Same-name files are
+  Places ONLY the files inside <archive-dir>/documents/（実名のまま・サブフォルダも構造ごと）
+  into the destination — no manifests/, no receipts/, no batch folder. Same-name files are
   replaced IN PLACE (versioned stores keep the old version as history).
   Unattended creds are read from the flags above OR env and passed to the cloud CLI
   via env, never argv.`);
@@ -310,7 +311,8 @@ function parsePushArgs(argv, backend) {
   if (backend.store === "azure") parseAzureTo(o.to);
   const out = {
     archiveDir: o._[0], to: o.to, prefix: o.prefix,
-    only: [...new Set(o.only ?? [])],
+    // documents/ からの相対パス（区切りは /）。Windows 流の \ 指定も受ける。
+    only: [...new Set((o.only ?? []).map((n) => n.replace(/\\/g, "/")))],
     dryRun: Boolean(o["dry-run"]), cleanup: Boolean(o.cleanup),
   };
   if (backend.store === "azure") {
@@ -394,6 +396,7 @@ function parseAzureTo(to) {
 //   uploadAll(docsDir, placed, env) … documents/ の中身を placed 直下へ一括転送
 //   uploadOne(filePath, fileName, placed, env) … 1 ファイルを placed/<fileName> へ
 //   statPlaced(placed, fileNames, env) … 配置済みファイルの Map<fileName, bytes>
+// fileName は documents/ からの相対パス（区切り /・帳票CSVフォルダ配下は <stem>/report.csv 等）。
 
 // スキーム非依存のスラッシュ結合（s3:// / gs:// / https:// すべてに使える）。
 function joinUri(prefix, child) {
@@ -424,8 +427,8 @@ const S3_BACKEND = {
     const sizes = new Map();
     for (const obj of contents) {
       const rest = String(obj.Key).slice(keyPrefix.length);
-      if (!rest || rest.includes("/")) continue; // 直下のみ（flat 配置の検証単位）
-      sizes.set(rest, Number(obj.Size));
+      if (!rest) continue;
+      sizes.set(rest, Number(obj.Size)); // placed からの相対キー（サブフォルダ込み）
     }
     return sizes;
   },
@@ -445,17 +448,19 @@ const GCS_BACKEND = {
     await runCommand("gcloud", ["storage", "cp", filePath, joinUri(placed, fileName)], { env, captureStdout: false });
   },
   async statPlaced(placed, _fileNames, env) {
-    // 直下ワイルドカードで 1 回 list（--json は url + metadata(size) を返す）。
+    // 再帰ワイルドカード（**）で 1 回 list（--json は url + metadata(size) を返す）。
     // マッチ 0 件だと gcloud は非 0 exit → 呼び出し側 catch で「全滅」扱い（verified:false）。
-    const r = await runCommand("gcloud", ["storage", "ls", "--json", joinUri(placed, "*")], { env, captureStdout: true });
+    const r = await runCommand("gcloud", ["storage", "ls", "--json", joinUri(placed, "**")], { env, captureStdout: true });
     const entries = r.stdout.trim() ? JSON.parse(r.stdout) : [];
+    const m = /^gs:\/\/[^/]+(?:\/(.+))?$/.exec(placed.replace(/\/+$/, ""));
+    const keyPrefix = m && m[1] ? `${m[1]}/` : "";
     const sizes = new Map();
     for (const e of Array.isArray(entries) ? entries : []) {
       const meta = e && e.metadata;
       if (!meta || typeof meta.size === "undefined") continue; // フォルダ等はスキップ
-      const key = String(meta.name ?? String(e.url).split("/").pop());
-      const base = key.split("/").pop();
-      if (base) sizes.set(base, Number(meta.size));
+      const key = String(meta.name ?? String(e.url).replace(/^gs:\/\/[^/]+\//, ""));
+      if (!key.startsWith(keyPrefix) || key === keyPrefix) continue;
+      sizes.set(key.slice(keyPrefix.length), Number(meta.size)); // placed からの相対キー
     }
     return sizes;
   },
@@ -490,8 +495,8 @@ const AZURE_BACKEND = {
     const sizes = new Map();
     for (const b of Array.isArray(entries) ? entries : []) {
       const rest = String(b.name).slice(keyPrefix.length);
-      if (!rest || rest.includes("/")) continue; // 直下のみ
-      sizes.set(rest, Number(b.properties?.contentLength));
+      if (!rest) continue;
+      sizes.set(rest, Number(b.properties?.contentLength)); // placed からの相対キー
     }
     return sizes;
   },
@@ -525,7 +530,9 @@ const LOCAL_BACKEND = {
     await fsp.mkdir(placed, { recursive: true });
   },
   async uploadOne(filePath, fileName, placed, _env) {
-    await fsp.copyFile(filePath, join(placed, fileName));
+    const target = join(placed, fileName);
+    await fsp.mkdir(dirname(target), { recursive: true }); // 帳票フォルダ配下（<stem>/report.csv）
+    await fsp.copyFile(filePath, target);
   },
   async statPlaced(placed, fileNames, _env) {
     const sizes = new Map();
@@ -590,7 +597,7 @@ async function pushPlacement(options, backend) {
     bytesByName.set(f.fileName, st.size);
     artifacts.push({
       fileName: f.fileName,
-      objectKey: f.fileName, // flat 配置＝実名がそのままオブジェクトキー
+      objectKey: f.fileName, // documents/ からの相対パスがそのままオブジェクトキー（placed 配下）
       sha256, bytes: st.size,
       itemId: meta.itemId ?? null, revNo: meta.revNo ?? null, type: meta.type ?? null,
     });
@@ -706,7 +713,10 @@ async function validateArchiveDirectory(path) {
   });
 }
 
-/** receipts/archive.json の artifacts[]（objectKey:"documents/<name>"）から実名→来歴の索引を作る。 */
+/**
+ * receipts/archive.json の artifacts[]（objectKey:"documents/<name>"）から実名→来歴の索引を作る。
+ * 帳票CSVフォルダ（objectKey:"documents/<stem>/" + files[]）は中の各ファイル <stem>/<file> を索引する。
+ */
 async function readArtifactIndex(archivePath) {
   const receipt = await readJsonObject(join(archivePath, "receipts", "archive.json"));
   const index = new Map();
@@ -717,40 +727,54 @@ async function readArtifactIndex(archivePath) {
     // 索引から除外する。載せると、host が artifacts[] 由来で --only を駆動した際に
     // documents/ 不在名で exit 2 になる・同名の実ファイルの来歴を先勝ちで汚染する。
     if (typeof a.skipped === "string" && a.skipped !== "") continue;
-    const name = a.objectKey.replace(/^documents\//, "");
-    if (!name || index.has(name)) continue;
-    index.set(name, {
-      itemId: a.itemId ?? null,
-      revNo: a.revNo ?? null,
-      type: a.type ?? null,
-    });
+    const base = a.objectKey.replace(/^documents\//, "");
+    const names = base.endsWith("/") && Array.isArray(a.files) ? a.files.map((f) => base + f) : [base];
+    for (const name of names) {
+      if (!name || name.endsWith("/") || index.has(name)) continue;
+      index.set(name, {
+        itemId: a.itemId ?? null,
+        revNo: a.revNo ?? null,
+        type: a.type ?? null,
+      });
+    }
   }
   return index;
 }
 
 /**
- * documents/ の通常ファイルのみを列挙する。非ファイル（サブディレクトリ・シンボリックリンク等）
- * の混在は exit 2 — flat 配置の対象外の実体を黙って除外/同行させない。documents/ が
- * 存在しない bundle（--with-artifacts none/text）は 0 件として正常扱い。
+ * documents/ の通常ファイルを再帰で列挙する（fileName は documents/ からの相対パス・区切り /）。
+ * 帳票CSVフォルダ（archive create --csv-zip）はサブフォルダとして構造ごと配置する。
+ * シンボリックリンク等の非ファイル・非ディレクトリの混在は exit 2 — bundle 外の実体を
+ * 黙って除外/同行させない。documents/ が存在しない bundle（--with-artifacts none/text）は
+ * 0 件として正常扱い。
  */
 async function listDocumentFiles(docsDir) {
-  let entries;
-  try {
-    entries = await fsp.readdir(docsDir, { withFileTypes: true });
-  } catch (error) {
-    if (error && error.code === "ENOENT") return []; // documents/ 無し＝配置対象 0 件
-    throw error;
-  }
   const files = [];
-  for (const entry of entries) {
-    if (!entry.isFile()) {
-      throw usageError(
-        `documents/ contains a non-file entry: ${entry.name}\n` +
-        "Placement copies plain files flat — remove subdirectories/symlinks from the bundle first.",
-      );
+  async function walk(dir, rel) {
+    let entries;
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true });
+    } catch (error) {
+      if (rel === "" && error && error.code === "ENOENT") return; // documents/ 無し＝配置対象 0 件
+      throw error;
     }
-    files.push({ fileName: entry.name, path: join(docsDir, entry.name) });
+    for (const entry of entries) {
+      const relPath = rel ? `${rel}/${entry.name}` : entry.name;
+      // Dirent は lstat 相当: シンボリックリンクは isDirectory()/isFile() とも false。
+      if (entry.isDirectory()) {
+        await walk(join(dir, entry.name), relPath);
+        continue;
+      }
+      if (!entry.isFile()) {
+        throw usageError(
+          `documents/ contains a non-file entry: ${relPath}\n` +
+          "Placement copies plain files and folders only — remove symlinks/special files from the bundle first.",
+        );
+      }
+      files.push({ fileName: relPath, path: join(dir, entry.name) });
+    }
   }
+  await walk(docsDir, "");
   files.sort((a, b) => (a.fileName < b.fileName ? -1 : a.fileName > b.fileName ? 1 : 0));
   return files;
 }

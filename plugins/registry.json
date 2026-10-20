@@ -5,7 +5,7 @@
       "name": "archive",
       "file": "i-repo-archive",
       "displayName": "i-repo-archive",
-      "version": "0.10.0",
+      "version": "0.11.0",
       "description": "帳票を bundle 化して保管：ローカル/ファイルサーバー、または S3 / GCS / Azure Blob へ配信（create=取得、push-*=配信）",
       "platforms": [
         "macos",
@@ -25,7 +25,7 @@
         {
           "path": "i-repo-archive",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-archive",
-          "sha256": "e51d496b6b4d433433e562d94440fe33530189ea633ba7d2ca0f2a23c1771417"
+          "sha256": "6192d70e77220756ae0886bb830129a62bca00277a26d6fc2fd87e2c04c4dde0"
         }
       ]
     },
@@ -231,8 +231,8 @@
       "name": "upload",
       "file": "i-repo-upload",
       "displayName": "i-repo-upload",
-      "version": "0.2.0",
-      "description": "帳票 bundle の documents/ の中身だけを送り先直下へ実名のまま flat 配置（manifests/receipts 等の裏方ファイルはゼロ）。同名は in-place 置換＝版機構を持つストア（Box/SharePoint/Drive 同期・S3/Blob バージョニング）では新バージョンとして積まれる。人が開くファイル共有向けの egress-only 配信",
+      "version": "0.3.0",
+      "description": "帳票 bundle の documents/ の中身だけを送り先直下へ実名のまま配置（documents/ の構造をそのまま＝帳票CSVフォルダはサブフォルダ。manifests/receipts 等の裏方ファイルはゼロ）。同名は in-place 置換＝版機構を持つストア（Box/SharePoint/Drive 同期・S3/Blob バージョニング）では新バージョンとして積まれる。人が開くファイル共有向けの egress-only 配信",
       "platforms": [
         "macos",
         "linux",
@@ -250,7 +250,7 @@
         {
           "path": "i-repo-upload",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-upload",
-          "sha256": "ac5775f24fefb93f418e3357dd79d91cb15f8430d9f03898968a98467691bad3"
+          "sha256": "3ab1c05183aa1a3fa5232c426455a95ab8d73a111ea7973c57927d214cdec898"
         }
       ]
     }

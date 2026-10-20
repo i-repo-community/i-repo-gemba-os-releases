@@ -45,7 +45,7 @@ async function loadBuiltins() {
 }
 
 const PLUGIN = "i-repo-archive";
-const VERSION = "0.10.0";
+const VERSION = "0.11.0";
 const PLUGIN_API = "1";
 const defaultArchiveRoot = () => join(homedir(), ".i-repo", "archives");
 
@@ -117,6 +117,22 @@ if (arg0 === "--plugin-schema") {
         label: "出力形式（成果物）",
         choices: ["pdf", "pdf,excel", "text", "none"],
         description: "アーカイブに含める成果物（pdf=PDF＋メタデータ / pdf,excel=PDF＋Excel＋メタデータ / text=バイナリ無し・フィールド入力値(クラスター値)まで含むテキストのみ / none=一覧メタのみ）" },
+      // 帳票CSV一式（DownloadCsv の ZIP）。--with-artifacts とは独立に足される（none/text でも取る）。
+      { name: "--csv-zip", type: "boolean", subcommand: "create", filter: true, affectsRecordSet: false,
+        label: "帳票CSV一式を含める",
+        description: "DownloadCsv の ZIP を帳票ごとに取得し、documents/<帳票ID>_<帳票名称>/ に展開して置く（report.csv ＋ 下でチェックした成果物。ZIP は残さない）" },
+      { name: "--csv-with-image", type: "boolean", subcommand: "create", filter: true, affectsRecordSet: false,
+        label: "クラスター画像・録音を含める", dependsOn: "--csv-zip",
+        description: "帳票CSV一式にクラスター画像・録音（report_<帳票ID>_<シート>_cluster_<ID>.png/.m4a）を含める" },
+      { name: "--csv-with-pdf", type: "boolean", subcommand: "create", filter: true, affectsRecordSet: false,
+        label: "PDFを含める", dependsOn: "--csv-zip",
+        description: "帳票CSV一式に PDF を含める（フォルダ内は <帳票ID>_<帳票名称>.pdf）" },
+      { name: "--csv-with-excel", type: "boolean", subcommand: "create", filter: true, affectsRecordSet: false,
+        label: "Excelを含める（Excelから作成した定義のみ）", dependsOn: "--csv-zip",
+        description: "帳票CSV一式に Excel を含める（Excel から作成した定義のみ・フォルダ内は <帳票ID>_<帳票名称>.xlsx）" },
+      { name: "--csv-with-pdf-layer", type: "boolean", subcommand: "create", filter: true, affectsRecordSet: false,
+        label: "レイヤー画像付きPDFを含める", dependsOn: "--csv-zip",
+        description: "帳票CSV一式の PDF をレイヤー画像付きにする（DownloadCsv withPDFLayer）" },
       { name: "--with-detail", type: "boolean", subcommand: "create", filter: true, affectsRecordSet: false,
         label: "クラスター詳細を含める",
         description: "各帳票の reports get を呼び、manifest にクラスター値(detail)を埋め込む" },
@@ -133,7 +149,7 @@ if (arg0 === "--plugin-schema") {
         description: "成果物ダウンロードごとのスリープ時間(ms)。0 で無効。API 過負荷防止用（最終DLの後は眠らない）" },
       { name: "--skip-unchanged-keys", type: "string", subcommand: "create", affectsRecordSet: false,
         label: "不変スキップキーファイル", placeholder: "keys.txt",
-        description: "行区切りキーファイル（1行1キー: report:<itemId>:rev<revNo> または <itemId>:<revNo>・任意で TAB 区切り第2列=前回の完全着地キー/URI）。マッチした帳票の成果物はDLせず skipped 印を付ける（host が前回配信の receipt から生成する運用キー）" },
+        description: "行区切りキーファイル（1行1キー: report:<itemId>:rev<revNo> または <itemId>:<revNo>・任意で TAB 区切り第2列=前回の完全着地キー/URI）。マッチした帳票の成果物はDLせず skipped 印を付ける（host が前回配信の receipt から生成する運用キー）。※--csv-zip を他の成果物と併用するときは無視される（第2列の1キーを全タイプへ写すと csv が別タイプの URI を指すため）" },
       { name: "--artifacts-bulk", type: "boolean", subcommand: "create", affectsRecordSet: false,
         label: "PDFまとめ取り（取得方式）",
         description: "PDF の取得方式指定: report-batches download（DownloadReport・withPDF の ZIP 同梱）で定義リビジョンごとにスライス取得し個別DLを省略する（--definition-id または --definition 必須・--with-artifacts に pdf が必要）。※--skip-unchanged-keys との併用時、skip は配置スキップにしかならず通信量は減らない（DownloadReport はスライス内全帳票を返すため）" },
@@ -403,6 +419,14 @@ function usage() {
                                 --with-artifacts). Note: combined with --skip-unchanged-keys
                                 the skip only avoids PLACEMENT — bulk still downloads the whole
                                 slice window (DownloadReport returns every report in the slice).
+      --csv-zip                Also fetch the DownloadCsv ZIP per report and unpack it into
+                               documents/<帳票ID>_<帳票名称>/ (report.csv + chosen extras; the
+                               ZIP itself is not kept). Independent of --with-artifacts (works
+                               with none/text too). Combined with other artifact types,
+                               --skip-unchanged-keys is ignored (one key cannot address both)
+      --csv-with-image / --csv-with-pdf / --csv-with-excel / --csv-with-pdf-layer
+                               Extras inside the CSV folder (cluster images/audio, PDF,
+                               Excel, layered PDF). Only meaningful with --csv-zip
       --dry-run                Resolve inputs and report without writing
       --endpoint/--user/--password <v>   Override i-repo credentials
       Filters: -l/--label-id -w/--word --public-status -e/--edit-status
@@ -472,6 +496,8 @@ const CREATE_SPEC = {
   "--detail-sleep-ms": "value", "--detail-sleep-every": "value",
   "--artifact-sleep-ms": "value", "--skip-unchanged-keys": "value",
   "--artifacts-bulk": "flag",
+  "--csv-zip": "flag", "--csv-with-image": "flag", "--csv-with-pdf": "flag",
+  "--csv-with-excel": "flag", "--csv-with-pdf-layer": "flag",
   "--endpoint": "value", "--user": "value", "--password": "value",
   "--label-id": "value", "-l": "--label-id",
   "--word": "value", "-w": "--word",
@@ -485,6 +511,14 @@ const CREATE_SPEC = {
   "--update-from": "value", "--update-to": "value",
   "--system-key": "list", "-k": "--system-key",
 };
+
+// --csv-with-* フラグ ↔ csvOptions のキー ↔ repb download-csv のフラグ（並びが正規化順）。
+const CSV_WITH_FLAGS = [
+  { flag: "csv-with-image", key: "image", cli: "--with-image" },
+  { flag: "csv-with-pdf", key: "pdf", cli: "--with-pdf" },
+  { flag: "csv-with-excel", key: "excel", cli: "--with-excel" },
+  { flag: "csv-with-pdf-layer", key: "pdfLayer", cli: "--with-pdf-layer" },
+];
 
 function parseCreateArgs(argv) {
   const o = parseArgv(argv, CREATE_SPEC, "create");
@@ -537,6 +571,10 @@ function parseCreateArgs(argv) {
     artifactSleepMs: Math.max(0, parseInt(o["artifact-sleep-ms"] ?? "0", 10) || 0),
     skipUnchangedKeys: o["skip-unchanged-keys"],
     artifactsBulk,
+    csvZip: Boolean(o["csv-zip"]),
+    // 正規化文字列（順序固定 image→pdf→excel→pdfLayer を + 連結・未チェックは ""）。receipt の
+    // csvOptions にそのまま載り、host はこれで「前回と同じ with* か」を照合する。
+    csvOptions: CSV_WITH_FLAGS.filter((f) => o[f.flag]).map((f) => f.key).join("+"),
     dryRun: Boolean(o["dry-run"]),
     endpoint: o.endpoint,
     user: o.user,
@@ -615,6 +653,9 @@ async function createArchive(options) {
   const artifacts = noBinaries
     ? []
     : Array.from(new Set(options.withArtifacts.filter((a) => a !== "none" && a !== "text")));
+  // csv（帳票CSV一式）は none/text ゲートの後で足す: none+csv=フォルダだけ / text+csv=detail 付き
+  // manifest＋フォルダ / pdf+csv=PDF とフォルダの両方。
+  if (options.csvZip) artifacts.push("csv");
   const archivePath = resolveArchivePath(options.out);
   ensureArchiveLocationIsSafe(archivePath, options.allowWorktree);
 
@@ -645,7 +686,13 @@ async function createArchive(options) {
 
     // (b) --skip-unchanged-keys: 前回配信から不変のレコードの DL を省く照合マップ
     // （key: "<itemId>:<revNo>"・revNo 無しは "0" に正規化。value: 第2列 or null）。
-    const skipMap = options.skipUnchangedKeys
+    // csv を他タイプと併用するときは効かせない: skip はキー第2列の 1 objectKey を全タイプへ
+    // 写すので、pdf+csv だと csv エントリが PDF の URI を指してしまう（DL する側へ倒す）。
+    const skipIgnored = Boolean(options.skipUnchangedKeys) && options.csvZip && artifacts.length > 1;
+    if (skipIgnored) {
+      console.error("--skip-unchanged-keys: ignored because --csv-zip is combined with other artifact types (downloading everything)");
+    }
+    const skipMap = options.skipUnchangedKeys && !skipIgnored
       ? await readSkipUnchangedKeys(options.skipUnchangedKeys)
       : null;
 
@@ -687,12 +734,13 @@ async function createArchive(options) {
         if (skipHit.matched) {
           skippedUnchanged++;
           for (const artifact of artifacts) {
+            const csvExtra = artifact === "csv" ? { csvOptions: options.csvOptions } : {};
             (record.artifacts = record.artifacts ?? []).push({
-              type: artifact, skipped: "unchanged", objectKey: skipHit.objectKey,
+              type: artifact, skipped: "unchanged", objectKey: skipHit.objectKey, ...csvExtra,
             });
             landedArtifacts.push({
               itemId: String(reportId), revNo: revNo || null,
-              type: artifact, skipped: "unchanged", objectKey: skipHit.objectKey,
+              type: artifact, skipped: "unchanged", objectKey: skipHit.objectKey, ...csvExtra,
             });
           }
           continue;
@@ -713,13 +761,23 @@ async function createArchive(options) {
             }
           }
           if (!dl) {
-            dl = await downloadArtifactNamed(credentials, reportId, artifact);
+            dl = artifact === "csv"
+              ? await downloadCsvZip(credentials, reportId, options.csvOptions)
+              : await downloadArtifactNamed(credentials, reportId, artifact);
             downloadsDone++;
             if (sleepMs > 0 && downloadsDone < plannedDownloads) {
               await new Promise((r) => setTimeout(r, sleepMs));
             }
           }
           try {
+            if (artifact === "csv") {
+              const ctx = { record, reportId, revNo, needsRev };
+              const { folder, files } = await placeCsvFolder(dl.tempPath, archivePath, ctx, usedNames, savedFiles);
+              const entry = { type: "csv", objectKey: `documents/${folder}/`, csvOptions: options.csvOptions, files };
+              (record.artifacts = record.artifacts ?? []).push(entry);
+              landedArtifacts.push({ itemId: String(reportId), revNo: revNo || null, ...entry });
+              continue; // finally で tempDir を消す
+            }
             const fileName = chooseArtifactFileName(dl.name, {
               record, reportId, revNo, needsRev, artifact,
               multipleArtifacts: artifacts.length > 1, usedNames,
@@ -1528,6 +1586,104 @@ async function downloadArtifactNamed(credentials, reportId, artifact) {
   }
 }
 
+// ── --csv-zip（帳票CSV一式・DownloadCsv の ZIP）──────────────────────────────
+//
+// 1 帳票 1 コールで repb download-csv を呼び（チェックした --with-* だけ渡す）、ZIP を
+// documents/<stem>/ に展開する（ZIP は残さない）。ZIP は store・エントリ名 CP932（UTF-8 フラグ無し）。
+
+function csvError(detail) {
+  return new Error(`--csv-zip: ${detail}`);
+}
+
+/** DownloadCsv の ZIP を tmp に取得する（呼び出し側が tempDir を消す）。 */
+async function downloadCsvZip(credentials, reportId, csvOptions) {
+  const tempDir = await fsp.mkdtemp(join(tmpdir(), "irepo-archive-csv-"));
+  try {
+    const keys = new Set(csvOptions.split("+"));
+    const tempPath = join(tempDir, `report-${reportId}.zip`);
+    const args = ["repb", "download-csv", reportId];
+    for (const f of CSV_WITH_FLAGS) if (keys.has(f.key)) args.push(f.cli, "true");
+    args.push("-o", tempPath);
+    await runCommand(iRepoBin(), args, { env: buildIRepoEnv(credentials), captureStdout: true, cwd: tempDir });
+    return { tempDir, tempPath };
+  } catch (error) {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+/**
+ * ZIP を documents/<stem>/ へ展開する。フォルダ名は個別 DL のファイル名と同じ基底
+ * （帳票ID_帳票名称・-rev<n>）。中身の命名:
+ *   - pdf_<ID><名称>.pdf / excel_<ID><名称>.xlsx … 名称部が CP932 なのでデコードせず、bulk 経路と
+ *     同じく CLI 既定名で chooseArtifactFileName に渡す（→ 帳票ID_帳票名称.<ext>）
+ *   - report.csv / report_<ID>_<シート>_cluster_<ID>.png|.m4a … そのまま（CSV の参照を壊さない）
+ *   - それ以外 … 無害化した名前で置き stderr に警告（捨てない）
+ * 全エントリ名は sanitizeUnicodeFileName でフォルダ直下の 1 コンポーネントに限定し、空になれば
+ * entry-<n>。フォルダ内の同名は _<帳票ID> / -n で避ける。
+ */
+async function placeCsvFolder(zipPath, archivePath, ctx, usedNames, savedFiles) {
+  const buf = await fsp.readFile(zipPath);
+  const entries = listZipEntries(buf, csvError).filter((e) => e.name[e.name.length - 1] !== 0x2f); // dir エントリ除外
+  // report.csv の無い ZIP（不完全・エラー応答）を csv 着地として verified にしない（fail-closed）。
+  if (!entries.some((e) => e.name.toString("latin1") === "report.csv")) {
+    throw csvError(`DownloadCsv ZIP for report ${ctx.reportId} has no report.csv`);
+  }
+  let stem = artifactStem(ctx);
+  if (/^\.*$/.test(stem)) stem = "report"; // itemId が "." / ".." だと documents/ の外を指す
+  if (ctx.needsRev) stem += `-rev${sanitizeFileName(ctx.revNo)}`;
+  const folder = dedupeFileName(stem, "", ctx.reportId, usedNames);
+  usedNames.add(folder);
+  const folderPath = join(archivePath, "documents", folder);
+  await fsp.mkdir(folderPath, { recursive: true });
+  // 大文字小文字を区別しない FS（Windows・macOS 既定）で report.csv と REPORT.CSV が同一実体に
+  // 上書きされないよう、フォルダ内の衝突判定は小文字キーで行う。
+  const seen = new Set();
+  const used = { has: (n) => seen.has(n.toLowerCase()), add: (n) => seen.add(n.toLowerCase()) };
+  const files = [];
+  // 本物の report.csv を先に処理して名前を確保する（REPORT.CSV が先に並んでも report.csv が改名されない）。
+  // n（entry-<n> の番号）は ZIP 内の元の位置のまま。
+  const order = [...entries.keys()].sort((a, b) =>
+    Number(entries[b].name.toString("latin1") === "report.csv") - Number(entries[a].name.toString("latin1") === "report.csv"));
+  for (const n of order) {
+    const entry = entries[n];
+    const fileName = csvEntryFileName(entry.name, n, ctx, used);
+    used.add(fileName);
+    const outputPath = join(folderPath, fileName);
+    await fsp.writeFile(outputPath, inflateZipEntry(buf, entry, csvError));
+    savedFiles.push(outputPath);
+    files.push(fileName);
+  }
+  return { folder, files };
+}
+
+const CSV_KNOWN_ENTRY = /^(report\.csv|report_[0-9]+_[0-9]+_cluster_[0-9]+\.(png|m4a))$/;
+
+/** ZIP エントリ名（生バイト列）→ フォルダ内のファイル名（1 コンポーネント）。 */
+function csvEntryFileName(raw, n, ctx, used) {
+  const latin = raw.toString("latin1"); // バイト 1:1（ASCII の接頭辞/拡張子判定だけに使う）
+  for (const [prefix, artifact] of [["pdf_", "pdf"], ["excel_", "excel"]]) {
+    const ext = fileExtensionFor(artifact);
+    if (latin.startsWith(prefix) && latin.endsWith(ext)) {
+      return chooseArtifactFileName(`report-${ctx.reportId}${ext}`, {
+        ...ctx, artifact, multipleArtifacts: false, usedNames: used,
+      });
+    }
+  }
+  let name = "";
+  try { name = new TextDecoder("utf-8", { fatal: true }).decode(raw); } catch { /* CP932 等は名前を使わない */ }
+  let clean = sanitizeUnicodeFileName(name);
+  if (clean !== name || !CSV_KNOWN_ENTRY.test(name)) {
+    console.error(`--csv-zip: unexpected entry in DownloadCsv ZIP for report ${ctx.reportId}: ${JSON.stringify(name || latin)} — placed as-is (sanitized)`);
+  }
+  if (!clean) clean = `entry-${n + 1}`;
+  if (WIN_RESERVED.test(clean)) clean = `_${clean}`; // CON / NUL.txt 等（Windows でデバイス扱い）
+  const dot = clean.lastIndexOf(".");
+  return dot > 0
+    ? dedupeFileName(clean.slice(0, dot), clean.slice(dot), ctx.reportId, used)
+    : dedupeFileName(clean, "", ctx.reportId, used);
+}
+
 // ── --skip-unchanged-keys（不変スキップ・#216）───────────────────────────────
 //
 // ホストが前回配信の receipt/manifest から生成する行区切りキーファイル（manifest パスではない）。
@@ -1695,60 +1851,65 @@ function bulkError(detail) {
   );
 }
 
-/** central directory の全エントリを返す（名前は生バイト列のまま — CP932 をデコードしない）。 */
-function listZipEntries(buf) {
-  if (buf.length < 22) throw bulkError("not a ZIP file (too small)");
+/**
+ * central directory の全エントリを返す（名前は生バイト列のまま — CP932 をデコードしない）。
+ * fail は呼び出し経路ごとのエラー文言（bulk / csv）。
+ */
+function listZipEntries(buf, fail = bulkError) {
+  if (buf.length < 22) throw fail("not a ZIP file (too small)");
   // EOCD（end of central directory）を末尾から探す（コメント込みで最大 65535+22 バイト）。
   const minEocd = Math.max(0, buf.length - 22 - 0xffff);
   let eocd = -1;
   for (let i = buf.length - 22; i >= minEocd; i--) {
     if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
   }
-  if (eocd === -1) throw bulkError("not a ZIP file (end of central directory not found)");
+  if (eocd === -1) throw fail("not a ZIP file (end of central directory not found)");
   const total = buf.readUInt16LE(eocd + 10);
   const cdOffset = buf.readUInt32LE(eocd + 16);
-  if (total === 0xffff || cdOffset === 0xffffffff) throw bulkError("ZIP64 archives are not supported");
+  if (total === 0xffff || cdOffset === 0xffffffff) throw fail("ZIP64 archives are not supported");
   const entries = [];
   let p = cdOffset;
   for (let n = 0; n < total; n++) {
     if (p + 46 > buf.length || buf.readUInt32LE(p) !== 0x02014b50) {
-      throw bulkError("corrupt ZIP central directory");
+      throw fail("corrupt ZIP central directory");
     }
     const method = buf.readUInt16LE(p + 10);
     const compressedSize = buf.readUInt32LE(p + 20);
+    const uncompressedSize = buf.readUInt32LE(p + 24);
     const nameLen = buf.readUInt16LE(p + 28);
     const extraLen = buf.readUInt16LE(p + 30);
     const commentLen = buf.readUInt16LE(p + 32);
     const localOffset = buf.readUInt32LE(p + 42);
     if (compressedSize === 0xffffffff || localOffset === 0xffffffff) {
-      throw bulkError("ZIP64 archives are not supported");
+      throw fail("ZIP64 archives are not supported");
     }
-    if (p + 46 + nameLen > buf.length) throw bulkError("corrupt ZIP central directory");
-    entries.push({ name: buf.subarray(p + 46, p + 46 + nameLen), method, compressedSize, localOffset });
+    if (p + 46 + nameLen > buf.length) throw fail("corrupt ZIP central directory");
+    entries.push({ name: buf.subarray(p + 46, p + 46 + nameLen), method, compressedSize, uncompressedSize, localOffset });
     p += 46 + nameLen + extraLen + commentLen;
   }
   return entries;
 }
 
 /** 1エントリの実データを取り出す（local header の name/extra 長からデータ位置を求める）。 */
-function inflateZipEntry(buf, entry) {
+function inflateZipEntry(buf, entry, fail = bulkError) {
   if (entry.localOffset + 30 > buf.length || buf.readUInt32LE(entry.localOffset) !== 0x04034b50) {
-    throw bulkError("corrupt ZIP local file header");
+    throw fail("corrupt ZIP local file header");
   }
   const nameLen = buf.readUInt16LE(entry.localOffset + 26);
   const extraLen = buf.readUInt16LE(entry.localOffset + 28);
   const start = entry.localOffset + 30 + nameLen + extraLen;
   const raw = buf.subarray(start, start + entry.compressedSize);
-  if (raw.length !== entry.compressedSize) throw bulkError("truncated ZIP entry data");
+  if (raw.length !== entry.compressedSize) throw fail("truncated ZIP entry data");
   if (entry.method === 0) return Buffer.from(raw); // store: 無圧縮（subarray を detach）
   if (entry.method === 8) {
     try {
-      return inflateRawSync(raw);
+      // 宣言サイズで打ち止め（zip bomb で無制限に膨らませない）。超過は throw → fail-closed。
+      return inflateRawSync(raw, { maxOutputLength: Math.max(1, entry.uncompressedSize) });
     } catch (error) {
-      throw bulkError(`deflate failed: ${error instanceof Error ? error.message : String(error)}`);
+      throw fail(`deflate failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  throw bulkError(`unsupported ZIP compression method ${entry.method}`);
+  throw fail(`unsupported ZIP compression method ${entry.method}`);
 }
 
 /**
@@ -1933,18 +2094,7 @@ function chooseArtifactFileName(downloadedName, ctx) {
   // fallback 判定は CLI が書いた生の名前で行う（report-<id>.<ext> は % を含まないので復号の影響なし）。
   const cliFallback = `report-${ctx.reportId}${fileExtensionFor(ctx.artifact)}`;
   if (downloadedName === cliFallback) {
-    // サーバ名なし → manifest の帳票名称から組み立てる (日本語は保持)。
-    // 封筒 (SCHEMA.md §2.5) では帳票名称は values.name に入る。
-    // 封筒でない生の行 (recordTypes:["*"] 経由) のために record.name も見る。
-    const rawName =
-      (ctx.record.values && typeof ctx.record.values.name === "string"
-        ? ctx.record.values.name.trim()
-        : "") ||
-      (typeof ctx.record.name === "string" ? ctx.record.name.trim() : "");
-    const cleanName = rawName ? sanitizeUnicodeFileName(rawName) : "";
-    stem = cleanName
-      ? `${sanitizeFileName(ctx.reportId)}_${cleanName}`
-      : sanitizeFileName(ctx.reportId);
+    stem = artifactStem(ctx);
   } else {
     // サーバ提供名: 復号後を無害化する。**stem だけでなく ext も**潰すのが要点 — 復号で `%2F`→`/` や
     // `%2E%2E`→`..` が ext 側に入ると `documents/` 外への書き込み（パストラバーサル）になり得るため
@@ -1961,10 +2111,32 @@ function chooseArtifactFileName(downloadedName, ctx) {
   if (ctx.needsRev) stem += `-rev${sanitizeFileName(ctx.revNo)}`;
   if (ctx.multipleArtifacts) stem += `-${sanitizeFileName(ctx.artifact)}`;
 
+  return dedupeFileName(stem, ext, ctx.reportId, ctx.usedNames);
+}
+
+/**
+ * サーバ名なしのときの基底名 `帳票ID_帳票名称`（帳票名称が無ければ帳票ID）。日本語は保持。
+ * 封筒 (SCHEMA.md §2.5) では帳票名称は values.name に入る。
+ * 封筒でない生の行 (recordTypes:["*"] 経由) のために record.name も見る。
+ */
+function artifactStem(ctx) {
+  const rawName =
+    (ctx.record.values && typeof ctx.record.values.name === "string"
+      ? ctx.record.values.name.trim()
+      : "") ||
+    (typeof ctx.record.name === "string" ? ctx.record.name.trim() : "");
+  const cleanName = rawName ? sanitizeUnicodeFileName(rawName) : "";
+  return cleanName
+    ? `${sanitizeFileName(ctx.reportId)}_${cleanName}`
+    : sanitizeFileName(ctx.reportId);
+}
+
+/** usedNames と衝突したら `_<帳票ID>`、それでも衝突したら `_<帳票ID>-<n>` を付ける。 */
+function dedupeFileName(stem, ext, reportId, usedNames) {
   let fileName = `${stem}${ext}`;
-  if (ctx.usedNames.has(fileName)) fileName = `${stem}_${sanitizeFileName(ctx.reportId)}${ext}`;
-  for (let n = 2; ctx.usedNames.has(fileName); n++) {
-    fileName = `${stem}_${sanitizeFileName(ctx.reportId)}-${n}${ext}`;
+  if (usedNames.has(fileName)) fileName = `${stem}_${sanitizeFileName(reportId)}${ext}`;
+  for (let n = 2; usedNames.has(fileName); n++) {
+    fileName = `${stem}_${sanitizeFileName(reportId)}-${n}${ext}`;
   }
   return fileName;
 }
