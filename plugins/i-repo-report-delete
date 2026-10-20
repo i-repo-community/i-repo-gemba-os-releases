@@ -34,7 +34,7 @@ async function loadBuiltins() {
 }
 
 const PLUGIN = "i-repo-report-delete";
-const VERSION = "0.1.7";
+const VERSION = "0.2.0";
 const PLUGIN_API = "1";
 
 // 検索フィルタ（DeleteReport 仕様の抽出条件・すべて filter:true）。
@@ -42,7 +42,11 @@ const PLUGIN_API = "1";
 const FILTER_PARAMS = [
   { name: "--definition", type: "string", label: "定義ID", description: "Filter: 定義ID" },
   { name: "--report", type: "string", label: "帳票ID", description: "Filter: 帳票ID（カンマ区切り可）" },
-  { name: "--label-id", type: "string", label: "ラベルID", description: "Filter: ラベルID（'nolabel' でラベル無し）" },
+  { name: "--label-id", type: "string", label: "ラベルID",
+    description: "Filter: ラベルID（'nolabel' でラベル無し）。指定したラベルが直接付いた帳票だけが対象（子孫ラベルの帳票は含まない）。ID は 1 つだけ。存在しない・確かめられないラベルなら削除せず止まる",
+    // ラベルを名前で選ぶ GUI 用の申告（docs/PLUGINS.md labelRef）。DeleteReport は未指定＝全帳票。
+    labelRef: { source: "report-label-masters", scope: "direct", emptyMeans: "all",
+      specialValues: [{ value: "nolabel", meaning: "no-label", label: "ラベルなし" }] } },
   { name: "--public-status", type: "select", choices: ["1", "2"], label: "公開ステータス", description: "Filter: 1:テスト / 2:公開" },
   { name: "--edit-status", type: "select", choices: ["0", "1", "2", "3", "4"], label: "編集ステータス", description: "Filter: 0:入力前 1:編集中 2:承認待ち 3:差し戻し 4:入力完了" },
   { name: "--report-name", type: "string", label: "帳票名称", description: "Filter: 帳票名称（部分一致）" },
@@ -240,6 +244,41 @@ const FILTER_KEYS = [
   if (o.user != null) env.IREPO_USER = o.user;
   if (o.password != null) env.IREPO_PASSWORD = o.password;
 
+  // 安全弁4（ラベルの確認）: 削除は対象が分からないまま進めない。ラベル ID は 1 つだけ
+  // （カンマ区切りは i-Reporter が黙って「指定なし」＝全帳票扱いにし得る）、かつ実在すること。
+  // 解決したラベル（ID・フルパス名）は receipt に残す（後でラベル名が変わってもその時の対象が読める）。
+  let label = null;
+  if (o["label-id"] != null) {
+    const id = String(o["label-id"]).trim();
+    if (id === "nolabel") {
+      label = { labelId: "nolabel", special: "no-label" };
+      const li = filterArgs.indexOf("--label-id");
+      if (li >= 0) filterArgs[li + 1] = id;
+    } else if (!/^\d+$/.test(id)) {
+      // -9（全階層）は本体は受け付けるが、削除では「ラベルで絞ったつもりが全部」になり得るので受けない。
+      console.error(`${PLUGIN}: --label-id "${o["label-id"]}" is not a single numeric label ID (or 'nolabel'; -9 is not accepted for delete). Refusing to delete.`);
+      process.exit(2);
+    } else {
+      const cap = await runIrepoCapture(["--format", "json", "sys", "rep-label-masters", "list", "--label-id", id], env);
+      let rows = null;
+      try { rows = JSON.parse(cap.stdout); } catch { rows = null; }
+      if (cap.code !== 0 || !Array.isArray(rows)) {
+        console.error(`${PLUGIN}: could not verify --label-id ${id} against the label master (exit ${cap.code}; requires i-repo >= 2.42.0 for "sys rep-label-masters list"). Refusing to delete.`);
+        process.exit(2);
+      }
+      const row = rows.find((r) => r && String(r.labelId) === id);
+      if (!row) {
+        console.error(`${PLUGIN}: --label-id ${id} does not exist on this server (deleted, or not visible to this user). Refusing to delete.`);
+        process.exit(2);
+      }
+      label = { labelId: id, labelIdPath: row.labelIdPath, labelNamePath: row.labelNamePath };
+      // 確認した値（前後の空白を除いたもの）をそのまま削除に渡す（確認と実行で値をずらさない）。
+      const li = filterArgs.indexOf("--label-id");
+      if (li >= 0) filterArgs[li + 1] = id;
+      console.error(`${PLUGIN}: label ${id} = ${row.labelNamePath}（このラベルが直接付いた帳票だけが対象・子孫ラベルは含まない）`);
+    }
+  }
+
   // ── receipt（要望書v4 要望6）──
   // 削除成否を exit 0 ではなく receipt で判定できるよう、ドレイン結果を §6 receipt に
   // 写像して stdout に出す。producedBy は本プラグイン＝receipt の発行者はここ。
@@ -278,6 +317,7 @@ const FILTER_KEYS = [
       failedCount,
       stoppedReason: drain.stoppedReason ?? null,
       errors,
+      ...(label ? { label } : {}),
       producedBy: { plugin: PLUGIN, version: VERSION },
     }) + "\n");
     // ドレイン完了トレーラ（result-code=8 到達の明示）。無い＝切断で切り分け可能。
@@ -456,7 +496,7 @@ Usage:
 Filters (最低1つ必須):
   -d, --definition <id>      定義ID
   -r, --report <ids>         帳票ID（カンマ区切り可）
-  -l, --label-id <id>        ラベルID（'nolabel' でラベル無し）
+  -l, --label-id <id>        ラベルID 1つ（'nolabel' でラベル無し・直下のみ・存在しなければ削除せず止まる）
       --public-status <1|2>  1:テスト / 2:公開
   -e, --edit-status <0-4>    0:入力前 1:編集中 2:承認待ち 3:差し戻し 4:入力完了
       --report-name <name>   帳票名称（部分一致）
