@@ -51,7 +51,7 @@ const { basename, dirname, join, resolve, relative, isAbsolute, sep } = require(
 const { spawnSpec } = require("./lib/spawn.js");
 
 const PLUGIN = "i-repo-upload";
-const VERSION = "0.3.0";
+const VERSION = "0.3.1";
 const PLUGIN_API = "1";
 
 const PLACE_SUBS = ["push-s3", "push-gcs", "push-azure", "push-local"];
@@ -97,10 +97,11 @@ if (arg0 === "--plugin-schema") {
         description: "ローカル/ネットワーク共有の配置先パス（同期クライアントの共有フォルダ含む）" },
       // --prefix / --cleanup は 4 サブコマンド共通の同文言（archive と同名・同 tokens・同 placeholder）。
       ...PLACE_SUBS.flatMap((sub) => [
-        { name: "--prefix", type: "string", subcommand: sub, filter: false,
+        // default は GUI の初期値（新規の配信先だけ）。CLI 実行時の既定は従来どおり「未指定なら直下」。
+        { name: "--prefix", type: "string", subcommand: sub, filter: false, default: "{date}",
           label: "配置先サブパス（任意）", placeholder: "{flow}/{date}/{batchId}",
           tokens: ["{batchId}", "{date}", "{datetime}", "{flow}"],
-          description: "<--to>/ 配下の配置先サブパス。未指定なら <--to> 直下へ実名のまま配置（実行ごとフォルダは作らない）。下のチップで差し込み可（{date}=YYYY-MM-DD, {datetime}=YYYYMMDDTHHMMSS, {flow}=フロー名, {batchId}=bundle 名）。安全な相対パスへ無害化（.. ・scheme 不可）— 無害化で空/危険になる指定はフォールバックせずエラー（exit 2）" },
+          description: "<--to>/ 配下の配置先サブパス。初期値 {date}＝日付フォルダ（同日の再実行は同フォルダで in-place 置換）。空にすると <--to> 直下へ実名のまま配置（実行ごとフォルダは作らない）。下のチップで差し込み可（{date}=YYYY-MM-DD, {datetime}=YYYYMMDDTHHMMSS, {flow}=フロー名, {batchId}=bundle 名）。安全な相対パスへ無害化（.. ・scheme 不可）— 無害化で空/危険になる指定はフォールバックせずエラー（exit 2）" },
         { name: "--cleanup", type: "boolean", subcommand: sub, destructive: true,
           label: "Clean up local archive",
           description: "配置が verified（verified:true かつ失敗0件）のときだけローカル bundle を削除" },

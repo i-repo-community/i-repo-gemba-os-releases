@@ -45,7 +45,7 @@ async function loadBuiltins() {
 }
 
 const PLUGIN = "i-repo-archive";
-const VERSION = "0.11.0";
+const VERSION = "0.11.1";
 const PLUGIN_API = "1";
 const defaultArchiveRoot = () => join(homedir(), ".i-repo", "archives");
 
@@ -656,6 +656,9 @@ async function createArchive(options) {
   // csv（帳票CSV一式）は none/text ゲートの後で足す: none+csv=フォルダだけ / text+csv=detail 付き
   // manifest＋フォルダ / pdf+csv=PDF とフォルダの両方。
   if (options.csvZip) artifacts.push("csv");
+  // csv フォルダは documents/<stem>/ で単体ファイルと衝突しない。`-<artifact>` 接尾辞は
+  // 同じ拡張子になり得る単体タイプ同士だけ（pdf と pdfLayer はどちらも .pdf）。
+  const standaloneCount = artifacts.filter((a) => a !== "csv").length;
   const archivePath = resolveArchivePath(options.out);
   ensureArchiveLocationIsSafe(archivePath, options.allowWorktree);
 
@@ -780,7 +783,7 @@ async function createArchive(options) {
             }
             const fileName = chooseArtifactFileName(dl.name, {
               record, reportId, revNo, needsRev, artifact,
-              multipleArtifacts: artifacts.length > 1, usedNames,
+              multipleArtifacts: standaloneCount > 1, usedNames,
             });
             usedNames.add(fileName);
             const outputPath = join(archivePath, "documents", fileName);
@@ -2077,7 +2080,8 @@ function runCommand(command, args, options) {
  *
  * Discriminators (applied to either base):
  *   -rev<n>      … --history で同一帳票IDが複数リビジョンあるとき
- *   -<artifact>  … 複数タイプ要求時 (pdf と pdfLayer は同じ .pdf で衝突する)
+ *   -<artifact>  … 単体タイプが複数のとき (pdf と pdfLayer は同じ .pdf で衝突する。
+ *                  csv フォルダは documents/<stem>/ なので対象外)
  *   _<帳票ID>    … それでも他帳票のサーバ名と衝突したとき (自動出力設定が
  *                  帳票名のみ等、ID を含まない場合に起こる)
  */
