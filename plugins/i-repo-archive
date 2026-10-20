@@ -45,7 +45,7 @@ async function loadBuiltins() {
 }
 
 const PLUGIN = "i-repo-archive";
-const VERSION = "0.11.1";
+const VERSION = "0.12.0";
 const PLUGIN_API = "1";
 const defaultArchiveRoot = () => join(homedir(), ".i-repo", "archives");
 
@@ -118,6 +118,9 @@ if (arg0 === "--plugin-schema") {
         choices: ["pdf", "pdf,excel", "text", "none"],
         description: "アーカイブに含める成果物（pdf=PDF＋メタデータ / pdf,excel=PDF＋Excel＋メタデータ / text=バイナリ無し・フィールド入力値(クラスター値)まで含むテキストのみ / none=一覧メタのみ）" },
       // 帳票CSV一式（DownloadCsv の ZIP）。--with-artifacts とは独立に足される（none/text でも取る）。
+      { name: "--use-server-name", type: "boolean", subcommand: "create", filter: true, affectsRecordSet: false,
+        label: "i-Reporter で設定したファイル名を使う",
+        description: "帳票定義の「ファイル自動出力設定」で名前を決めてある帳票は、その名前で PDF/Excel を置く（帳票CSV一式のフォルダ名とフォルダ内の PDF/Excel も同じ名前に揃える）。設定の無い帳票は従来どおり <帳票ID>_<帳票名称>。※設定名に帳票IDが入っていないと、同じ日付フォルダへ後から同名の別帳票が来たとき上書きされる（同じ実行の中の重なりは _<帳票ID> で避ける）。PDFまとめ取り・帳票CSV一式だけのときは設定名を取得できないため従来の名前" },
       { name: "--csv-zip", type: "boolean", subcommand: "create", filter: true, affectsRecordSet: false,
         label: "帳票CSV一式を含める",
         description: "DownloadCsv の ZIP を帳票ごとに取得し、documents/<帳票ID>_<帳票名称>/ に展開して置く（report.csv ＋ 下でチェックした成果物。ZIP は残さない）" },
@@ -419,6 +422,10 @@ function usage() {
                                 --with-artifacts). Note: combined with --skip-unchanged-keys
                                 the skip only avoids PLACEMENT — bulk still downloads the whole
                                 slice window (DownloadReport returns every report in the slice).
+      --use-server-name        Name PDF/Excel files (and the matching CSV folder) after the
+                               i-Reporter ファイル自動出力設定 name when the definition has one
+                               (else 帳票ID_帳票名称). Names without the report ID can collide
+                               across runs and overwrite each other at the destination
       --csv-zip                Also fetch the DownloadCsv ZIP per report and unpack it into
                                documents/<帳票ID>_<帳票名称>/ (report.csv + chosen extras; the
                                ZIP itself is not kept). Independent of --with-artifacts (works
@@ -495,7 +502,7 @@ const CREATE_SPEC = {
   "--with-artifacts": "value", "--with-detail": "flag", "--dry-run": "flag",
   "--detail-sleep-ms": "value", "--detail-sleep-every": "value",
   "--artifact-sleep-ms": "value", "--skip-unchanged-keys": "value",
-  "--artifacts-bulk": "flag",
+  "--artifacts-bulk": "flag", "--use-server-name": "flag",
   "--csv-zip": "flag", "--csv-with-image": "flag", "--csv-with-pdf": "flag",
   "--csv-with-excel": "flag", "--csv-with-pdf-layer": "flag",
   "--endpoint": "value", "--user": "value", "--password": "value",
@@ -571,6 +578,7 @@ function parseCreateArgs(argv) {
     artifactSleepMs: Math.max(0, parseInt(o["artifact-sleep-ms"] ?? "0", 10) || 0),
     skipUnchangedKeys: o["skip-unchanged-keys"],
     artifactsBulk,
+    useServerName: Boolean(o["use-server-name"]),
     csvZip: Boolean(o["csv-zip"]),
     // 正規化文字列（順序固定 image→pdf→excel→pdfLayer を + 連結・未チェックは ""）。receipt の
     // csvOptions にそのまま載り、host はこれで「前回と同じ with* か」を照合する。
@@ -685,7 +693,9 @@ async function createArchive(options) {
       const id = getReportId(record);
       if (id !== null) idCounts.set(id, (idCounts.get(id) ?? 0) + 1);
     }
-    const usedNames = new Set();
+    // 大文字小文字を区別しない FS（Windows・macOS 既定）で、設定名（--use-server-name）の
+    // Invoice.pdf / invoice.pdf が同一実体に上書きされないよう、衝突判定は小文字キーで行う。
+    const usedNames = caseFoldSet();
 
     // (b) --skip-unchanged-keys: 前回配信から不変のレコードの DL を省く照合マップ
     // （key: "<itemId>:<revNo>"・revNo 無しは "0" に正規化。value: 第2列 or null）。
@@ -749,6 +759,9 @@ async function createArchive(options) {
           continue;
         }
 
+        // --use-server-name: この帳票で最初に得たサーバ申告名の stem。帳票CSV一式のフォルダ名と
+        // フォルダ内の PDF/Excel もこれに揃える（pdf/excel が csv より先に回る並び）。
+        let serverStem = null;
         for (const artifact of artifacts) {
           let dl = null;
           if (bulk && artifact === "pdf") {
@@ -766,7 +779,7 @@ async function createArchive(options) {
           if (!dl) {
             dl = artifact === "csv"
               ? await downloadCsvZip(credentials, reportId, options.csvOptions)
-              : await downloadArtifactNamed(credentials, reportId, artifact);
+              : await downloadArtifactNamed(credentials, reportId, artifact, options.useServerName);
             downloadsDone++;
             if (sleepMs > 0 && downloadsDone < plannedDownloads) {
               await new Promise((r) => setTimeout(r, sleepMs));
@@ -774,13 +787,14 @@ async function createArchive(options) {
           }
           try {
             if (artifact === "csv") {
-              const ctx = { record, reportId, revNo, needsRev };
+              const ctx = { record, reportId, revNo, needsRev, serverStem };
               const { folder, files } = await placeCsvFolder(dl.tempPath, archivePath, ctx, usedNames, savedFiles);
               const entry = { type: "csv", objectKey: `documents/${folder}/`, csvOptions: options.csvOptions, files };
               (record.artifacts = record.artifacts ?? []).push(entry);
               landedArtifacts.push({ itemId: String(reportId), revNo: revNo || null, ...entry });
               continue; // finally で tempDir を消す
             }
+            if (dl.serverName && serverStem === null) serverStem = serverStemOf(dl.name);
             const fileName = chooseArtifactFileName(dl.name, {
               record, reportId, revNo, needsRev, artifact,
               multipleArtifacts: standaloneCount > 1, usedNames,
@@ -1566,27 +1580,50 @@ function buildListArgs(filters) {
  *     上限（NAME_MAX 255B）を超えて ENAMETOOLONG で落ちる（実機報告）。既定名に固定して根本回避する。
  *   - downloadedName が chooseArtifactFileName の cliFallback と一致するので、最終名は manifest の
  *     帳票名称から `<帳票ID>_<帳票名称>.<ext>` で統一的に組める（サーバの自動出力設定名は使わない）。
+ *   - 例外は --use-server-name（opt-in）: 保存名は同じく -o で固定し、名前だけを `--format json` の
+ *     serverFileName で受け取って chooseArtifactFileName のサーバ名分岐（復号・無害化・切り詰め）に渡す。
  */
-async function downloadArtifactNamed(credentials, reportId, artifact) {
+async function downloadArtifactNamed(credentials, reportId, artifact, useServerName = false) {
   const tempDir = await fsp.mkdtemp(join(tmpdir(), "irepo-archive-dl-"));
   try {
     const safeName = `report-${reportId}${fileExtensionFor(artifact)}`;
-    await runCommand(
-      iRepoBin(),
-      ["rep", "download", reportId, "--file-type", artifact, "-o", join(tempDir, safeName)],
-      { env: buildIRepoEnv(credentials), captureStdout: true, cwd: tempDir },
-    );
+    const args = ["rep", "download", reportId, "--file-type", artifact, "-o", join(tempDir, safeName)];
+    // --use-server-name: 保存名は -o で固定したまま、サーバ申告名（ファイル自動出力設定の名称）だけを
+    // `--format json` の serverFileName で受け取る（長い日本語名で ENAMETOOLONG になる経路を踏まない）。
+    if (useServerName) args.push("--format", "json");
+    const result = await runCommand(iRepoBin(), args, { env: buildIRepoEnv(credentials), captureStdout: true, cwd: tempDir });
     const entries = await fsp.readdir(tempDir);
     if (entries.length !== 1) {
       throw new Error(
         `expected exactly one downloaded file for report ${reportId} (${artifact}), found ${entries.length}`,
       );
     }
-    return { tempDir, tempPath: join(tempDir, entries[0]), name: entries[0] };
+    const serverName = useServerName ? serverFileNameFrom(result.stdout, artifact) : null;
+    return serverName
+      ? { tempDir, tempPath: join(tempDir, entries[0]), name: serverName, serverName: true }
+      : { tempDir, tempPath: join(tempDir, entries[0]), name: entries[0] };
   } catch (error) {
     await fsp.rm(tempDir, { recursive: true, force: true });
     throw error;
   }
+}
+
+/**
+ * `rep download --format json` の stdout（JSON 1行）から serverFileName を取り出す（生の値）。
+ * パス区切りは後段の sanitizeUnicodeFileName が `_` に潰す（CLI の「最後のセグメントだけ採用」とは
+ * 違い、名前の一部を黙って捨てない）。拡張子が
+ * 成果物の種類と違えば足す（"点検表_v1.2" を ".2" 拡張子と誤認しない）。読めない・無い → null（従来名）。
+ */
+function serverFileNameFrom(stdout, artifact) {
+  const ext = fileExtensionFor(artifact);
+  for (const line of String(stdout).split(/\r?\n/).reverse()) {
+    let row;
+    try { row = JSON.parse(line); } catch { continue; }
+    const name = row && typeof row.serverFileName === "string" ? row.serverFileName.trim() : "";
+    if (!name) return null;
+    return name.toLowerCase().endsWith(ext) ? name : `${name}${ext}`;
+  }
+  return null;
 }
 
 // ── --csv-zip（帳票CSV一式・DownloadCsv の ZIP）──────────────────────────────
@@ -1641,8 +1678,7 @@ async function placeCsvFolder(zipPath, archivePath, ctx, usedNames, savedFiles) 
   await fsp.mkdir(folderPath, { recursive: true });
   // 大文字小文字を区別しない FS（Windows・macOS 既定）で report.csv と REPORT.CSV が同一実体に
   // 上書きされないよう、フォルダ内の衝突判定は小文字キーで行う。
-  const seen = new Set();
-  const used = { has: (n) => seen.has(n.toLowerCase()), add: (n) => seen.add(n.toLowerCase()) };
+  const used = caseFoldSet();
   const files = [];
   // 本物の report.csv を先に処理して名前を確保する（REPORT.CSV が先に並んでも report.csv が改名されない）。
   // n（entry-<n> の番号）は ZIP 内の元の位置のまま。
@@ -2104,7 +2140,7 @@ function chooseArtifactFileName(downloadedName, ctx) {
     // `%2E%2E`→`..` が ext 側に入ると `documents/` 外への書き込み（パストラバーサル）になり得るため
     // （Cursor P1）。sanitizeUnicodeFileName は区切り(/ \)・禁止文字を `_` 化し、末尾の `.`/空白を除く
     // ので、`.`/`..` は空文字になる（日本語は保持）。
-    stem = sanitizeUnicodeFileName(stem);
+    stem = avoidWinReserved(truncateUtf8(sanitizeUnicodeFileName(stem), SERVER_STEM_MAX_BYTES));
     ext = sanitizeUnicodeFileName(ext);
   }
   // `..`/`.` などが全て削れて空になった basename は親ディレクトリを指すので、id ベースへ倒して
@@ -2124,6 +2160,7 @@ function chooseArtifactFileName(downloadedName, ctx) {
  * 封筒でない生の行 (recordTypes:["*"] 経由) のために record.name も見る。
  */
 function artifactStem(ctx) {
+  if (ctx.serverStem) return ctx.serverStem; // --use-server-name で得た設定名（帳票CSV一式のフォルダ名を揃える）
   const rawName =
     (ctx.record.values && typeof ctx.record.values.name === "string"
       ? ctx.record.values.name.trim()
@@ -2133,6 +2170,42 @@ function artifactStem(ctx) {
   return cleanName
     ? `${sanitizeFileName(ctx.reportId)}_${cleanName}`
     : sanitizeFileName(ctx.reportId);
+}
+
+// サーバ申告名の stem の上限（UTF-8 バイト）。NAME_MAX 255B から -rev<n>・-<artifact>・_<帳票ID>-<n>・
+// 拡張子の余地を残す（日本語 1 文字 3 バイト ≒ 60 文字）。
+const SERVER_STEM_MAX_BYTES = 180;
+
+/** UTF-8 で max バイト以内に切り詰める（文字の途中では切らない）。 */
+function truncateUtf8(value, max) {
+  if (Buffer.byteLength(value, "utf8") <= max) return value;
+  let out = "";
+  for (const ch of value) {
+    if (Buffer.byteLength(out + ch, "utf8") > max) break;
+    out += ch;
+  }
+  return out.replace(/[. ]+$/, "");
+}
+
+/** has/add だけの、大文字小文字と Unicode 正規化の違いを区別しない名前集合（usedNames 用）。 */
+function caseFoldSet() {
+  // NFC へ正規化してから小文字化（macOS の APFS は正規化だけ違う名前を同一視する）。
+  const key = (n) => n.normalize("NFC").toLowerCase();
+  const seen = new Set();
+  return { has: (n) => seen.has(key(n)), add: (n) => seen.add(key(n)) };
+}
+
+/** CON / NUL.pdf 等の Windows 予約デバイス名は _ を前置する（csvEntryFileName と同じ扱い）。 */
+function avoidWinReserved(stem) {
+  return stem && WIN_RESERVED.test(stem) ? `_${stem}` : stem;
+}
+
+/**
+ * サーバ申告名 → 無害化・切り詰め済みの stem（拡張子なし）。chooseArtifactFileName のサーバ名分岐と同じ規則。 */
+function serverStemOf(name) {
+  const decoded = decodeServerFileName(name);
+  const dot = decoded.lastIndexOf(".");
+  return avoidWinReserved(truncateUtf8(sanitizeUnicodeFileName(dot > 0 ? decoded.slice(0, dot) : decoded), SERVER_STEM_MAX_BYTES)) || null;
 }
 
 /** usedNames と衝突したら `_<帳票ID>`、それでも衝突したら `_<帳票ID>-<n>` を付ける。 */
