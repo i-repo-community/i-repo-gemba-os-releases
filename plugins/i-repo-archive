@@ -45,7 +45,7 @@ async function loadBuiltins() {
 }
 
 const PLUGIN = "i-repo-archive";
-const VERSION = "0.13.0";
+const VERSION = "0.14.0";
 const PLUGIN_API = "1";
 const defaultArchiveRoot = () => join(homedir(), ".i-repo", "archives");
 
@@ -171,10 +171,15 @@ if (arg0 === "--plugin-schema") {
         description: "Filter: 帳票定義ID（数値・改版前後の全リビジョン配下を対象）" },
       { name: "--label-id", type: "string", subcommand: "create", filter: true, default: "-9",
         label: "ラベルID", placeholder: "-9 で全レベル",
-        description: "Filter: ラベルID（rep list の -l）。既定 -9 は全レベル（すべて）。空欄/未指定だと最上位階層のみ＝対象帳票0件になりやすいので既定を -9 にしている。指定したラベルが直接付いた帳票だけが対象（子孫ラベルの帳票は含まない）。ID は 1 つだけ（カンマ区切り不可）",
+        description: "Filter: ラベルID（rep list の -l）。既定 -9 は全レベル（すべて）。空欄/未指定だと最上位階層のみ＝対象帳票0件になりやすいので既定を -9 にしている。既定では指定したラベルが直接付いた帳票だけが対象（子孫ラベルの帳票も含めるには --label-scope subtree）。ID は 1 つだけ（カンマ区切り不可）",
         // ラベルを名前で選ぶ GUI 用の申告（docs/PLUGINS.md labelRef）。GetReportList は直下だけ・未指定は最上位だけ。
-        labelRef: { source: "report-label-masters", scope: "direct", emptyMeans: "top-level-only",
+        // scope は既定値、scopes は --label-scope で選べる値。
+        labelRef: { source: "report-label-masters", scope: "direct", scopes: ["direct", "subtree"], scopeParam: "--label-scope",
+          emptyMeans: "top-level-only",
           specialValues: [{ value: "-9", meaning: "all-levels", label: "全階層（すべて）" }] } },
+      { name: "--label-scope", type: "select", subcommand: "create", filter: true, default: "direct",
+        choices: ["direct", "subtree"], label: "ラベルの範囲",
+        description: "--label-id の範囲。direct=そのラベルが直接付いた帳票だけ（既定）/ subtree=そのラベルと配下すべてのラベルの帳票（帳票ID で重複を除く・閲覧グループで見えない子ラベルは含めない）。数値の --label-id が必要" },
       { name: "--word", type: "string", subcommand: "create", filter: true,
         label: "検索ワード", description: "Filter: 帳票名・備考などの検索ワード" },
       // rep list の choices は文字列（test/published）。repb download の数値コードとは別物。
@@ -187,8 +192,8 @@ if (arg0 === "--plugin-schema") {
         choices: ["before-input", "editing", "waiting-approval", "rejected", "completed", "applying"],
         description: "Filter: 編集ステータス（before-input=入力前 / editing=編集中 / waiting-approval=承認待ち / rejected=差戻し / completed=完了 / applying=申請中）" },
       { name: "--type", type: "string", subcommand: "create", filter: true,
-        label: "帳票種別", placeholder: "label,sheet,set,book",
-        description: "Filter: 帳票種別（カンマ区切り: label/sheet/set/book）" },
+        label: "帳票種別", placeholder: "sheet,set,book",
+        description: "Filter: 帳票種別（カンマ区切り: sheet/set/book・既定は 3 つとも）。label は帳票ではないので指定できない" },
       { name: "--definition", type: "string", subcommand: "create", description: "Filter: definition（--definition-id に一本化・CLI専用）" },
       { name: "--word-target", type: "string", subcommand: "create", filter: true,
         label: "検索対象", description: "Filter: 検索ワードの対象" },
@@ -425,6 +430,8 @@ function usage() {
                                 --with-artifacts). Note: combined with --skip-unchanged-keys
                                 the skip only avoids PLACEMENT — bulk still downloads the whole
                                 slice window (DownloadReport returns every report in the slice).
+      --label-scope <s>        direct (default: reports labelled with --label-id itself) or subtree
+                               (that label and every label below it; duplicates removed)
       --use-server-name        Name PDF/Excel files (and the matching CSV folder) after the
                                i-Reporter ファイル自動出力設定 name when the definition has one
                                (else 帳票ID_帳票名称). Names without the report ID can collide
@@ -509,7 +516,7 @@ const CREATE_SPEC = {
   "--csv-zip": "flag", "--csv-with-image": "flag", "--csv-with-pdf": "flag",
   "--csv-with-excel": "flag", "--csv-with-pdf-layer": "flag",
   "--endpoint": "value", "--user": "value", "--password": "value",
-  "--label-id": "value", "-l": "--label-id",
+  "--label-id": "value", "-l": "--label-id", "--label-scope": "value",
   "--word": "value", "-w": "--word",
   "--public-status": "value",
   "--edit-status": "value", "-e": "--edit-status",
@@ -542,8 +549,9 @@ function parseCreateArgs(argv) {
   const filters = {
     // 既定 -9 = 全階層（すべて）。未指定だと rep list が最上位階層のみ＝0件になりやすいので、
     // schema の default だけでなく直接 create 実行（GUI 非経由）でも -9 を既定にする。
-    labelId: checkLabelId(o["label-id"] ?? "-9"), word: o.word, publicStatus: o["public-status"],
-    editStatus: o["edit-status"], itemType: o.type,
+    labelId: checkLabelId(o["label-id"] ?? "-9"), labelScope: checkLabelScope(o["label-scope"], o["label-id"] ?? "-9"),
+    word: o.word, publicStatus: o["public-status"],
+    editStatus: o["edit-status"], itemType: checkItemType(o.type),
     definition: o["definition-id"] ?? o.definition,
     wordTarget: o["word-target"], history: Boolean(o.history),
     registFrom: o["regist-from"], registTo: o["regist-to"],
@@ -678,7 +686,7 @@ async function createArchive(options) {
   const jobId = `archive-${timestampTag()}-${process.pid}`;
   const credentials = await resolveCredentials(options);
   // 実行時に解決したラベル（ID とフルパス名）を receipt に残す — 後でラベル名が変わっても、その時の対象が読める。
-  const labelResolved = await resolveLabel(credentials, options.filters.labelId);
+  const labelResolved = await resolveLabel(credentials, options.filters);
   const manifestText = await listReports(credentials, options.filters);
   const records = parseManifest(manifestText); // validates the stream-end trailer
   const savedFiles = [];
@@ -1558,10 +1566,15 @@ function buildListArgs(filters) {
   const args = [];
   const push = (flag, value) => { if (value && value.length > 0) args.push(flag, value); };
   push("--label-id", filters.labelId);
+  if (filters.labelScope === "subtree") push("--label-scope", "subtree");
   push("--word", filters.word);
   push("--public-status", filters.publicStatus);
   push("--edit-status", filters.editStatus);
-  push("--type", filters.itemType);
+  // ラベル行（type 0）は帳票ではないので取らない。--label-id に子ラベルがあると GetReportList は子ラベル自体を
+  // 行として返し（itemId=ラベルID・revNo=0）、それを帳票と誤認して rep download/reports get すると、
+  // 同じ番号の別帳票を取りかねない（-9 では返らない・番号指定で起きる。実機 sales02 で確認）。
+  // --type に label が入る指定は checkItemType が拒否済み（黙って外す・広げると receipt の条件と食い違う）。
+  push("--type", filters.itemType || "sheet,set,book");
   push("--definition", filters.definition);
   // 定義フィルタは常に系譜全体（改版で定義IDが変わっても過去・中間・未来の全リビジョン配下）。
   // 帳票は作成時リビジョンのIDにぶら下がるため、これが無いと改版またぎの帳票が静かに配信漏れする。
@@ -1663,26 +1676,58 @@ function checkLabelId(value) {
  * -9 は特別値（全階層）。存在しない ID は 0 件のまま黙って成功するのを防ぐため stderr に警告する
  * （止めはしない — 取得は読み取りで、0 件の bundle も正当）。解決できない（権限・旧 CLI 等）ときも警告のみ。
  */
-async function resolveLabel(credentials, labelId) {
+async function resolveLabel(credentials, filters) {
+  const { labelId } = filters;
   if (labelId === "-9") return { labelId: "-9", special: "all-levels" };
   if (labelId === "") return { labelId: "", special: "top-level-only" };
+  const subtree = filters.labelScope === "subtree";
   let rows;
   try {
-    const result = await runCommand(
-      iRepoBin(), ["sys", "rep-label-masters", "list", "--label-id", labelId, "--format", "json"],
-      { env: buildIRepoEnv(credentials), captureStdout: true },
-    );
+    const args = ["sys", "rep-label-masters", "list", "--label-id", labelId, "--format", "json"];
+    if (subtree) args.push("--scope", "subtree");
+    const result = await runCommand(iRepoBin(), args, { env: buildIRepoEnv(credentials), captureStdout: true });
     rows = JSON.parse(result.stdout);
   } catch (error) {
-    console.error(`warning: could not verify --label-id ${labelId} (${error instanceof Error ? error.message.split("\n")[0] : String(error)}) — continuing without the label name`);
-    return { labelId, verified: false };
+    const reason = error instanceof Error ? error.message.split("\n")[0] : String(error);
+    // 配下を確かめられないまま「直下だけ」で成功させない（配下すべてのつもりで取りこぼす）。
+    if (subtree) throw new Error(`--label-scope subtree: could not list the labels below ${labelId} (${reason})`);
+    console.error(`warning: could not verify --label-id ${labelId} (${reason}) — continuing without the label name`);
+    return { labelId, scope: "direct", verified: false };
   }
   const row = Array.isArray(rows) ? rows.find((r) => r && String(r.labelId) === labelId) : null;
   if (!row) {
     console.error(`warning: --label-id ${labelId} does not exist on this server (deleted, or not visible to this user) — the archive will likely be empty`);
-    return { labelId, found: false };
+    // rep list --label-scope subtree は存在しない起点でエラーになるので、警告で続ける方針に合わせて direct で引く（0 件）。
+    // 既定（direct）の filters には labelScope を載せない（receipt の形を変えない）。
+    if (subtree) filters.labelScope = undefined;
+    return { labelId, scope: subtree ? "subtree" : "direct", found: false };
   }
-  return { labelId, labelIdPath: row.labelIdPath, labelNamePath: row.labelNamePath };
+  return {
+    labelId, labelIdPath: row.labelIdPath, labelNamePath: row.labelNamePath,
+    scope: subtree ? "subtree" : "direct",
+    // 実際に引いたラベル（起点＋配下・閲覧グループで見えるものだけ）。配下の構成は後から変わるので、その時の範囲を残す。
+    ...(subtree ? { expandedLabelIds: rows.map((r) => String(r.labelId)) } : {}),
+  };
+}
+
+/** --type の検査。ラベル行は帳票ではないので archive では取らない（指定されたら止める）。 */
+function checkItemType(value) {
+  if (value == null) return undefined;
+  const types = String(value).split(",").map((t) => t.trim()).filter(Boolean);
+  if (types.includes("label")) {
+    throw new Error('--type "label" is not supported by archive create: label rows are not reports. Use sheet,set,book (the default).');
+  }
+  return types.length > 0 ? types.join(",") : undefined;
+}
+
+/** --label-scope の検査（direct 既定）。subtree は数値のラベル ID のときだけ意味がある。 */
+function checkLabelScope(value, labelId) {
+  const v = value == null ? "direct" : String(value).trim();
+  if (v !== "direct" && v !== "subtree") throw new Error(`--label-scope must be direct or subtree (got "${value}").`);
+  if (v === "subtree" && !/^\d+$/.test(String(labelId).trim())) {
+    throw new Error("--label-scope subtree requires a numeric --label-id (not -9 / empty).");
+  }
+  return v === "subtree" ? "subtree" : undefined; // 既定（direct）は filters に載せない（receipt の形を変えない）
 }
 
 // ── --csv-zip（帳票CSV一式・DownloadCsv の ZIP）──────────────────────────────
