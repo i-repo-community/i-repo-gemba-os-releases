@@ -34,14 +34,14 @@ async function loadBuiltins() {
 }
 
 const PLUGIN = "i-repo-report-delete";
-const VERSION = "0.2.0";
+const VERSION = "0.2.1";
 const PLUGIN_API = "1";
 
 // 検索フィルタ（DeleteReport 仕様の抽出条件・すべて filter:true）。
 // フラグ名は組み込み report-batches delete と 1:1 で対応させ、そのまま転送する。
 const FILTER_PARAMS = [
   { name: "--definition", type: "string", label: "定義ID", description: "Filter: 定義ID" },
-  { name: "--report", type: "string", label: "帳票ID", description: "Filter: 帳票ID（カンマ区切り可）" },
+  { name: "--report", type: "string", label: "帳票ID", description: "Filter: 帳票ID 1つ（DeleteReport はカンマ区切りを受けない。複数は1件ずつ呼ぶ）" },
   { name: "--label-id", type: "string", label: "ラベルID",
     description: "Filter: ラベルID（'nolabel' でラベル無し）。指定したラベルが直接付いた帳票だけが対象（子孫ラベルの帳票は含まない）。ID は 1 つだけ。存在しない・確かめられないラベルなら削除せず止まる",
     // ラベルを名前で選ぶ GUI 用の申告（docs/PLUGINS.md labelRef）。DeleteReport は未指定＝全帳票。
@@ -244,6 +244,13 @@ const FILTER_KEYS = [
   if (o.user != null) env.IREPO_USER = o.user;
   if (o.password != null) env.IREPO_PASSWORD = o.password;
 
+  // 安全弁3.5（帳票IDは1つ）: DeleteReport の report は帳票ID 1つだけ。カンマ区切りは
+  // サーバーが code=2（パラメータ異常）で拒否する（実機確認済み）。送る前に止める。
+  if (o.report != null && !/^\d+$/.test(String(o.report))) {
+    console.error(`${PLUGIN}: --report "${o.report}" is not a single report ID. DeleteReport takes one report ID per call — call once per report. Refusing to delete.`);
+    process.exit(2);
+  }
+
   // 安全弁4（ラベルの確認）: 削除は対象が分からないまま進めない。ラベル ID は 1 つだけ
   // （カンマ区切りは i-Reporter が黙って「指定なし」＝全帳票扱いにし得る）、かつ実在すること。
   // 解決したラベル（ID・フルパス名）は receipt に残す（後でラベル名が変わってもその時の対象が読める）。
@@ -290,11 +297,10 @@ const FILTER_KEYS = [
     // stderr の進捗・確認・ゲート案内は継承し、stdout（json 結果）だけ捕捉する。
     const jsonArgs = [];
     if (process.env.IREPO_TIMEOUT) jsonArgs.push("--timeout", process.env.IREPO_TIMEOUT);
-    if (process.env.IREPO_QUIET === "1") jsonArgs.push("--quiet"); // 内側の stderr 進捗を抑制（--format json は保持）
-    jsonArgs.push(
-      "--format", "json", "report-batches", "delete", ...filterArgs,
-      "--drain", "--execute-count", String(o["execute-count"]),
-    );
+    // --quiet は渡さない: 本体の quiet は json より優先され stdout が件数だけになり、
+    // 結果 json を読めず receipt が出なくなる（進捗が stderr に出るのは許容）。
+    // --execute-count は FORWARD_FLAGS 経由で filterArgs に入っている。
+    jsonArgs.push("--format", "json", "report-batches", "delete", ...filterArgs, "--drain");
     if (o.force) jsonArgs.push("--force");
     const cap = await runIrepoCapture(jsonArgs, env);
     const drain = parseLastJson(cap.stdout);
@@ -317,6 +323,8 @@ const FILTER_KEYS = [
       failedCount,
       stoppedReason: drain.stoppedReason ?? null,
       errors,
+      // ドレインを止めたエラー（サーバーの拒否など）。件数はそこまでの実績。
+      ...(drain.error ? { error: drain.error } : {}),
       ...(label ? { label } : {}),
       producedBy: { plugin: PLUGIN, version: VERSION },
     }) + "\n");
@@ -495,7 +503,7 @@ Usage:
 
 Filters (最低1つ必須):
   -d, --definition <id>      定義ID
-  -r, --report <ids>         帳票ID（カンマ区切り可）
+  -r, --report <id>          帳票ID 1つ（複数は1件ずつ呼ぶ。カンマ区切りは削除せず止まる）
   -l, --label-id <id>        ラベルID 1つ（'nolabel' でラベル無し・直下のみ・存在しなければ削除せず止まる）
       --public-status <1|2>  1:テスト / 2:公開
   -e, --edit-status <0-4>    0:入力前 1:編集中 2:承認待ち 3:差し戻し 4:入力完了

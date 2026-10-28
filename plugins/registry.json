@@ -148,7 +148,7 @@
       "name": "report-delete",
       "file": "i-repo-report-delete",
       "displayName": "i-repo-report-delete",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "description": "帳票削除（DeleteReport）— 寿命管理。認証済み組み込み report-batches delete を呼び戻す（自分では認証しない）",
       "platforms": [
         "macos",
@@ -167,7 +167,7 @@
         {
           "path": "i-repo-report-delete",
           "url": "https://raw.githubusercontent.com/i-repo-community/i-repo-gemba-os-releases/main/plugins/i-repo-report-delete",
-          "sha256": "3fcf088469322ce6f0c176f9c84729b23a41d3a564a263da86c2de9fcfe96c5b"
+          "sha256": "bfaa907f74078aec3be74fdce8b6e6d698968255481565dbac27813d29729dc1"
         }
       ]
     },
